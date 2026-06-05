@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header" style="display:flex;justify-content:space-between;align-items:center;">
+    <div>
+        <h2>🔍 OCR 识别配置</h2>
+        <p>配置 OCR 服务，用于识别扫描件/图片中的文字</p>
+    </div>
+    <button class="btn btn-primary" onclick="openModal('add-modal')">+ 添加配置</button>
+</div>
+
+{% if configs %}
+<div class="card">
+    <div class="card-body" style="padding:0;">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>名称</th>
+                    <th>类型</th>
+                    <th>API 地址</th>
+                    <th>模型</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for cfg in configs %}
+                <tr>
+                    <td>{{ cfg.name }}</td>
+                    <td>
+                        {% if cfg.provider_type == 'paddleocr' %}
+                            <span class="badge badge-info">PaddleOCR</span>
+                        {% elif cfg.provider_type == 'openai-vision' %}
+                            <span class="badge badge-accent">Vision API</span>
+                        {% else %}
+                            <span class="badge badge-default">{{ cfg.provider_type }}</span>
+                        {% endif %}
+                    </td>
+                    <td style="font-size:12px; max-width:200px; overflow:hidden; text-overflow:ellipsis;">{{ cfg.api_url }}</td>
+                    <td style="font-size:12px;">{{ cfg.model_name or '-' }}</td>
+                    <td>
+                        {% if cfg.is_active %}
+                            <span class="badge badge-success">启用</span>
+                        {% else %}
+                            <span class="badge badge-default">禁用</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <button class="btn btn-outline btn-xs" onclick="testOCR({{ cfg.id }})">🔗 测试</button>
+                        <button class="btn btn-outline btn-xs" onclick='editOCR({{ cfg.id|tojson }}, {{ cfg.name|tojson }}, {{ cfg.provider_type|tojson }}, {{ cfg.api_url|tojson }}, {{ cfg.model_name|tojson }}, {{ cfg.is_active|lower }})'>✏️</button>
+                        <a href="/ocr-config/delete/{{ cfg.id }}" class="btn btn-outline btn-xs" style="color:var(--danger);" onclick="return confirm('确定删除？')">🗑</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% else %}
+<div class="card">
+    <div class="card-body">
+        <div class="empty-state">
+            <div class="icon">🔍</div>
+            <h3>暂无 OCR 配置</h3>
+            <p>添加 OCR 服务后可识别扫描件和图片中的文字</p>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<!-- 测试结果显示区 -->
+<div id="ocr-test-result" style="display:none; margin-top:16px; padding:12px 16px; border-radius:8px; font-size:14px;"></div>
+
+<!-- 添加/编辑弹窗 -->
+<div id="add-modal" class="modal-overlay">
+    <div class="modal">
+        <div class="modal-header">
+            <h3 id="modal-title">添加 OCR 配置</h3>
+            <button onclick="closeModal('add-modal')" class="modal-close">✕</button>
+        </div>
+        <form id="ocr-form" method="post" action="/ocr-config/add">
+            {{ csrf_token_input(request)|safe }}
+            <input type="hidden" id="cfg-id" name="cfg_id" value="">
+            <div class="modal-body">
+                <label>名称</label>
+                <input type="text" name="name" id="cfg-name" value="OCR配置" class="form-control" required>
+
+                <label>提供商类型</label>
+                <select name="provider_type" id="cfg-provider" class="form-control">
+                    <option value="paddleocr">PaddleOCR</option>
+                    <option value="openai-vision">OpenAI Vision (多模态模型)</option>
+                    <option value="custom">自定义</option>
+                </select>
+
+                <label>API 地址</label>
+                <input type="text" name="api_url" id="cfg-url" placeholder="http://192.168.0.99:8001/ocr" class="form-control" required>
+                <small style="color:var(--text-muted);">PaddleOCR: http://host:port/ocr | Vision: https://api.openai.com/v1/chat/completions</small>
+
+                <label>API Key <small>(PaddleOCR 可留空)</small></label>
+                <input type="text" name="api_key" id="cfg-key" value="" class="form-control" placeholder="留空表示不需要 Key">
+
+                <label>模型名称 <small>(Vision 类型需要)</small></label>
+                <input type="text" name="model_name" id="cfg-model" value="" class="form-control" placeholder="如 gpt-4o / Qwen2.5-VL-72B">
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline" onclick="closeModal('add-modal')">取消</button>
+                <button type="submit" class="btn btn-primary">💾 保存</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function editOCR(id, name, provider, url, model, active) {
+    document.getElementById('modal-title').textContent = '编辑 OCR 配置';
+    document.getElementById('ocr-form').action = '/ocr-config/update/' + id;
+    document.getElementById('cfg-name').value = name;
+    document.getElementById('cfg-provider').value = provider;
+    document.getElementById('cfg-url').value = url;
+    document.getElementById('cfg-model').value = model || '';
+    document.getElementById('cfg-key').value = '';
+    openModal('add-modal');
+}
+
+async function testOCR(id) {
+    var resultDiv = document.getElementById('ocr-test-result');
+    var btn = event.target;
+    btn.textContent = '测试中...';
+    btn.disabled = true;
+    resultDiv.style.display = 'block';
+    resultDiv.style.background = '#edf2f7';
+    resultDiv.style.color = '#4a5568';
+    resultDiv.textContent = '⏳ 正在测试 OCR 连接...';
+    try {
+        var resp = await fetch('/ocr-config/test/' + id, { method: 'POST' });
+        var data = await resp.json();
+        if (data.success) {
+            resultDiv.style.background = '#f0fff4';
+            resultDiv.style.color = '#276749';
+            resultDiv.innerHTML = '';
+            var strongEl = document.createElement('strong');
+            strongEl.textContent = '✅ ' + data.message;
+            resultDiv.appendChild(strongEl);
+            showToast(data.message, 'success');
+        } else {
+            resultDiv.style.background = '#fff5f5';
+            resultDiv.style.color = '#9b2c2c';
+            resultDiv.innerHTML = '';
+            var strongEl = document.createElement('strong');
+            strongEl.textContent = '❌ 连接失败';
+            resultDiv.appendChild(strongEl);
+            resultDiv.appendChild(document.createElement('br'));
+            var spanEl = document.createElement('span');
+            spanEl.style.fontSize = '12px';
+            spanEl.textContent = data.message;
+            resultDiv.appendChild(spanEl);
+            showToast(data.message, 'error');
+        }
+    } catch(e) {
+        resultDiv.style.background = '#fff5f5';
+        resultDiv.style.color = '#9b2c2c';
+        resultDiv.innerHTML = '';
+        var strongEl = document.createElement('strong');
+        strongEl.textContent = '❌ 请求失败';
+        resultDiv.appendChild(strongEl);
+        resultDiv.appendChild(document.createElement('br'));
+        var spanEl = document.createElement('span');
+        spanEl.style.fontSize = '12px';
+        spanEl.textContent = String(e);
+        resultDiv.appendChild(spanEl);
+        showToast('请求失败: ' + e, 'error');
+    }
+    btn.textContent = '🔗 测试';
+    btn.disabled = false;
+}
+</script>
+{% endblock %}

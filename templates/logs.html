@@ -1,0 +1,268 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header" style="display:flex;justify-content:space-between;align-items:center;">
+    <div>
+        <h2>📋 处理日志</h2>
+        <p>共 {{ total }} 条记录</p>
+    </div>
+    <div style="display:flex;gap:16px;">
+        <button class="btn btn-outline btn-sm" onclick="openExportPanel()">📥 导出</button>
+        <button class="btn btn-danger btn-sm" onclick="openClearModal()">🗑️ 清除全部记录</button>
+    </div>
+</div>
+
+<!-- 导出面板（默认隐藏） -->
+<div id="export-panel" class="card" style="display:none; margin-bottom:20px;">
+    <div class="card-header">
+        <h3>📥 导出选项</h3>
+        <button class="modal-close" onclick="document.getElementById('export-panel').style.display='none'">&times;</button>
+    </div>
+    <div class="card-body">
+        <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+            <div class="form-group" style="margin-bottom:0;">
+                <label style="font-size:12px;">开始日期</label>
+                <input type="date" id="export-date-from" class="form-control" style="width:160px;">
+            </div>
+            <div class="form-group" style="margin-bottom:0;">
+                <label style="font-size:12px;">结束日期</label>
+                <input type="date" id="export-date-to" class="form-control" style="width:160px;">
+            </div>
+            <button class="btn btn-primary btn-sm" onclick="exportCSV()">📄 导出 CSV</button>
+            <button class="btn btn-success btn-sm" onclick="exportAttachments()">📦 导出附件 (ZIP)</button>
+        </div>
+        <p style="font-size:12px;color:var(--text-muted);margin-top:8px;">
+            不选日期则导出全部记录。CSV 包含发件人/主题/分类/摘要/AI解读/涉及方/正文/附件。
+        </p>
+    </div>
+</div>
+
+<!-- 统计 -->
+<div class="stats-grid" style="grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));">
+    <div class="stat-card">
+        <div class="stat-value" style="font-size:22px;">{{ counts.get('forwarded', 0) }}</div>
+        <div class="stat-label">✅ 已转发</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value" style="font-size:22px;">{{ counts.get('analyzed', 0) }}</div>
+        <div class="stat-label">📝 已分析</div>
+    </div>
+    <div class="stat-card danger">
+        <div class="stat-value" style="font-size:22px;">{{ counts.get('failed', 0) }}</div>
+        <div class="stat-label">❌ 失败</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value" style="font-size:22px;">{{ counts.get('skipped', 0) }}</div>
+        <div class="stat-label">⏭ 已跳过</div>
+    </div>
+</div>
+
+<!-- 筛选 -->
+<div class="card" style="margin-bottom:20px;">
+    <div class="card-body">
+        <form method="get" action="/logs" class="filter-bar" style="margin:0;">
+            <select name="status" class="form-control" style="width:auto;">
+                <option value="">全部状态</option>
+                <option value="forwarded" {% if status_filter == 'forwarded' %}selected{% endif %}>已转发</option>
+                <option value="analyzed" {% if status_filter == 'analyzed' %}selected{% endif %}>已分析</option>
+                <option value="failed" {% if status_filter == 'failed' %}selected{% endif %}>失败</option>
+                <option value="skipped" {% if status_filter == 'skipped' %}selected{% endif %}>已跳过</option>
+                <option value="pending" {% if status_filter == 'pending' %}selected{% endif %}>待处理</option>
+            </select>
+            <input type="text" name="keyword" class="form-control" placeholder="搜索主题/发件人/摘要..." value="{{ keyword }}" style="flex:1;">
+            <button type="submit" class="btn btn-primary">🔍 搜索</button>
+            {% if status_filter or keyword %}
+            <a href="/logs" class="btn btn-outline">清除</a>
+            {% endif %}
+        </form>
+    </div>
+</div>
+
+{% if logs %}
+<div class="card">
+    <div class="card-body" style="padding:0; overflow-x:auto;">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>时间</th>
+                    <th>发件人</th>
+                    <th>主题</th>
+                    <th>分类</th>
+                    <th>转发邮箱</th>
+                    <th>附件</th>
+                    <th>状态</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for log in logs %}
+                <tr>
+                    <td style="font-size:12px; white-space:nowrap;">{{ log.created_at.strftime('%m-%d %H:%M') if log.created_at else '-' }}</td>
+                    <td style="font-size:12px; max-width:150px; overflow:hidden; text-overflow:ellipsis;">{{ log.sender or '-' }}</td>
+                    <td style="font-size:13px; max-width:280px; overflow:hidden; text-overflow:ellipsis;">
+                        <a href="/logs/detail/{{ log.id }}" style="text-decoration:none; color:var(--primary);">{{ log.subject or '(无主题)' }}</a>
+                    </td>
+                    <td><span class="badge badge-info">{{ log.doc_type or '-' }}</span></td>
+                    <td style="font-size:12px; color:var(--text-muted); max-width:150px; overflow:hidden; text-overflow:ellipsis;">{{ log.target_email or '-' }}</td>
+                    <td style="font-size:12px;">
+                        {% set log_atts = attachment_map.get(log.id, []) %}
+                        {% if log_atts %}
+                            {% for att in log_atts %}
+                                <span title="{{ att.filename }}" style="display:inline-block;background:#e2e8f0;padding:1px 6px;border-radius:4px;margin:1px;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">📎 {{ att.filename }}</span>
+                            {% endfor %}
+                        {% else %}
+                            <span style="color:var(--text-muted);">—</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if log.status == 'forwarded' %}
+                            <span class="badge badge-success">✅ 已转发</span>
+                        {% elif log.status == 'analyzed' %}
+                            <span class="badge badge-info">📝 已分析</span>
+                        {% elif log.status == 'failed' %}
+                            <span class="badge badge-danger">❌ 失败</span>
+                        {% elif log.status == 'skipped' %}
+                            <span class="badge badge-default">⏭ 已跳过</span>
+                        {% else %}
+                            <span class="badge badge-warning">⏳ 待处理</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- 分页 -->
+{% if total_pages > 1 %}
+<div class="pagination">
+    {% if page > 1 %}
+    <a href="/logs?page={{ page - 1 }}&status={{ status_encoded }}&keyword={{ keyword_encoded }}">‹ 上一页</a>
+    {% else %}
+    <span class="disabled">‹ 上一页</span>
+    {% endif %}
+
+    <span class="current">{{ page }} / {{ total_pages }}</span>
+
+    {% if page < total_pages %}
+    <a href="/logs?page={{ page + 1 }}&status={{ status_encoded }}&keyword={{ keyword_encoded }}">下一页 ›</a>
+    {% else %}
+    <span class="disabled">下一页 ›</span>
+    {% endif %}
+</div>
+{% endif %}
+
+{% else %}
+<div class="card">
+    <div class="card-body">
+        <div class="empty-state">
+            <div class="icon">📋</div>
+            <h3>暂无日志</h3>
+            <p>邮件处理记录将在此显示</p>
+        </div>
+    </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ===== 导出面板 =====
+function openExportPanel() {
+    document.getElementById('export-panel').style.display = 'block';
+}
+
+function exportCSV() {
+    const from = document.getElementById('export-date-from').value;
+    const to = document.getElementById('export-date-to').value;
+    let url = '/logs/export-csv?';
+    if (from) url += 'date_from=' + encodeURIComponent(from) + '&';
+    if (to) url += 'date_to=' + encodeURIComponent(to) + '&';
+    window.location.href = url;
+}
+
+function exportAttachments() {
+    const from = document.getElementById('export-date-from').value;
+    const to = document.getElementById('export-date-to').value;
+    let url = '/logs/export-attachments?';
+    if (from) url += 'date_from=' + encodeURIComponent(from) + '&';
+    if (to) url += 'date_to=' + encodeURIComponent(to) + '&';
+    window.location.href = url;
+}
+
+// ===== 清除记录（双重确认）=====
+function openClearModal() {
+    const modal = document.getElementById('clear-confirm-modal');
+    const input = document.getElementById('clear-confirm-input');
+    const btn = document.getElementById('clear-confirm-btn');
+    input.value = '';
+    btn.disabled = true;
+    modal.classList.add('show');
+    setTimeout(() => input.focus(), 100);
+}
+
+function closeClearModal() {
+    document.getElementById('clear-confirm-modal').classList.remove('show');
+}
+
+// 输入监听：只有输入 "DELETE" 才启用按钮
+document.addEventListener('DOMContentLoaded', function() {
+    const input = document.getElementById('clear-confirm-input');
+    const btn = document.getElementById('clear-confirm-btn');
+    if (input) {
+        input.addEventListener('input', function() {
+            btn.disabled = (input.value.trim() !== 'DELETE');
+        });
+    }
+});
+
+function executeClear() {
+    const btn = document.getElementById('clear-confirm-btn');
+    btn.disabled = true;
+    btn.textContent = '⏳ 清除中...';
+
+    fetch('/logs/clear', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                showToast(data.message, 'success');
+                setTimeout(() => location.reload(), 1500);
+            } else {
+                showToast(data.message, 'error');
+                btn.disabled = false;
+                btn.textContent = '确认清除';
+            }
+        })
+        .catch(e => {
+            showToast('请求失败: ' + e, 'error');
+            btn.disabled = false;
+            btn.textContent = '确认清除';
+        });
+}
+</script>
+
+<!-- 清除确认模态框 -->
+<div class="modal-overlay" id="clear-confirm-modal">
+    <div class="modal" style="max-width:440px;">
+        <div class="modal-header" style="background:#fff5f5; border-bottom:1px solid #fed7d7;">
+            <h3 style="color:#c53030;">⚠️ 危险操作</h3>
+            <button class="modal-close" onclick="closeClearModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p style="margin-bottom:12px; color:#4a5568;">
+                此操作将<strong>永久删除</strong>所有处理记录和附件文件，不可恢复。
+            </p>
+            <p style="margin-bottom:16px; font-size:13px; color:#718096;">
+                请在下方输入 <code style="background:#fed7d7; padding:2px 6px; border-radius:3px; font-weight:600;">DELETE</code> 以确认：
+            </p>
+            <input type="text" id="clear-confirm-input" class="form-control"
+                   placeholder="输入 DELETE" autocomplete="off"
+                   style="text-align:center; font-size:16px; letter-spacing:2px; font-weight:600;">
+            <div style="display:flex; gap:10px; margin-top:16px; justify-content:flex-end;">
+                <button class="btn btn-outline" onclick="closeClearModal()">取消</button>
+                <button class="btn btn-danger" id="clear-confirm-btn" disabled
+                        onclick="executeClear()">确认清除</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

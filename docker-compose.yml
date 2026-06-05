@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  legal-mail-router:
+    build: .
+    container_name: legal-mail-router
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

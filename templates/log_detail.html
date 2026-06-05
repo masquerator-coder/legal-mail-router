@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+    <h2>📧 邮件详情</h2>
+    <a href="/logs" class="btn btn-outline">← 返回日志列表</a>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h3>{{ log.subject or '(无主题)' }}</h3>
+        {% if log.status == 'forwarded' %}
+            <span class="badge badge-success">✅ 已转发</span>
+        {% elif log.status == 'analyzed' %}
+            <span class="badge badge-info">📝 已分析</span>
+        {% elif log.status == 'failed' %}
+            <span class="badge badge-danger">❌ 失败</span>
+        {% elif log.status == 'skipped' %}
+            <span class="badge badge-default">⏭ 已跳过</span>
+        {% else %}
+            <span class="badge badge-warning">⏳ 待处理</span>
+        {% endif %}
+    </div>
+    <div class="card-body">
+        <table class="table">
+            {% set sender = log.sender | format_sender %}
+            <tr><td style="width:100px; color:var(--text-muted);">发件人</td><td>{% if sender.name %}【{{ sender.name }}】【{% endif %}{{ sender.email }}{% if sender.name %}】{% endif %}</td></tr>
+            <tr><td style="color:var(--text-muted);">转发邮箱</td><td>{{ log.target_email or '(未设置)' }}</td></tr>
+            <tr><td style="color:var(--text-muted);">接收时间</td><td>{{ log.received_at }}</td></tr>
+            <tr><td style="color:var(--text-muted);">Message-ID</td><td style="font-size:12px; word-break:break-all;">{{ log.message_id }}</td></tr>
+            <tr><td style="color:var(--text-muted);">处理时间</td><td>{{ log.created_at }}</td></tr>
+        </table>
+    </div>
+</div>
+
+{% if llm_result %}
+<div class="card" style="margin-top:20px;">
+    <div class="card-header"><h3>🤖 AI 分析结果</h3></div>
+    <div class="card-body">
+        <table class="table">
+            <tr><td style="width:120px; color:var(--text-muted);">文书类型</td><td><span class="badge badge-info" style="font-size:14px;">{{ llm_result.doc_type }}</span></td></tr>
+            <tr><td style="color:var(--text-muted);">紧急程度</td><td>{{ urgency_map.get(llm_result.urgency, llm_result.urgency) }}</td></tr>
+            <tr><td style="color:var(--text-muted);">案件摘要</td><td>{{ llm_result.case_summary }}</td></tr>
+            {% if llm_result.ai_interpretation %}
+            <tr><td style="color:var(--text-muted);">🤖 AI解读</td><td style="line-height:1.7; background:#f8fafc; padding:12px; border-radius:8px; white-space:pre-wrap;">{{ llm_result.ai_interpretation }}</td></tr>
+            {% endif %}
+            <tr><td style="color:var(--text-muted);">涉及方</td><td>{{ llm_result.involved_parties or log.involved_parties or '无' }}</td></tr>
+            <tr><td style="color:var(--text-muted);">关键日期</td><td>{{ llm_result.key_date or '无' }}</td></tr>
+            <tr><td style="color:var(--text-muted);">案号</td><td>{{ llm_result.case_number or '无' }}</td></tr>
+            <tr><td style="color:var(--text-muted);">律师类型</td><td>{{ llm_result.target_lawyer_type }}</td></tr>
+            <tr><td style="color:var(--text-muted);">置信度</td><td>{{ (llm_result.confidence * 100)|round(1) if llm_result.confidence is not none else 'N/A' }}%</td></tr>
+        </table>
+    </div>
+</div>
+{% endif %}
+
+{% if log.error_message %}
+<div class="card" style="margin-top:20px; border-color: var(--danger);">
+    <div class="card-header" style="color:var(--danger);"><h3>⚠️ 错误信息</h3></div>
+    <div class="card-body">
+        <pre style="white-space:pre-wrap; font-size:13px; color:var(--danger);">{{ log.error_message }}</pre>
+    </div>
+</div>
+{% endif %}
+
+<div class="card" style="margin-top:20px;">
+    <div class="card-header"><h3>📄 邮件正文</h3></div>
+    <div class="card-body">
+        {% set full_body = log.body_text or log.body_preview %}
+        <pre style="white-space:pre-wrap; font-size:13px; line-height:1.6; max-height:500px; overflow-y:auto;">{{ full_body or '(无正文)' }}</pre>
+    </div>
+</div>
+
+{% if log.attachments %}
+<div class="card" style="margin-top:20px;">
+    <div class="card-header"><h3>📎 附件 ({{ log.attachments|length }})</h3></div>
+    <div class="card-body">
+        <table class="table">
+            <thead><tr><th>文件名</th><th>大小</th></tr></thead>
+            <tbody>
+                {% for att in log.attachments %}
+                <tr>
+                    <td>{{ att.filename }}</td>
+                    <td>{{ (att.file_size / 1024)|round(1) }} KB</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+
+{% if log.llm_raw_response %}
+<div class="card" style="margin-top:20px;">
+    <div class="card-header"><h3>🔧 LLM 原始响应</h3></div>
+    <div class="card-body">
+        <div class="code-block">{{ log.llm_raw_response }}</div>
+    </div>
+</div>
+{% endif %}
+{% endblock %}

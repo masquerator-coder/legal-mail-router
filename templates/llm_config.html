@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+    <h2>🤖 LLM 配置</h2>
+    <p>配置大模型 API 用于两阶段文书分析：先识别类型，再详细解读审核</p>
+</div>
+
+<div style="margin-bottom:20px;">
+    <button class="btn btn-primary" onclick="openModal('add-llm-modal')">➕ 添加配置</button>
+</div>
+
+{% if configs %}
+{% for cfg in configs %}
+<div class="card">
+    <div class="card-header">
+        <h3>{{ cfg.name }} {% if cfg.is_active %}<span class="badge badge-success" style="margin-left:8px;">激活</span>{% endif %}</h3>
+        <div>
+            {% if not cfg.is_active %}
+            <a href="/llm-config/activate/{{ cfg.id }}" class="btn btn-success btn-sm">✅ 激活</a>
+            {% endif %}
+            <button class="btn btn-outline btn-sm" id="llm-test-btn-{{ cfg.id }}" onclick="testLLMConnection({{ cfg.id }})">🔗 测试连接</button>
+            <button class="btn btn-outline btn-sm" onclick="openModal('edit-llm-modal-{{ cfg.id }}')">✏️ 编辑</button>
+            <a href="/llm-config/delete/{{ cfg.id }}" class="btn btn-danger btn-sm" onclick="return confirm('确定删除？')">🗑</a>
+        </div>
+    </div>
+    <div class="card-body">
+        <table class="table">
+            <tr>
+                <td style="border:none; width:100px; color:var(--text-muted);">API 地址</td>
+                <td style="border:none; font-family:monospace; font-size:13px;">{{ cfg.api_url }}</td>
+            </tr>
+            <tr>
+                <td style="border:none; color:var(--text-muted);">模型</td>
+                <td style="border:none;">
+                    <span class="badge badge-info">{{ cfg.model_name }}</span>
+                    <span id="model-type-label-{{ cfg.id }}" class="badge" style="margin-left:8px;
+                        {% if cfg.model_type == 'multimodal' %}background:#10b981;{% elif cfg.model_type == 'text' %}background:#6366f1;{% else %}background:#94a3b8;{% endif %}
+                        color:#fff;font-size:11px;">
+                        {% if cfg.model_type == 'multimodal' %}🌐 多模态
+                        {% elif cfg.model_type == 'text' %}📝 纯文本
+                        {% else %}❓ 未知{% endif %}
+                    </span>
+                    <button class="btn btn-xs btn-outline" style="margin-left:8px; padding:2px 8px; font-size:11px;" 
+                            id="detect-btn-{{ cfg.id }}" onclick="detectModelType({{ cfg.id }})">🔍 检测</button>
+                </td>
+            </tr>
+            <tr>
+                <td style="border:none; color:var(--text-muted);">参数</td>
+                <td style="border:none; font-size:13px;">max_tokens={{ cfg.max_tokens }}, temperature={{ cfg.temperature }}</td>
+            </tr>
+            {% if cfg.analysis_prompt %}
+            <tr>
+                <td style="border:none; color:var(--text-muted);">提示词</td>
+                <td style="border:none; font-size:12px; color:var(--text-muted);">已自定义（{{ cfg.analysis_prompt|length }} 字符）</td>
+            </tr>
+            {% endif %}
+        </table>
+    </div>
+</div>
+
+<!-- 编辑 Modal -->
+<div class="modal-overlay" id="edit-llm-modal-{{ cfg.id }}">
+    <div class="modal" style="max-width:720px;">
+        <div class="modal-header">
+            <h3>编辑 LLM 配置</h3>
+            <button class="modal-close" onclick="closeModal('edit-llm-modal-{{ cfg.id }}')">&times;</button>
+        </div>
+        <div class="modal-body">
+            <form method="post" action="/llm-config/edit/{{ cfg.id }}">
+                {{ csrf_token_input(request)|safe }}
+                <div class="form-group"><label>名称</label><input class="form-control" name="name" value="{{ cfg.name }}"></div>
+                <div class="form-group"><label>API 地址</label><input class="form-control" name="api_url" value="{{ cfg.api_url }}" required></div>
+                <div class="form-group"><label>API Key (留空不修改)</label><input class="form-control" type="password" name="api_key"></div>
+                <div class="form-group"><label>模型名称</label><input class="form-control" name="model_name" value="{{ cfg.model_name }}" required></div>
+                <div class="form-row">
+                    <div class="form-group"><label>max_tokens</label><input class="form-control" type="number" name="max_tokens" value="{{ cfg.max_tokens }}"></div>
+                    <div class="form-group"><label>temperature</label><input class="form-control" type="number" step="0.1" name="temperature" value="{{ cfg.temperature }}"></div>
+                </div>
+                <div class="form-group">
+                    <label>📋 提示词模板（两阶段：先识别文书类型，再详细解读审核）</label>
+                    <div style="margin-bottom:6px;">
+                        <button type="button" class="btn btn-outline btn-xs" onclick="resetToDefault('prompt-edit-{{ cfg.id }}')">🔄 恢复默认模板</button>
+                    </div>
+                    <textarea class="form-control" name="analysis_prompt" id="prompt-edit-{{ cfg.id }}" rows="10" style="font-family:monospace; font-size:12px;">{{ cfg.analysis_prompt }}</textarea>
+                    <small style="color:var(--text-muted);">可用变量：{"{subject}"}, {"{sender}"}, {"{body}"}, {"{doc_types}"}（从路由规则自动填充）。留空则使用系统默认的两阶段模板。</small>
+                </div>
+                <div class="form-check">
+                    <input type="hidden" name="is_active" value="false">
+                    <input type="checkbox" name="is_active" value="true" {% if cfg.is_active %}checked{% endif %}>
+                    <span>设为激活</span>
+                </div>
+                <div style="margin-top:20px; text-align:right;">
+                    <button type="button" class="btn btn-outline" onclick="closeModal('edit-llm-modal-{{ cfg.id }}')">取消</button>
+                    <button type="submit" class="btn btn-primary">保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endfor %}
+{% else %}
+<div class="card">
+    <div class="card-body">
+        <div class="empty-state">
+            <div class="icon">🤖</div>
+            <h3>暂无 LLM 配置</h3>
+            <p>配置大模型 API 以启用两阶段智能分析</p>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<!-- 添加 Modal -->
+<div class="modal-overlay" id="add-llm-modal">
+    <div class="modal" style="max-width:720px;">
+        <div class="modal-header">
+            <h3>添加 LLM 配置</h3>
+            <button class="modal-close" onclick="closeModal('add-llm-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+            <form method="post" action="/llm-config/add">
+                {{ csrf_token_input(request)|safe }}
+                <div class="form-group"><label>名称</label><input class="form-control" name="name" value="默认配置"></div>
+                <div class="form-group"><label>API 地址 * (OpenAI 兼容)</label><input class="form-control" name="api_url" placeholder="https://api.deepseek.com/v1" required></div>
+                <div class="form-group"><label>API Key *</label><input class="form-control" type="password" name="api_key" required></div>
+                <div class="form-group"><label>模型名称 *</label><input class="form-control" name="model_name" placeholder="deepseek-chat" required></div>
+                <div class="form-row">
+                    <div class="form-group"><label>max_tokens</label><input class="form-control" type="number" name="max_tokens" value="2000"></div>
+                    <div class="form-group"><label>temperature</label><input class="form-control" type="number" step="0.1" name="temperature" value="0.3"></div>
+                </div>
+                <div class="form-group">
+                    <label>📋 提示词模板（两阶段：先识别文书类型，再详细解读审核）</label>
+                    <div style="margin-bottom:6px;">
+                        <button type="button" class="btn btn-outline btn-xs" onclick="resetToDefault('prompt-add')">🔄 填充默认模板</button>
+                    </div>
+                    <textarea class="form-control" name="analysis_prompt" id="prompt-add" rows="10" style="font-family:monospace; font-size:12px;" placeholder="留空使用系统默认的两阶段提示词模板"></textarea>
+                    <small style="color:var(--text-muted);">可用变量：{"{subject}"}, {"{sender}"}, {"{body}"}, {"{doc_types}"}（从路由规则自动填充）。留空则使用系统默认模板。</small>
+                </div>
+                <div class="form-check">
+                    <input type="hidden" name="is_active" value="false">
+                    <input type="checkbox" name="is_active" value="true" checked>
+                    <span>设为激活</span>
+                </div>
+                <div style="margin-top:20px; text-align:right;">
+                    <button type="button" class="btn btn-outline" onclick="closeModal('add-llm-modal')">取消</button>
+                    <button type="submit" class="btn btn-primary">添加</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// 默认两阶段提示词模板
+{% raw %}
+var DEFAULT_PROMPT = "你是一位资深法律文书分析专家。请按以下两阶段分析邮件及附件内容：\n\n## 第一阶段：文书类型识别\n根据邮件标题、正文和附件内容，从以下类型中选择最匹配的文书类型：\n{doc_types}\n\n## 第二阶段：详细解读与审核\n无论文书类型，请进行以下全面分析：\n1. **案情摘要**：概括案件核心内容和涉及方\n2. **法律要点分析**：识别核心法律问题，分析适用的法律依据和裁判规则\n3. **关键信息提取**：案号、关键日期（开庭/答辩/上诉截止等）、涉及金额、管辖法院/机关等\n4. **风险提示**：潜在的法律风险、程序风险、时效风险、证据风险\n5. **处理建议**：应采取的下一步行动、需要准备的材料、注意事项、是否建议委托专业律师\n\n## 邮件信息\n- 发件人：{sender}\n- 主题：{subject}\n- 内容：\n{body}\n\n注意：如果下方有\"## 附件内容\"段落，请以附件原文为主要分析依据。\n\n## 输出格式\n请严格返回 JSON 格式（不要包含 markdown 代码块标记）：\n{\n  \"doc_type\": \"文书类型（从上述类型中选择）\",\n  \"case_summary\": \"一句话概括案件内容和涉及方\",\n  \"ai_interpretation\": \"第二阶段完整分析结果，包含：法律要点分析、关键信息提取、风险提示（按重要性分级）、处理建议。300-600字。\",\n  \"urgency\": \"high|medium|low\",\n  \"key_date\": \"关键日期或null\",\n  \"case_number\": \"案号或null\",\n  \"involved_parties\": \"涉及方名称（逗号分隔）\",\n  \"target_lawyer_type\": \"民事|刑事|行政|知识产权|劳动纠纷|公司商事|默认\",\n  \"confidence\": 0.0-1.0之间的置信度\n}";
+{% endraw %}
+
+function resetToDefault(textareaId) {
+    var ta = document.getElementById(textareaId);
+    if (!ta) return;
+    ta.value = DEFAULT_PROMPT;
+    ta.scrollTop = 0;
+}
+
+async function detectModelType(id) {
+    var btn = document.getElementById('detect-btn-' + id);
+    var label = document.getElementById('model-type-label-' + id);
+    btn.textContent = '⏳ 检测中...';
+    btn.disabled = true;
+    try {
+        var resp = await fetch('/llm-config/detect-model/' + id, { method: 'POST' });
+        var data = await resp.json();
+        if (data.success) {
+            label.textContent = (data.model_type === 'multimodal' ? '🌐 多模态' : data.model_type === 'text' ? '📝 纯文本' : '❓ 未知');
+            label.style.background = data.model_type === 'multimodal' ? '#10b981' : data.model_type === 'text' ? '#6366f1' : '#94a3b8';
+            showToast('检测完成: ' + data.label, 'success');
+        } else {
+            showToast(data.message, 'error');
+        }
+    } catch(e) {
+        showToast('请求失败: ' + e, 'error');
+    }
+    btn.textContent = '🔍 检测';
+    btn.disabled = false;
+}
+</script>
+{% endblock %}

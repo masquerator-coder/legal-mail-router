@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token_value(request) }}">
+    <title>{{ system_name }}</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <!-- 侧边栏 -->
+    <aside class="sidebar">
+        <div class="sidebar-brand">
+            <h1>⚖️ {{ system_name }}</h1>
+            <div class="subtitle">Legal Mail Router</div>
+        </div>
+
+        <nav class="sidebar-nav">
+            <a href="/dashboard" class="{{ 'active' if active_page == 'dashboard' else '' }}">
+                <span class="icon">📊</span> 仪表盘
+            </a>
+            <a href="/email-config" class="{{ 'active' if active_page == 'email_config' else '' }}">
+                <span class="icon">📧</span> 邮箱配置
+            </a>
+            <a href="/llm-config" class="{{ 'active' if active_page == 'llm_config' else '' }}">
+                <span class="icon">🤖</span> LLM 配置
+            </a>
+            <a href="/ocr-config" class="{{ 'active' if active_page == 'ocr_config' else '' }}">
+                <span class="icon">🔍</span> OCR 配置
+            </a>
+            <a href="/routing" class="{{ 'active' if active_page == 'routing' else '' }}">
+                <span class="icon">🔀</span> 路由规则
+            </a>
+            <a href="/doc-templates" class="{{ 'active' if active_page == 'doc_templates' else '' }}">
+                <span class="icon">📄</span> 文书模板
+            </a>
+            <a href="/settings" class="{{ 'active' if active_page == 'settings' else '' }}">
+                <span class="icon">⚙️</span> 系统设置
+            </a>
+        </nav>
+
+        <div class="sidebar-footer">
+            <span class="status-dot {{ 'online' if scheduler_running else 'offline' }}"></span>
+            {{ "调度运行中" if scheduler_running else "调度已停止" }}
+        </div>
+    </aside>
+
+    <!-- 主内容 -->
+    <main class="main-content">
+        {% block content %}{% endblock %}
+    </main>
+
+    <!-- Flash 消息（服务端） -->
+    {% set msgs = get_flash_messages(request) %}
+    {% if msgs %}
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        {% for m in msgs %}
+        showToast({{ m.message|tojson }}, {{ m.category|tojson }});
+        {% endfor %}
+    });
+    </script>
+    {% endif %}
+
+    <!-- Toast 容器 -->
+    <div id="toast" class="toast" style="display:none;"></div>
+
+    <script>
+    // ── CSRF 保护：自动为 fetch POST/PUT/DELETE 添加 X-CSRF-Token header ──
+    (function() {
+        var _csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+        var _origFetch = window.fetch;
+        window.fetch = function(url, options) {
+            options = options || {};
+            var method = (options.method || 'GET').toUpperCase();
+            if (['POST','PUT','PATCH','DELETE'].includes(method) && _csrfToken) {
+                if (!options.headers) options.headers = {};
+                options.headers['X-CSRF-Token'] = _csrfToken;
+            }
+            return _origFetch.call(this, url, options);
+        };
+    })();
+
+    function showToast(msg, type) {
+        var t = document.getElementById('toast');
+        t.textContent = msg;
+        t.className = 'toast toast-' + (type || 'success');
+        t.style.display = 'block';
+        setTimeout(function() { t.style.display = 'none'; }, 8000);
+    }
+
+    function openModal(id) {
+        document.getElementById(id).classList.add('show');
+    }
+
+    function closeModal(id) {
+        document.getElementById(id).classList.remove('show');
+    }
+
+    // 点击遮罩关闭
+    document.addEventListener('click', function(e) {
+        if (e.target.classList.contains('modal-overlay')) {
+            e.target.classList.remove('show');
+        }
+    });
+
+    // 测试邮箱连接
+    async function testEmailConnection(accountId) {
+        var btn = document.getElementById('test-btn-' + accountId);
+        var resultDiv = document.getElementById('test-result-' + accountId);
+        var row = document.getElementById('test-result-row-' + accountId);
+        btn.textContent = '测试中...';
+        btn.disabled = true;
+        if (row) row.style.display = '';
+        if (resultDiv) {
+            resultDiv.innerHTML = '';
+            var span = document.createElement('span');
+            span.style.color = '#718096';
+            span.textContent = '⏳ 正在连接服务器...';
+            resultDiv.appendChild(span);
+        }
+        try {
+            var resp = await fetch('/email-config/test/' + accountId, { method: 'POST' });
+            var data = await resp.json();
+            if (data.success) {
+                if (resultDiv) {
+                    resultDiv.innerHTML = '';
+                    var msgDiv = document.createElement('div');
+                    msgDiv.style.color = '#38a169';
+                    msgDiv.style.fontWeight = '500';
+                    msgDiv.textContent = '✅ ' + data.message;
+                    resultDiv.appendChild(msgDiv);
+                    if (data.emails && data.emails.length > 0) {
+                        var table = document.createElement('table');
+                        table.style.cssText = 'margin-top:8px;font-size:12px;width:100%;border-collapse:collapse;';
+                        var thead = document.createElement('tr');
+                        thead.style.cssText = 'color:#718096;border-bottom:1px solid #e2e8f0;';
+                        ['主题','发件人','日期','附件'].forEach(function(h) {
+                            var th = document.createElement('th');
+                            th.style.cssText = 'text-align:left;padding:4px;';
+                            th.textContent = h;
+                            thead.appendChild(th);
+                        });
+                        table.appendChild(thead);
+                        data.emails.forEach(function(e) {
+                            var tr = document.createElement('tr');
+                            tr.style.borderBottom = '1px solid #f0f0f0';
+                            var cells = [
+                                {v: e.subject || '(无)', s: 'padding:4px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'},
+                                {v: e.sender || '-', s: 'padding:4px;max-width:150px;overflow:hidden;text-overflow:ellipsis;'},
+                                {v: e.date || '-', s: 'padding:4px;'},
+                                {v: e.attachments > 0 ? '📎' + e.attachments : '-', s: 'padding:4px;text-align:center;'}
+                            ];
+                            cells.forEach(function(c) {
+                                var td = document.createElement('td');
+                                td.style.cssText = c.s;
+                                td.textContent = c.v;
+                                tr.appendChild(td);
+                            });
+                            table.appendChild(tr);
+                        });
+                        resultDiv.appendChild(table);
+                    }
+                } else {
+                    showToast(data.message, 'success');
+                }
+            } else {
+                if (resultDiv) {
+                    resultDiv.innerHTML = '';
+                    var span = document.createElement('span');
+                    span.style.color = '#e53e3e';
+                    span.textContent = '❌ ' + data.message;
+                    resultDiv.appendChild(span);
+                } else showToast(data.message, 'error');
+            }
+        } catch(e) {
+            if (resultDiv) {
+                resultDiv.innerHTML = '';
+                var span = document.createElement('span');
+                span.style.color = '#e53e3e';
+                span.textContent = '请求失败: ' + e;
+                resultDiv.appendChild(span);
+            } else showToast('请求失败: ' + e, 'error');
+        }
+        btn.textContent = '🔗 测试';
+        btn.disabled = false;
+    }
+
+    // 测试 LLM 连接
+    async function testLLMConnection(configId) {
+        var btn = document.getElementById('llm-test-btn-' + configId);
+        btn.textContent = '测试中...';
+        btn.disabled = true;
+        try {
+            var resp = await fetch('/llm-config/test/' + configId, { method: 'POST' });
+            var data = await resp.json();
+            showToast(data.message, data.success ? 'success' : 'error');
+        } catch(e) {
+            showToast('请求失败: ' + e, 'error');
+        }
+        btn.textContent = '测试连接';
+        btn.disabled = false;
+    }
+
+    // 手动触发检查
+    async function triggerManualCheck() {
+        var btn = document.getElementById('trigger-btn');
+        var resultDiv = document.getElementById('trigger-result');
+        btn.textContent = '⏳ 执行中...';
+        btn.disabled = true;
+        if (resultDiv) {
+            resultDiv.innerHTML = '';
+            var span = document.createElement('span');
+            span.style.color = '#718096';
+            span.textContent = '⏳ 正在收取和分析邮件...';
+            resultDiv.appendChild(span);
+        }
+        try {
+            var resp = await fetch('/dashboard/trigger-check', { method: 'POST' });
+            var data = await resp.json();
+            if (data.success) {
+                if (resultDiv) {
+                    resultDiv.innerHTML = '';
+                    var span = document.createElement('span');
+                    span.style.color = '#38a169';
+                    span.textContent = '✅ ' + data.message;
+                    resultDiv.appendChild(span);
+                }
+                showToast(data.message, 'success');
+                // 3秒后刷新页面以显示最新数据
+                setTimeout(function() { location.reload(); }, 3000);
+            } else {
+                if (resultDiv) {
+                    resultDiv.innerHTML = '';
+                    var span = document.createElement('span');
+                    span.style.color = '#e53e3e';
+                    span.textContent = '❌ ' + data.message;
+                    resultDiv.appendChild(span);
+                }
+                showToast(data.message, 'error');
+            }
+        } catch(e) {
+            if (resultDiv) {
+                resultDiv.innerHTML = '';
+                var span = document.createElement('span');
+                span.style.color = '#e53e3e';
+                span.textContent = '请求失败: ' + e;
+                resultDiv.appendChild(span);
+            }
+            showToast('请求失败: ' + e, 'error');
+        }
+        btn.textContent = '▶️ 手动执行';
+        btn.disabled = false;
+    }
+
+    </script>
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>

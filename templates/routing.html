@@ -1,0 +1,206 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+    <h2>🔀 路由规则</h2>
+    <p>配置文书分类规则和转发目标</p>
+</div>
+
+<div style="display:grid; grid-template-columns: 2fr 1fr; gap: 20px;">
+
+<!-- 路由规则列表 -->
+<div>
+    <div style="margin-bottom:16px;">
+        <button class="btn btn-primary" onclick="openModal('add-rule-modal')">➕ 添加规则</button>
+    </div>
+
+    {% if rules %}
+    <div class="card">
+        <div class="card-body" style="padding:0;">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>文书类型</th>
+                        <th>关键词</th>
+                        <th>所属账户</th>
+                        <th>目标律师</th>
+                        <th>优先级</th>
+                        <th>状态</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for rule in rules %}
+                    <tr>
+                        <td><span class="badge badge-info">{{ rule.doc_type }}</span></td>
+                        <td style="font-size:12px; max-width:150px; overflow:hidden; text-overflow:ellipsis;">{{ rule.keywords or '-' }}</td>
+                        <td>
+                            {% if rule.account_id and rule.account %}
+                                <span style="font-size:13px;">📧 {{ rule.account.name }}</span>
+                            {% else %}
+                                <span class="badge badge-default">🌐 全局</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <strong>{{ rule.target_name or '-' }}</strong>
+                            <br><span style="font-size:12px; color:var(--text-muted);">{{ rule.target_email }}</span>
+                        </td>
+                        <td>{{ rule.priority }}</td>
+                        <td>
+                            {% if rule.enabled %}
+                                <span class="badge badge-success">启用</span>
+                            {% else %}
+                                <span class="badge badge-default">禁用</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <button class="btn btn-outline btn-xs" onclick="openModal('edit-rule-modal-{{ rule.id }}')">✏️</button>
+                            <a href="/routing/delete/{{ rule.id }}" class="btn btn-danger btn-xs" onclick="return confirm('确定删除？')">🗑</a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% else %}
+    <div class="card">
+        <div class="card-body">
+            <div class="empty-state">
+                <div class="icon">🔀</div>
+                <h3>暂无路由规则</h3>
+                <p>添加规则后，邮件将自动转发到对应律师</p>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+<!-- 编辑规则 Modals -->
+{% if rules %}
+{% for rule in rules %}
+<div class="modal-overlay" id="edit-rule-modal-{{ rule.id }}">
+    <div class="modal">
+        <div class="modal-header">
+            <h3>编辑路由规则</h3>
+            <button class="modal-close" onclick="closeModal('edit-rule-modal-{{ rule.id }}')">&times;</button>
+        </div>
+        <div class="modal-body">
+            <form method="post" action="/routing/edit/{{ rule.id }}">
+                {{ csrf_token_input(request)|safe }}
+                <div class="form-group">
+                    <label>所属账户 (空=全局规则)</label>
+                    <select class="form-control" name="account_id">
+                        <option value="" {% if not rule.account_id %}selected{% endif %}>🌐 全局规则（所有账户生效）</option>
+                        {% for acc in accounts %}
+                            <option value="{{ acc.id }}" {% if rule.account_id == acc.id %}selected{% endif %}>📧 {{ acc.name }} ({{ acc.username }})</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-group"><label>文书类型</label><input class="form-control" name="doc_type" value="{{ rule.doc_type }}" required></div>
+                <div class="form-group"><label>关键词 (逗号分隔)</label><input class="form-control" name="keywords" value="{{ rule.keywords }}"></div>
+                <div class="form-group"><label>目标律师姓名</label><input class="form-control" name="target_name" value="{{ rule.target_name }}"></div>
+                <div class="form-group"><label>目标邮箱 *</label><input class="form-control" name="target_email" value="{{ rule.target_email }}" required></div>
+                <div class="form-row">
+                    <div class="form-group"><label>专用SMTP(可选)</label><input class="form-control" name="smtp_host" value="{{ rule.smtp_host }}" placeholder="留空使用默认"></div>
+                    <div class="form-group"><label>端口</label><input class="form-control" type="number" name="smtp_port" value="{{ rule.smtp_port }}"></div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group"><label>SMTP账号</label><input class="form-control" name="smtp_username" value="{{ rule.smtp_username }}"></div>
+                    <div class="form-group"><label>SMTP密码(留空不修改)</label><input class="form-control" type="password" name="smtp_password"></div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group"><label>优先级</label><input class="form-control" type="number" name="priority" value="{{ rule.priority }}"></div>
+                    <input type="hidden" name="enabled" value="false">
+                    <div class="form-check"><input type="checkbox" name="enabled" value="true" {% if rule.enabled %}checked{% endif %}><span>启用</span></div>
+                </div>
+                <div style="margin-top:20px; text-align:right;">
+                    <button type="button" class="btn btn-outline" onclick="closeModal('edit-rule-modal-{{ rule.id }}')">取消</button>
+                    <button type="submit" class="btn btn-primary">保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endfor %}
+{% endif %}
+
+<!-- 默认SMTP配置 -->
+<div>
+    <div class="card">
+        <div class="card-header"><h3>📮 默认 SMTP 配置</h3></div>
+        <div class="card-body">
+            <form method="post" action="/routing/default-smtp">
+                {{ csrf_token_input(request)|safe }}
+                <div class="form-group"><label>SMTP 服务器</label><input class="form-control" name="smtp_host" value="{{ default_smtp.get('smtp_host', '') }}" placeholder="smtp.163.com"></div>
+                <div class="form-group"><label>端口</label><input class="form-control" name="smtp_port" value="{{ default_smtp.get('smtp_port', '587') }}"></div>
+                <div class="form-group"><label>发件账号</label><input class="form-control" name="smtp_username" value="{{ default_smtp.get('smtp_username', '') }}"></div>
+                <div class="form-group"><label>SMTP 授权码</label><input class="form-control" type="password" name="smtp_password" placeholder="留空不修改"></div>
+                <div class="form-group"><label>默认转发邮箱 (兜底)</label><input class="form-control" name="forward_email" value="{{ default_smtp.get('forward_email', '') }}" placeholder="无匹配规则时转发到此"></div>
+                <button type="submit" class="btn btn-primary">💾 保存 SMTP 配置</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="card" style="margin-top:20px;">
+        <div class="card-header"><h3>📖 文书类型参考</h3></div>
+        <div class="card-body" style="font-size:13px; line-height:2;">
+            <div><span class="badge badge-info">起诉状</span> 民事/刑事起诉书</div>
+            <div><span class="badge badge-info">判决书</span> 法院判决文书</div>
+            <div><span class="badge badge-info">裁定书</span> 法院裁定</div>
+            <div><span class="badge badge-info">传票</span> 开庭传票/出庭通知</div>
+            <div><span class="badge badge-info">律师函</span> 律师函/法律意见书</div>
+            <div><span class="badge badge-info">合同协议</span> 合同/协议文件</div>
+            <div><span class="badge badge-info">证据材料</span> 证据清单/材料</div>
+            <div><span class="badge badge-info">通知书</span> 行政/法院通知书</div>
+            <div><span class="badge badge-default">其他</span> 其他法律文书</div>
+        </div>
+    </div>
+</div>
+
+</div>
+
+<!-- 添加规则 Modal -->
+<div class="modal-overlay" id="add-rule-modal">
+    <div class="modal">
+        <div class="modal-header">
+            <h3>添加路由规则</h3>
+            <button class="modal-close" onclick="closeModal('add-rule-modal')">&times;</button>
+        </div>
+        <div class="modal-body">
+            <form method="post" action="/routing/add">
+                {{ csrf_token_input(request)|safe }}
+                <div class="form-group">
+                    <label>所属账户 (空=全局规则)</label>
+                    <select class="form-control" name="account_id">
+                        <option value="">🌐 全局规则（所有账户生效）</option>
+                        {% for acc in accounts %}
+                            <option value="{{ acc.id }}">📧 {{ acc.name }} ({{ acc.username }})</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-group"><label>文书类型 *</label><input class="form-control" name="doc_type" placeholder="起诉状 / 判决书 / 合同协议 ..." required></div>
+                <div class="form-group"><label>关键词 (逗号分隔)</label><input class="form-control" name="keywords" placeholder="离婚, 继承, 房产"></div>
+                <div class="form-group"><label>目标律师姓名</label><input class="form-control" name="target_name" placeholder="张律师"></div>
+                <div class="form-group"><label>目标邮箱 *</label><input class="form-control" name="target_email" placeholder="lawyer@firm.com" required></div>
+                <div class="form-row">
+                    <div class="form-group"><label>专用SMTP (可选)</label><input class="form-control" name="smtp_host" placeholder="留空使用默认SMTP"></div>
+                    <div class="form-group"><label>端口</label><input class="form-control" type="number" name="smtp_port" value="587"></div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group"><label>SMTP账号</label><input class="form-control" name="smtp_username"></div>
+                    <div class="form-group"><label>SMTP密码</label><input class="form-control" type="password" name="smtp_password"></div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group"><label>优先级</label><input class="form-control" type="number" name="priority" value="0"></div>
+                    <input type="hidden" name="enabled" value="false">
+                    <div class="form-check"><input type="checkbox" name="enabled" value="true" checked><span>启用</span></div>
+                </div>
+                <div style="margin-top:20px; text-align:right;">
+                    <button type="button" class="btn btn-outline" onclick="closeModal('add-rule-modal')">取消</button>
+                    <button type="submit" class="btn btn-primary">添加</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

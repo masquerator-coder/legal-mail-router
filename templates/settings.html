@@ -1,0 +1,536 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+    <h2>⚙️ 系统设置</h2>
+    <p>配置系统基本参数</p>
+</div>
+
+<div>
+    <form method="POST" action="/settings/save">
+    {{ csrf_token_input(request)|safe }}
+
+    <!-- 系统名称 -->
+    <div class="card">
+        <div class="card-header"><h3>🏷️ 基本信息</h3></div>
+        <div class="card-body">
+            <div class="form-group">
+                <label for="system_name">系统名称</label>
+                <input type="text" id="system_name" name="system_name"
+                       value="{{ settings.system_name }}"
+                       class="form-control"
+                       maxlength="50" required>
+                <div class="form-hint">显示在页面标题和侧边栏品牌区域</div>
+            </div>
+
+            <div class="form-group" style="margin-top:16px;">
+                <label for="system_port">服务端口号</label>
+                <input type="number" id="system_port" name="system_port"
+                       value="{{ settings.system_port }}"
+                       class="form-control" style="width:140px;"
+                       min="1024" max="65535" required>
+                <div class="form-hint">
+                    修改端口后需点击下方「重启服务」按钮生效
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 调度参数（含 LLM 重试） -->
+    <div class="card">
+        <div class="card-header"><h3>⏱️ 调度参数</h3></div>
+        <div class="card-body">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;">
+                <div class="form-group">
+                    <label for="default_check_interval">默认检查间隔（分钟）</label>
+                    <input type="number" id="default_check_interval" name="default_check_interval"
+                           value="{{ settings.default_check_interval }}"
+                           class="form-control" style="width:120px;"
+                           min="1" max="1440" required>
+                    <div class="form-hint">
+                        新建邮箱账户时的默认检查频率（已有账户不受影响）
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="monitor_days">监控时间范围</label>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <select class="form-control" id="monitor_days_preset" onchange="setMonitorDays(this.value)" style="width:130px;">
+                            <option value="">自定义</option>
+                            <option value="3">近 3 天</option>
+                            <option value="7">近 7 天</option>
+                            <option value="15">近 15 天</option>
+                            <option value="30">近 30 天</option>
+                            <option value="90">近 90 天</option>
+                        </select>
+                        <input type="number" id="monitor_days" name="monitor_days"
+                               value="{{ settings.monitor_days }}"
+                               class="form-control" style="width:100px;"
+                               min="1" max="365" required>
+                        <span style="font-size:13px;color:var(--text-muted);">天</span>
+                    </div>
+                    <div class="form-hint">
+                        每次检查时拉取最近 N 天内的邮件。范围越大首次处理越慢
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="llm_retry_interval">LLM 重试间隔（秒）</label>
+                    <input type="number" id="llm_retry_interval" name="llm_retry_interval"
+                           value="{{ settings.llm_retry_interval }}"
+                           class="form-control" style="width:120px;"
+                           min="1" max="300" required>
+                    <div class="form-hint">
+                        LLM 分析失败后，每次重试之间的等待秒数
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="llm_max_retries">LLM 最大重试次数</label>
+                    <input type="number" id="llm_max_retries" name="llm_max_retries"
+                           value="{{ settings.llm_max_retries }}"
+                           class="form-control" style="width:120px;"
+                           min="0" max="10" required>
+                    <div class="form-hint">
+                        0 = 不重试；全部重试失败后邮件仍会转发并标注「大模型分析失败」
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="context_window_tokens">上下文窗口 (tokens)</label>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <input type="number" id="context_window_tokens" name="context_window_tokens"
+                               value="{{ settings.context_window_tokens }}"
+                               class="form-control" style="width:140px;"
+                               min="0" max="2147483647" required>
+                        <button type="button" class="btn btn-outline btn-sm" onclick="detectContextWindow()" id="detect-btn" style="white-space:nowrap;">
+                            🔍 自动探测
+                        </button>
+                        <span id="detect-result" style="font-size:12px;color:var(--text-muted);"></span>
+                    </div>
+                    <div class="form-hint">
+                        0 = 自动探测当前 LLM 上下文窗口大小；>0 的用户设定值优先。影响分析/修订的 token 预算和正文截断长度。
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>AI 解读输出方式</label>
+                    <div style="display:flex;gap:20px;margin-top:6px;">
+                        <label class="radio-label" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                            <input type="radio" name="analysis_output_mode" value="content"
+                                   {% if settings.analysis_output_mode == 'content' %}checked{% endif %}>
+                            <span>📧 邮件正文</span>
+                        </label>
+                        <label class="radio-label" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                            <input type="radio" name="analysis_output_mode" value="attachment"
+                                   {% if settings.analysis_output_mode == 'attachment' %}checked{% endif %}>
+                            <span>📎 Word 附件</span>
+                        </label>
+                    </div>
+                    <div class="form-hint">
+                        选择「邮件正文」将 AI 解读直接显示在邮件中；选择「Word 附件」则生成 .docx 文档作为附件发送，正文仅保留摘要
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 修改版文书生成 -->
+    <div class="card">
+        <div class="card-header"><h3>📝 修改版文书生成</h3></div>
+        <div class="card-body">
+            <div class="form-group">
+                <label>启用修改版文书生成</label>
+                <div style="margin-top:6px;">
+                    <input type="hidden" name="revision_enabled" value="false">
+                    <input type="checkbox" name="revision_enabled" value="true"
+                           {% if settings.revision_enabled == 'true' %}checked{% endif %}
+                           onchange="toggleRevisionFields(this.checked)"
+                           style="width:18px;height:18px;cursor:pointer;">
+                    <span style="margin-left:6px;font-size:14px;">LLM 分析后自动生成修改版文书</span>
+                </div>
+                <div class="form-hint">
+                    启用后，系统会在 LLM 分析完成后用审核意见对原文书进行修订，生成「修改版文书.docx」作为附件随邮件转发。会增加一次 LLM 调用。
+                </div>
+            </div>
+
+            <div id="revision-prompt-group" style="margin-top:16px;display:none;">
+                <label for="revision_prompt">修订提示词模板</label>
+                <textarea id="revision_prompt" name="revision_prompt"
+                          class="form-control" rows="6"
+                          style="font-family:monospace;font-size:12px;"
+                          placeholder="留空使用系统默认提示词">{{ settings.revision_prompt }}</textarea>
+                <div class="form-hint">
+                    自定义 LLM 修订提示词。占位符：{doc_type} {ai_interpretation} {original_text}。留空则使用内置默认提示词。<br>
+                    💡 <strong>修订提示词</strong> 控制 LLM <strong>如何修改</strong>（修正规则、语气、标记规范），而
+                    <a href="/doc-templates" style="color:var(--accent);">文书模板</a>
+                    控制修订后文书的<strong>格式结构</strong>（段落顺序、必备要素）。两者互补，各司其职。
+                </div>
+            </div>
+
+            <div id="revision-highlight-group" style="margin-top:16px;display:none;">
+                <label>色彩标注改动</label>
+                <div style="margin-top:6px;">
+                    <input type="hidden" name="revision_highlight" value="false">
+                    <input type="checkbox" name="revision_highlight" value="true"
+                           {% if settings.revision_highlight == 'true' or not settings.revision_highlight %}checked{% endif %}
+                           style="width:18px;height:18px;cursor:pointer;">
+                    <span style="margin-left:6px;font-size:14px;">在 Word 文档中用颜色标注修改内容</span>
+                </div>
+                <div class="form-hint">
+                    <span style="color:#0046c8;">■ 蓝色 = 新增</span>
+                    &nbsp;&nbsp;
+                    <span style="color:#c80000;">■ 红色 = 修改</span>
+                    &nbsp;&nbsp;
+                    <span style="color:#b40000;text-decoration:line-through;">■ 删除线 = 建议删除</span>
+                    &nbsp; 关闭则以纯文本输出。
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 审核意见模板 -->
+    <div class="card">
+        <div class="card-header"><h3>📋 审核意见模板</h3></div>
+        <div class="card-body">
+            <div class="form-group">
+                <label>启用审核意见模板</label>
+                <div style="margin-top:6px;">
+                    <input type="hidden" name="review_template_enabled" value="false">
+                    <input type="checkbox" name="review_template_enabled" value="true"
+                           {% if settings.review_template_enabled == 'true' %}checked{% endif %}
+                           onchange="toggleReviewTemplateFields(this.checked)"
+                           style="width:18px;height:18px;cursor:pointer;">
+                    <span style="margin-left:6px;font-size:14px;">用 DOCX 模板生成审核意见</span>
+                </div>
+                <div class="form-hint">
+                    启用后，系统将使用指定的 DOCX 模板替换 xxx 占位符，
+                    生成「审核意见.docx」作为附件转发。
+                </div>
+            </div>
+
+            <div id="review-template-path-group" style="margin-top:16px;display:none;">
+                <label for="review_template_path">模板文件路径</label>
+                <input type="text" id="review_template_path" name="review_template_path"
+                       value="{{ settings.review_template_path }}"
+                       class="form-control" style="width:480px;"
+                       placeholder="templates/合同审核意见模板.docx">
+                <div class="form-hint">
+                    相对于项目根目录的路径。模板需为 .docx 格式，其中的 xxx 将被替换为实际信息。
+                    模板示例：<br>
+                    P1: "...收到<b>xxx</b>发来的拟与<b>xxx</b>签订的《<b>xxx</b>》。合同内容为<b>xxx</b>事宜。合同价款<b>xxx</b>元。"<br>
+                    P6: 日期自动替换为当前日期
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 日志与报告 -->
+    <div class="card">
+        <div class="card-header"><h3>📋 日志与报告</h3></div>
+        <div class="card-body">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;">
+                <!-- 左：日志保留 -->
+                <div class="form-group">
+                    <label for="log_retention_days">日志保留天数</label>
+                    <input type="number" id="log_retention_days" name="log_retention_days"
+                           value="{{ settings.log_retention_days }}"
+                           class="form-control" style="width:120px;"
+                           min="0" max="365" required>
+                    <div class="form-hint">0=永久保留（不推荐）；N天后自动清理记录和附件</div>
+                </div>
+
+                <!-- 右：日报开关 -->
+                <div class="form-group">
+                    <label>每日运行报告</label>
+                    <div style="margin-top:6px;">
+                        <input type="hidden" name="daily_report_enabled" value="false">
+                        <input type="checkbox" name="daily_report_enabled" value="true"
+                               {% if settings.daily_report_enabled == 'true' %}checked{% endif %}
+                               onchange="toggleReportFields(this.checked)"
+                               style="width:18px;height:18px;cursor:pointer;">
+                        <span style="margin-left:6px;font-size:14px;">启用</span>
+                    </div>
+                    <div class="form-hint">每天定时发送运行汇总报告</div>
+                </div>
+
+                <!-- 日报时间 -->
+                <div class="form-group" id="report-time-group">
+                    <label for="daily_report_time">日报发送时间</label>
+                    <input type="time" id="daily_report_time" name="daily_report_time"
+                           value="{{ settings.daily_report_time }}"
+                           class="form-control" style="width:150px;">
+                    <div class="form-hint">24 小时制，默认 09:00</div>
+                </div>
+
+                <!-- 日报邮箱 -->
+                <div class="form-group" id="report-email-group">
+                    <label for="admin_email">日报接收邮箱</label>
+                    <input type="email" id="admin_email" name="admin_email"
+                           value="{{ settings.admin_email }}"
+                           class="form-control" style="width:260px;"
+                           placeholder="输入接收日报的邮箱">
+                    <div class="form-hint">留空则不发送。需先配置默认 SMTP</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 操作按钮 -->
+    <div style="display:flex;gap:12px;align-items:center;margin-top:24px;">
+        <button type="submit" class="btn btn-primary">💾 保存设置</button>
+        <a href="/dashboard" class="btn btn-outline">取消</a>
+    </div>
+
+    </form>
+
+    <!-- 服务与备份 -->
+    <div class="card" style="margin-top:24px;">
+        <div class="card-header"><h3>🔧 服务控制与备份</h3></div>
+        <div class="card-body">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;">
+                <!-- 左：服务控制 -->
+                <div>
+                    <h4 style="margin-bottom:8px;">🔄 服务控制</h4>
+                    <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">
+                        修改端口后点击重启生效。重启/关闭期间约 3-5 秒不可用。
+                    </p>
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <button type="button" class="btn btn-warning" onclick="restartService()" id="restart-btn">🔄 重启服务</button>
+                        <button type="button" class="btn btn-danger" onclick="shutdownService()" id="shutdown-btn">⏹ 停止服务</button>
+                    </div>
+                    <span id="service-msg" style="font-size:13px;display:block;margin-top:8px;"></span>
+                </div>
+
+                <!-- 右：配置备份 -->
+                <div>
+                    <h4 style="margin-bottom:8px;">💾 配置备份与恢复</h4>
+                    <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">
+                        导出所有配置为 JSON 文件，加密字段密文保存。恢复时追加到现有数据。
+                    </p>
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                        <a href="/backup/export" class="btn btn-primary">📥 导出</a>
+                        <form method="post" action="/backup/import" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:center;">
+                            {{ csrf_token_input(request)|safe }}
+                            <input type="file" name="file" accept=".json" required
+                                   style="font-size:13px;padding:6px;border:1px solid var(--border);border-radius:6px;max-width:160px;">
+                            <button type="submit" class="btn btn-primary" style="white-space:nowrap;">📤 恢复</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 修改密码 -->
+    <div class="card" style="margin-top:24px;">
+        <div class="card-header"><h3>🔒 修改登录密码</h3></div>
+        <div class="card-body">
+            <div class="form-group">
+                <label for="old_password">原密码</label>
+                <input type="password" id="old_password" class="form-control" style="width:260px;" placeholder="输入当前密码">
+            </div>
+            <div class="form-group" style="margin-top:16px;">
+                <label for="new_password">新密码</label>
+                <input type="password" id="new_password" class="form-control" style="width:260px;" placeholder="至少 6 位">
+            </div>
+            <div class="form-group" style="margin-top:16px;">
+                <label for="confirm_password">确认新密码</label>
+                <input type="password" id="confirm_password" class="form-control" style="width:260px;" placeholder="再次输入新密码">
+            </div>
+            <div style="margin-top:16px;">
+                <button type="button" class="btn btn-primary" onclick="changePassword()" id="change-pw-btn">
+                    🔑 修改密码
+                </button>
+                <span id="change-pw-msg" style="margin-left:12px;font-size:13px;"></span>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function setMonitorDays(val) {
+    if (val) {
+        document.getElementById('monitor_days').value = val;
+    }
+}
+
+// 日报字段联动：取消勾选时隐藏时间/邮箱字段
+function toggleReportFields(enabled) {
+    var timeGroup = document.getElementById('report-time-group');
+    var emailGroup = document.getElementById('report-email-group');
+    if (timeGroup) timeGroup.style.display = enabled ? '' : 'none';
+    if (emailGroup) emailGroup.style.display = enabled ? '' : 'none';
+}
+// 修改版文书字段联动：取消勾选时隐藏提示词和色彩选项
+function toggleRevisionFields(enabled) {
+    var promptGroup = document.getElementById('revision-prompt-group');
+    var highlightGroup = document.getElementById('revision-highlight-group');
+    if (promptGroup) promptGroup.style.display = enabled ? '' : 'none';
+    if (highlightGroup) highlightGroup.style.display = enabled ? '' : 'none';
+}
+// 页面加载时根据当前状态设置
+document.addEventListener('DOMContentLoaded', function() {
+    var dailyCb = document.querySelector('input[name="daily_report_enabled"][type="checkbox"]');
+    if (dailyCb) toggleReportFields(dailyCb.checked);
+    var revCb = document.querySelector('input[name="revision_enabled"][type="checkbox"]');
+    if (revCb) toggleRevisionFields(revCb.checked);
+    var rtCb = document.querySelector('input[name="review_template_enabled"][type="checkbox"]');
+    if (rtCb) toggleReviewTemplateFields(rtCb.checked);
+});
+
+function toggleReviewTemplateFields(enabled) {
+    var group = document.getElementById('review-template-path-group');
+    if (group) group.style.display = enabled ? '' : 'none';
+}
+
+async function detectContextWindow() {
+    var btn = document.getElementById('detect-btn');
+    var result = document.getElementById('detect-result');
+    btn.disabled = true;
+    btn.textContent = '⏳ 探测中...';
+    result.textContent = '';
+    try {
+        var resp = await fetch('/settings/detect-context-window');
+        var data = await resp.json();
+        if (data.success) {
+            document.getElementById('context_window_tokens').value = data.window;
+            result.innerHTML = '<span style="color:#38a169;">✅ ' + data.message + '</span>';
+        } else {
+            result.innerHTML = '<span style="color:#e53e3e;">❌ ' + data.message + '</span>';
+        }
+    } catch(e) {
+        result.innerHTML = '<span style="color:#e53e3e;">❌ 请求失败: ' + (e.message || '未知') + '</span>';
+    }
+    btn.disabled = false;
+    btn.textContent = '🔍 自动探测';
+}
+
+function _serviceMsg(text, color) {
+    var el = document.getElementById('service-msg');
+    el.innerHTML = '';
+    var span = document.createElement('span');
+    span.style.color = color || '#d69e2e';
+    span.textContent = text;
+    el.appendChild(span);
+}
+
+function _enableServiceBtns(enabled) {
+    document.getElementById('restart-btn').disabled = !enabled;
+    document.getElementById('shutdown-btn').disabled = !enabled;
+}
+
+async function restartService() {
+    var btn = document.getElementById('restart-btn');
+    if (!confirm('确定要重启服务吗？重启期间约 3-5 秒不可用。')) return;
+    btn.disabled = true;
+    btn.textContent = '⏳ 重启中...';
+    _serviceMsg('正在重启服务，页面将在 5 秒后自动刷新...', '#d69e2e');
+    try {
+        var resp = await fetch('/settings/restart', { method: 'POST' });
+        var data = await resp.json();
+        _serviceMsg('✅ ' + data.message, '#38a169');
+    } catch(e) {
+        _serviceMsg('❌ 重启请求失败', '#e53e3e');
+        btn.disabled = false;
+        btn.textContent = '🔄 重启服务';
+        return;
+    }
+    // 轮询等待服务恢复
+    var attempts = 0;
+    async function checkHealth() {
+        attempts++;
+        try {
+            var r = await fetch('/health');
+            if (r.ok) {
+                window.location.reload();
+                return;
+            }
+        } catch(e) {}
+        if (attempts < 30) {
+            setTimeout(checkHealth, 1000);
+        } else {
+            _serviceMsg('服务重启超时，请手动检查', '#e53e3e');
+            btn.disabled = false;
+            btn.textContent = '🔄 重启服务';
+        }
+    }
+    checkHealth();
+}
+
+async function shutdownService() {
+    var btn = document.getElementById('shutdown-btn');
+    if (!confirm('⚠️ 确定要停止服务吗？停止后系统将不可用，需要手动在终端重新启动。')) return;
+    btn.disabled = true;
+    btn.textContent = '⏳ 停止中...';
+    _enableServiceBtns(false);
+    _serviceMsg('正在停止服务...', '#d69e2e');
+    try {
+        var resp = await fetch('/settings/shutdown', { method: 'POST' });
+        var data = await resp.json();
+        _serviceMsg('服务已停止' ,'#38a169');
+    } catch(e) {
+        // 服务停止后 fetch 也可能因为连接断开而报错，这是正常的
+        _serviceMsg('服务已停止，终端窗口可关闭', '#38a169');
+    }
+    btn.textContent = '⏹ 已停止';
+}
+
+async function changePassword() {
+    var btn = document.getElementById('change-pw-btn');
+    var msg = document.getElementById('change-pw-msg');
+    var oldPw = document.getElementById('old_password').value;
+    var newPw = document.getElementById('new_password').value;
+    var confirmPw = document.getElementById('confirm_password').value;
+
+    if (!oldPw || !newPw || !confirmPw) {
+        msg.innerHTML = '<span style="color:#e53e3e;">请填写所有字段</span>';
+        return;
+    }
+    if (newPw.length < 6) {
+        msg.innerHTML = '<span style="color:#e53e3e;">新密码至少 6 位</span>';
+        return;
+    }
+    if (newPw !== confirmPw) {
+        msg.innerHTML = '<span style="color:#e53e3e;">两次输入的新密码不一致</span>';
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = '⏳ 修改中...';
+    msg.innerHTML = '';
+
+    var formData = new FormData();
+    formData.append('old_password', oldPw);
+    formData.append('new_password', newPw);
+    formData.append('confirm_password', confirmPw);
+
+    try {
+        var resp = await fetch('/settings/change-password', { method: 'POST', body: formData });
+        var data = await resp.json();
+        if (data.success) {
+            var span = document.createElement('span');
+            span.style.color = '#38a169';
+            span.textContent = '✅ ' + data.message;
+            msg.appendChild(span);
+            document.getElementById('old_password').value = '';
+            document.getElementById('new_password').value = '';
+            document.getElementById('confirm_password').value = '';
+        } else {
+            var span = document.createElement('span');
+            span.style.color = '#e53e3e';
+            span.textContent = '❌ ' + data.message;
+            msg.appendChild(span);
+        }
+    } catch(e) {
+        var span = document.createElement('span');
+        span.style.color = '#e53e3e';
+        span.textContent = '❌ 请求失败: ' + (e.message || '未知错误');
+        msg.appendChild(span);
+    }
+    btn.disabled = false;
+    btn.textContent = '🔑 修改密码';
+}
+</script>
+{% endblock %}
