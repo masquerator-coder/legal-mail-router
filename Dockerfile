@@ -30,12 +30,15 @@ COPY LLM提示词.md ./
 # 创建数据目录
 RUN mkdir -p /app/data/attachments
 
-# 暴露端口
-EXPOSE 8888
+# 默认端口（可通过 docker run -e PORT=9000 或 docker-compose 覆盖）
+ENV PORT=8020
+
+# 暴露端口（EXPOSE 仅作文档用途，实际端口由 PORT 环境变量控制）
+EXPOSE 8020
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8888/health')" || exit 1
+    CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://localhost:{os.environ.get(\"PORT\",\"8020\")}/health')" || exit 1
 
-# 启动
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8888"]
+# 启动（shell 形式支持环境变量替换）
+CMD python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT}

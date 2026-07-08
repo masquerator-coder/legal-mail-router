@@ -31,6 +31,8 @@
                             <span class="badge badge-info">PaddleOCR</span>
                         {% elif cfg.provider_type == 'openai-vision' %}
                             <span class="badge badge-accent">Vision API</span>
+                        {% elif cfg.provider_type == 'mineru' %}
+                            <span class="badge badge-primary">MinerU</span>
                         {% else %}
                             <span class="badge badge-default">{{ cfg.provider_type }}</span>
                         {% endif %}
@@ -47,7 +49,10 @@
                     <td>
                         <button class="btn btn-outline btn-xs" onclick="testOCR({{ cfg.id }})">🔗 测试</button>
                         <button class="btn btn-outline btn-xs" onclick='editOCR({{ cfg.id|tojson }}, {{ cfg.name|tojson }}, {{ cfg.provider_type|tojson }}, {{ cfg.api_url|tojson }}, {{ cfg.model_name|tojson }}, {{ cfg.is_active|lower }})'>✏️</button>
-                        <a href="/ocr-config/delete/{{ cfg.id }}" class="btn btn-outline btn-xs" style="color:var(--danger);" onclick="return confirm('确定删除？')">🗑</a>
+                        <form method="post" action="/ocr-config/delete/{{ cfg.id }}" style="display:inline;" onsubmit="return confirm('确定删除？')">
+                            {{ csrf_token_input(request)|safe }}
+                            <button type="submit" class="btn btn-outline btn-xs" style="color:var(--danger);">🗑</button>
+                        </form>
                     </td>
                 </tr>
                 {% endfor %}
@@ -88,6 +93,7 @@
                 <select name="provider_type" id="cfg-provider" class="form-control">
                     <option value="paddleocr">PaddleOCR</option>
                     <option value="openai-vision">OpenAI Vision (多模态模型)</option>
+                    <option value="mineru">MinerU (文档解析)</option>
                     <option value="custom">自定义</option>
                 </select>
 
@@ -100,6 +106,12 @@
 
                 <label>模型名称 <small>(Vision 类型需要)</small></label>
                 <input type="text" name="model_name" id="cfg-model" value="" class="form-control" placeholder="如 gpt-4o / Qwen2.5-VL-72B">
+
+                <label style="display:flex;align-items:center;gap:8px;margin-top:12px;">
+                    <input type="hidden" name="is_active" value="false">
+                    <input type="checkbox" name="is_active" id="cfg-active" value="true" checked style="width:16px;height:16px;">
+                    <span>启用</span>
+                </label>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-outline" onclick="closeModal('add-modal')">取消</button>
@@ -120,6 +132,7 @@ function editOCR(id, name, provider, url, model, active) {
     document.getElementById('cfg-url').value = url;
     document.getElementById('cfg-model').value = model || '';
     document.getElementById('cfg-key').value = '';
+    document.getElementById('cfg-active').checked = active;
     openModal('add-modal');
 }
 

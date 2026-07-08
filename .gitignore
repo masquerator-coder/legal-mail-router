@@ -1,17 +1,26 @@
-venv/
+# Python
 __pycache__/
-*.pyc
-*.pyo
-.egg-info/
-data/
-.env
-*.log
-log/
-.pytest_cache/
-.ruff_cache/
-tests/
-scripts/
-*.db-shm
-*.db-wal
-*.db
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Project specific
+data/
+*.db
+.reasonix/
+
+# Config with secrets (encryption key)
+data/.encryption_key

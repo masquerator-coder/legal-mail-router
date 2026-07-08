@@ -83,9 +83,15 @@ async def update_ocr_config(
     return RedirectResponse(url="/ocr-config", status_code=303)
 
 
-@router.get("/delete/{cfg_id}")
-async def delete_ocr_config(cfg_id: int, request: Request, db: Session = Depends(get_db)):
+@router.post("/delete/{cfg_id}")
+async def delete_ocr_config(
+    cfg_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
     """删除 OCR 配置"""
+    check_csrf(request, form_csrf)
     cfg = db.query(OCRConfig).filter_by(id=cfg_id).first()
     if not cfg:
         flash(request, "配置不存在", "error")

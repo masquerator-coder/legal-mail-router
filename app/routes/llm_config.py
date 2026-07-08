@@ -98,8 +98,14 @@ async def edit_llm_config(
     return RedirectResponse(url="/llm-config", status_code=303)
 
 
-@router.get("/delete/{config_id}")
-async def delete_llm_config(config_id: int, request: Request, db: Session = Depends(get_db)):
+@router.post("/delete/{config_id}")
+async def delete_llm_config(
+    config_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
+    check_csrf(request, form_csrf)
     config = db.query(LLMConfig).filter_by(id=config_id).first()
     if config:
         db.delete(config)
@@ -108,8 +114,14 @@ async def delete_llm_config(config_id: int, request: Request, db: Session = Depe
     return RedirectResponse(url="/llm-config", status_code=303)
 
 
-@router.get("/activate/{config_id}")
-async def activate_llm_config(config_id: int, request: Request, db: Session = Depends(get_db)):
+@router.post("/activate/{config_id}")
+async def activate_llm_config(
+    config_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
+    check_csrf(request, form_csrf)
     db.query(LLMConfig).filter_by(is_active=True).update({"is_active": False})
     config = db.query(LLMConfig).filter_by(id=config_id).first()
     if config:

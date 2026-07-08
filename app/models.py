@@ -69,28 +69,24 @@ class RoutingRule(Base):
     __tablename__ = "routing_rules"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(
-        Integer, ForeignKey("email_accounts.id", ondelete="CASCADE"),
-        nullable=True, default=None,
-        comment="关联邮箱账户(NULL=全局规则)"
+    account_ids = Column(
+        Text, default="",
+        comment="关联邮箱账户ID(逗号分隔,空=全局规则)"
     )
-    doc_type = Column(String(50), nullable=False, comment="文书类型")
-    keywords = Column(Text, default="", comment="关键词(逗号分隔)")
+    doc_type = Column(String(50), nullable=False, default="", comment="[废弃] 文书类型 — 当前版本未启用按类型匹配")
+    keywords = Column(Text, default="", comment="[废弃] 关键词(逗号分隔) — 当前版本未启用关键词匹配")
     target_email = Column(String(200), nullable=False, comment="目标邮箱")
     target_name = Column(String(100), default="", comment="目标律师姓名")
     smtp_host = Column(String(200), default="", comment="SMTP服务器(空=使用默认)")
     smtp_port = Column(Integer, default=587)
     smtp_username = Column(String(200), default="")
     smtp_password_encrypted = Column(Text, default="")
-    priority = Column(Integer, default=0, comment="优先级(数字越大越优先)")
+    priority = Column(Integer, default=0, comment="[废弃] 优先级 — 当前版本未使用")
     enabled = Column(Boolean, default=True, comment="是否启用")
     created_at = Column(DateTime, default=datetime.now)
 
-    account = relationship("EmailAccount", backref="routing_rules")
-
     __table_args__ = (
         Index("ix_routing_rules_enabled_priority", "enabled", "priority"),
-        Index("ix_routing_rules_account_id", "account_id"),
     )
 
 
@@ -125,6 +121,7 @@ class EmailLog(Base):
     target_email = Column(String(200), comment="转发目标邮箱")
     status = Column(String(20), default="pending", comment="pending/analyzed/forwarded/failed/skipped")
     llm_raw_response = Column(Text, comment="LLM原始响应")
+    doc_types = Column(Text, comment="多附件时所有文书类型列表(逗号分隔)")
     error_message = Column(Text, comment="错误信息")
     created_at = Column(DateTime, default=datetime.now)
 

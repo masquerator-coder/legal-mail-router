@@ -35,6 +35,10 @@ def _load_or_create_session_key():
             return key[:32]
     key = os.urandom(32)
     SESSION_KEY_FILE.write_bytes(key)
+    try:
+        SESSION_KEY_FILE.chmod(0o600)
+    except Exception:
+        pass  # Windows 下 chmod 可能不支持，忽略
     logger.info("已生成新的 session 密钥并持久化保存")
     return key
 
@@ -111,7 +115,7 @@ app.add_middleware(
     session_cookie="starze_session",
     max_age=86400,          # 24 小时过期
     same_site="lax",        # 限制跨站请求
-    https_only=False,       # 内网部署可关闭；公网部署务必设为 True
+    https_only=os.environ.get("FORCE_HTTPS", "").lower() in ("true", "1", "yes"),
 )
 
 # 静态文件
@@ -216,4 +220,4 @@ async def favicon():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8888, reload=False)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8020, reload=False)

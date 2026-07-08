@@ -3,8 +3,11 @@ LLM 分析模块 — 调用 OpenAI 兼容 API 分析法律文书
 """
 import json
 import logging
+import re
 import httpx
 from app.config import decrypt
+from config.model_windows import KNOWN_MODEL_WINDOWS, DEFAULT_CONTEXT_WINDOW
+from app.prompt_budget import estimate_tokens, truncate_prompt_parts
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +70,18 @@ DEFAULT_ANALYSIS_PROMPT = """你是一位资深法律文书分析专家。请按
 }}"""
 
 
-def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "", routing_doc_types: list = None) -> str:
-    """构建分析 prompt。routing_doc_types 为路由规则中的文书类型列表。"""
+def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
+                  body_max_chars: int = 8000,
+                  kb_context: str = "",
+                  routing_doc_types: list = None) -> str:
+    """构建分析 prompt。body_max_chars 为邮件正文字符上限（0=不截断）。"""
     template = custom_prompt if custom_prompt.strip() else _get_default_prompt()
 
-    # 截断过长的正文（保留前 4000 字符）
-    body_truncated = body[:4000]
+    # 截断过长的正文
+    if body_max_chars > 0 and len(body) > body_max_chars:
+        body_truncated = body[:body_max_chars]
+    else:
+        body_truncated = body
 
     # 构建文书类型列表
     if routing_doc_types:
@@ -121,6 +130,9 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "", 
     prompt = template.format(**format_args)
     if classifier_hint:
         prompt += classifier_hint
+    # 注入知识库检索结果
+    if kb_context:
+        prompt += "\n\n" + kb_context
     return prompt
 
 
@@ -138,6 +150,12 @@ async def analyze_email(
     routing_doc_types: list = None,
     images: list = None,
     model_type: str = "unknown",
+    kb_context: str = "",
+    body_max_chars: int = 8000,
+    timeout: int = 180,
+    context_window: int = 0,
+    usage_ratio: float = 0.50,
+    token_method: str = "approximate",
 ) -> dict:
     """
     使用 LLM 分析邮件（含附件文本）
@@ -156,7 +174,27 @@ async def analyze_email(
     }
     """
     api_key = decrypt(api_key_encrypted)
-    prompt = build_prompt(subject, sender, body, custom_prompt, routing_doc_types)
+
+    # 构建 base prompt（不含 kb_context，因为它需要单独跟踪用于截断）
+    prompt = build_prompt(subject, sender, body, custom_prompt,
+                          body_max_chars=body_max_chars,
+                          routing_doc_types=None)
+
+    # 预算检查（在提交前检测是否需要截断）
+    if context_window > 0:
+        parts = {
+            "template_with_body": prompt,
+            "kb_context": kb_context,
+            "attachment_texts": attachment_texts,
+        }
+        parts = truncate_prompt_parts(parts, context_window, usage_ratio, max_tokens, token_method)
+        prompt = parts["template_with_body"]
+        kb_context = parts.get("kb_context", "")
+        attachment_texts = parts.get("attachment_texts", "")
+
+    # 拼接 kb_context
+    if kb_context:
+        prompt += "\n\n" + kb_context
 
     # 拼接附件内容
     if attachment_texts:
@@ -202,7 +240,7 @@ async def analyze_email(
         "temperature": temperature,
     }
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(api_url, headers=headers, json=payload)
         response.raise_for_status()
         data = response.json()
@@ -262,43 +300,8 @@ def _fallback_analysis() -> dict:
 
 # ════════════════════════════════════════════
 # 已知模型上下文窗口（tokens）
+# 已移至 config/model_windows.py
 # ════════════════════════════════════════════
-
-KNOWN_MODEL_WINDOWS = {
-    # OpenAI
-    "gpt-4o": 128_000, "gpt-4o-mini": 128_000,
-    "gpt-4-turbo": 128_000, "gpt-4": 8192, "gpt-4-32k": 32768,
-    "gpt-3.5-turbo": 16385, "gpt-3.5-turbo-16k": 16385,
-    "o1": 200_000, "o1-mini": 128_000, "o3-mini": 200_000,
-    # Anthropic
-    "claude-3-opus": 200_000, "claude-3-sonnet": 200_000,
-    "claude-3-haiku": 200_000, "claude-3.5-sonnet": 200_000,
-    "claude-3.5-haiku": 200_000, "claude-4-sonnet": 200_000,
-    # DeepSeek
-    "deepseek-v3": 131_072, "deepseek-v4": 131_072,
-    "deepseek-r1": 131_072, "deepseek-chat": 131_072,
-    "deepseek-coder": 131_072, "deepseek-reasoner": 131_072,
-    # Google
-    "gemini-2.0-flash": 1_048_576, "gemini-2.0-pro": 2_097_152,
-    "gemini-1.5-pro": 2_097_152, "gemini-1.5-flash": 1_048_576,
-    # Qwen (通义千问)
-    "qwen-max": 32768, "qwen-plus": 131_072, "qwen-turbo": 131_072,
-    "qwen3": 131_072, "qwen2.5": 131_072,
-    "qwq": 131_072,
-    # GLM (智谱)
-    "glm-4": 128_000, "glm-4-plus": 128_000, "glm-4-flash": 128_000,
-    "glm-4v": 128_000,
-    # Moonshot / Kimi
-    "moonshot-v1": 131_072, "kimi": 131_072,
-    # Yi (零一万物)
-    "yi-large": 32768, "yi-medium": 16384,
-    # Mistral
-    "mistral-large": 131_072, "mistral-medium": 32768,
-    "mistral-small": 32768,
-}
-
-# 默认上下文窗口（未知模型回退值）
-DEFAULT_CONTEXT_WINDOW = 131_072
 
 # 已知多模态模型关键词（用于探测补充）
 _VISION_KEYWORDS = [
@@ -325,7 +328,6 @@ def detect_context_window(api_url: str, api_key: str, model_name: str) -> int:
             return window
 
     # ── 策略2: 关键词推断 ──
-    import re
     # 128k / 200k / 1M 等显式标注
     m = re.search(r'(\d+)\s*[kK]', model_name)
     if m:
@@ -353,7 +355,6 @@ def detect_context_window(api_url: str, api_key: str, model_name: str) -> int:
         models_url = base_url + "/models"
         headers = {"Authorization": f"Bearer {api_key}"}
         # 同步查询（探测时通常已在线程中）
-        import httpx
         resp = httpx.get(models_url, headers=headers, timeout=10.0)
         if resp.status_code == 200:
             data = resp.json()

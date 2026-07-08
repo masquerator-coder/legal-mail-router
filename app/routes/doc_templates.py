@@ -135,9 +135,15 @@ async def edit_template(
     return RedirectResponse(url="/doc-templates", status_code=303)
 
 
-@router.get("/delete/{template_id}")
-async def delete_template(template_id: int, request: Request, db: Session = Depends(get_db)):
+@router.post("/delete/{template_id}")
+async def delete_template(
+    template_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
     """删除文书模板"""
+    check_csrf(request, form_csrf)
     tmpl = db.query(DocTemplate).filter_by(id=template_id).first()
     if tmpl:
         db.delete(tmpl)
@@ -147,8 +153,14 @@ async def delete_template(template_id: int, request: Request, db: Session = Depe
 
 
 @router.post("/set-default/{template_id}")
-async def set_default_template(template_id: int, request: Request, db: Session = Depends(get_db)):
+async def set_default_template(
+    template_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
     """设为该文书类型的默认模板"""
+    check_csrf(request, form_csrf)
     tmpl = db.query(DocTemplate).filter_by(id=template_id).first()
     if not tmpl:
         return JSONResponse({"success": False, "message": "模板不存在"}, status_code=404)

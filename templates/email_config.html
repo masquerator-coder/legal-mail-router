@@ -41,10 +41,16 @@
                         <button class="btn btn-outline btn-xs" id="test-btn-{{ acc.id }}" onclick="testEmailConnection({{ acc.id }})">🔗 测试</button>
                         <a href="/routing" class="btn btn-outline btn-xs">📋 转发规则</a>
                         <button class="btn btn-outline btn-xs" onclick="openModal('edit-account-modal-{{ acc.id }}')">✏️ 编辑</button>
-                        <a href="/email-config/toggle/{{ acc.id }}" class="btn btn-outline btn-xs">
-                            {{ '⏸ 禁用' if acc.enabled else '▶ 启用' }}
-                        </a>
-                        <a href="/email-config/delete/{{ acc.id }}" class="btn btn-danger btn-xs" onclick="return confirm('确定删除该账户？')">🗑 删除</a>
+                        <form method="post" action="/email-config/toggle/{{ acc.id }}" style="display:inline;">
+                            {{ csrf_token_input(request)|safe }}
+                            <button type="submit" class="btn btn-outline btn-xs">
+                                {{ '⏸ 禁用' if acc.enabled else '▶ 启用' }}
+                            </button>
+                        </form>
+                        <form method="post" action="/email-config/delete/{{ acc.id }}" style="display:inline;" onsubmit="return confirm('确定删除该账户？')">
+                            {{ csrf_token_input(request)|safe }}
+                            <button type="submit" class="btn btn-danger btn-xs">🗑 删除</button>
+                        </form>
                     </td>
                 </tr>
                 <tr id="test-result-row-{{ acc.id }}" style="display:none;">

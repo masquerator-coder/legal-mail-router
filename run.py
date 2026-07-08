@@ -13,7 +13,7 @@
 
 参数:
   --host HOST         监听地址 (默认: 0.0.0.0)
-  --port PORT         监听端口 (默认: 8888)
+  --port PORT         监听端口 (默认: 8020)
   --no-browser        不自动打开浏览器
   --reload            开发模式热重载
   --log-file FILE     日志输出文件 (默认: log/legal-mail.log)
@@ -21,8 +21,10 @@
 import argparse
 import sys
 import os
+import signal
 import time
 import subprocess
+import shutil
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -101,9 +103,9 @@ def cmd_check(args):
         print("数据目录: 未创建")
 
     # antiword
-    antiword = subprocess.run(["which", "antiword"], capture_output=True)
-    if antiword.returncode == 0:
-        print(f"  ✓ antiword ({antiword.stdout.decode().strip()})")
+    antiword_path = shutil.which("antiword")
+    if antiword_path:
+        print(f"  ✓ antiword ({antiword_path})")
     else:
         print("  - antiword 未安装 (.doc 提取降级)")
 
@@ -134,7 +136,7 @@ def cmd_test(args):
     sys.exit(result.returncode)
 
 
-def _resolve_port(args, default=8888) -> int:
+def _resolve_port(args, default=8020) -> int:
     """解析端口：CLI > 数据库设置 > 默认"""
     port = args.port
     if port == default:
@@ -236,7 +238,12 @@ def cmd_stop(args):
 
     try:
         pid = int(PID_FILE.read_text().strip())
-        os.kill(pid, 15)  # SIGTERM
+
+        # 跨平台发送终止信号
+        if sys.platform == "win32":
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+        else:
+            os.kill(pid, signal.SIGTERM)
         print(f"已发送停止信号 (PID: {pid})")
 
         # 等待进程退出
@@ -249,7 +256,11 @@ def cmd_stop(args):
                 PID_FILE.unlink(missing_ok=True)
                 return
         print("⚠️  进程未响应，强制终止...")
-        os.kill(pid, 9)
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True)
+        else:
+            os.kill(pid, signal.SIGKILL)
         PID_FILE.unlink(missing_ok=True)
     except (ValueError, OSError) as e:
         print(f"停止失败: {e}")
@@ -302,7 +313,7 @@ def main():
     # start
     p_start = subparsers.add_parser("start", help="启动服务")
     p_start.add_argument("--host", default="0.0.0.0")
-    p_start.add_argument("--port", type=int, default=8888)
+    p_start.add_argument("--port", type=int, default=8020)
     p_start.add_argument("--no-browser", action="store_true")
     p_start.add_argument("--reload", action="store_true")
     p_start.add_argument("--daemon", action="store_true", help="后台守护进程模式")
@@ -314,7 +325,7 @@ def main():
     # restart
     p_restart = subparsers.add_parser("restart", help="重启后台服务")
     p_restart.add_argument("--host", default="0.0.0.0")
-    p_restart.add_argument("--port", type=int, default=8888)
+    p_restart.add_argument("--port", type=int, default=8020)
     p_restart.add_argument("--daemon", action="store_true", default=True)
     p_restart.add_argument("--log-file", help="日志文件路径")
 
@@ -342,7 +353,7 @@ def main():
         if not hasattr(args, 'host'):
             args.host = "0.0.0.0"
         if not hasattr(args, 'port'):
-            args.port = 8888
+            args.port = 8020
         if not hasattr(args, 'no_browser'):
             args.no_browser = False
         if not hasattr(args, 'reload'):

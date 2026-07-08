@@ -5,8 +5,9 @@
         <h2>📋 处理日志</h2>
         <p>共 {{ total }} 条记录</p>
     </div>
-    <div style="display:flex;gap:16px;">
+    <div style="display:flex;gap:16px;align-items:center;">
         <button class="btn btn-outline btn-sm" onclick="openExportPanel()">📥 导出</button>
+        <button class="btn btn-danger btn-sm" id="delete-selected-btn" style="display:none;" onclick="openDeleteSelectedModal()">🗑️ 删除选中 (<span id="selected-count">0</span>)</button>
         <button class="btn btn-danger btn-sm" onclick="openClearModal()">🗑️ 清除全部记录</button>
     </div>
 </div>
@@ -83,6 +84,7 @@
         <table class="table">
             <thead>
                 <tr>
+                    <th style="width:36px;"><input type="checkbox" id="select-all" onchange="toggleSelectAll(this.checked)" title="全选/取消全选"></th>
                     <th>时间</th>
                     <th>发件人</th>
                     <th>主题</th>
@@ -95,6 +97,7 @@
             <tbody>
                 {% for log in logs %}
                 <tr>
+                    <td style="text-align:center;"><input type="checkbox" class="log-checkbox" value="{{ log.id }}" onchange="updateSelection()"></td>
                     <td style="font-size:12px; white-space:nowrap;">{{ log.created_at.strftime('%m-%d %H:%M') if log.created_at else '-' }}</td>
                     <td style="font-size:12px; max-width:150px; overflow:hidden; text-overflow:ellipsis;">{{ log.sender or '-' }}</td>
                     <td style="font-size:13px; max-width:280px; overflow:hidden; text-overflow:ellipsis;">
@@ -189,6 +192,77 @@ function exportAttachments() {
     window.location.href = url;
 }
 
+// ===== 选择删除 =====
+var _csrfTokenSelection = document.querySelector('meta[name="csrf-token"]').content;
+
+function toggleSelectAll(checked) {
+    document.querySelectorAll('.log-checkbox').forEach(function(cb) {
+        cb.checked = checked;
+    });
+    updateSelection();
+}
+
+function updateSelection() {
+    var checked = document.querySelectorAll('.log-checkbox:checked');
+    var count = checked.length;
+    var btn = document.getElementById('delete-selected-btn');
+    var span = document.getElementById('selected-count');
+    if (count > 0) {
+        btn.style.display = 'inline-block';
+        span.textContent = count;
+    } else {
+        btn.style.display = 'none';
+    }
+}
+
+function openDeleteSelectedModal() {
+    var checked = document.querySelectorAll('.log-checkbox:checked');
+    var ids = [];
+    checked.forEach(function(cb) { ids.push(cb.value); });
+    document.getElementById('delete-ids-input').value = ids.join(',');
+    document.getElementById('delete-selected-count').textContent = ids.length;
+    document.getElementById('delete-selected-modal').classList.add('show');
+}
+
+function closeDeleteSelectedModal() {
+    document.getElementById('delete-selected-modal').classList.remove('show');
+}
+
+function executeDeleteSelected() {
+    var ids = document.getElementById('delete-ids-input').value;
+    if (!ids) return;
+
+    var btn = document.getElementById('execute-delete-btn');
+    btn.disabled = true;
+    btn.textContent = '⏳ 删除中...';
+
+    fetch('/logs/delete-selected', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-CSRF-Token': _csrfTokenSelection,
+        },
+        body: 'log_ids=' + encodeURIComponent(ids),
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        if (data.success) {
+            showToast(data.message, 'success');
+            closeDeleteSelectedModal();
+            setTimeout(function() { location.reload(); }, 1500);
+        } else {
+            showToast(data.message, 'error');
+            btn.disabled = false;
+            btn.textContent = '确认删除';
+        }
+    })
+    .catch(function(e) {
+        showToast('请求失败: ' + e, 'error');
+        btn.disabled = false;
+        btn.textContent = '确认删除';
+    });
+}
+
 // ===== 清除记录（双重确认）=====
 function openClearModal() {
     const modal = document.getElementById('clear-confirm-modal');
@@ -239,6 +313,28 @@ function executeClear() {
         });
 }
 </script>
+
+<!-- 选择删除确认模态框 -->
+<div class="modal-overlay" id="delete-selected-modal">
+    <div class="modal" style="max-width:440px;">
+        <div class="modal-header" style="background:#fff5f5; border-bottom:1px solid #fed7d7;">
+            <h3 style="color:#c53030;">⚠️ 确认删除</h3>
+            <button class="modal-close" onclick="closeDeleteSelectedModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p style="margin-bottom:12px; color:#4a5568;">
+                确定要删除选中的 <strong id="delete-selected-count">0</strong> 条处理记录吗？
+                相关附件文件也将被删除，不可恢复。
+            </p>
+            <input type="hidden" id="delete-ids-input" value="">
+            <div style="display:flex; gap:10px; margin-top:16px; justify-content:flex-end;">
+                <button class="btn btn-outline" onclick="closeDeleteSelectedModal()">取消</button>
+                <button class="btn btn-danger" id="execute-delete-btn"
+                        onclick="executeDeleteSelected()">确认删除</button>
+            </div>
+        </div>
+    </div>
+</div>
 
 <!-- 清除确认模态框 -->
 <div class="modal-overlay" id="clear-confirm-modal">

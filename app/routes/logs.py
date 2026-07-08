@@ -12,7 +12,7 @@ from sqlalchemy import func
 from app.database import get_db
 from app.models import EmailLog, Attachment
 from app.scheduler import scheduler
-from app.config import ATTACHMENTS_DIR
+from app.config import ATTACHMENTS_DIR, resolve_attachment_path
 from app.csrf import check_csrf
 from urllib.parse import quote
 router = APIRouter(prefix="/logs", tags=["处理日志"])
@@ -112,6 +112,66 @@ async def log_detail(log_id: int, request: Request, db: Session = Depends(get_db
     })
 
 
+@router.post("/delete-selected")
+async def delete_selected_logs(
+    request: Request,
+    db: Session = Depends(get_db),
+    log_ids: str = Form(""),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
+    """批量删除选中的处理记录及其附件"""
+    check_csrf(request, form_csrf)
+    import shutil
+    import time
+    from sqlalchemy.exc import OperationalError
+
+    if not log_ids.strip():
+        return {"success": False, "message": "未选择任何记录"}
+
+    try:
+        ids = [int(x.strip()) for x in log_ids.split(",") if x.strip()]
+    except ValueError:
+        return {"success": False, "message": "无效的记录ID"}
+
+    if not ids:
+        return {"success": False, "message": "未选择任何记录"}
+
+    # 先查询要删除的附件文件路径
+    attachments = db.query(Attachment).filter(Attachment.log_id.in_(ids)).all()
+    file_paths = [resolve_attachment_path(att.file_path) for att in attachments if att.file_path]
+
+    # 数据库删除 — 带重试
+    max_retries = 4
+    for attempt in range(max_retries):
+        try:
+            db.query(Attachment).filter(Attachment.log_id.in_(ids)).delete(synchronize_session=False)
+            db.query(EmailLog).filter(EmailLog.id.in_(ids)).delete(synchronize_session=False)
+            db.commit()
+            break
+        except OperationalError as e:
+            db.rollback()
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            raise
+
+    # 删除附件文件
+    deleted_files = 0
+    for fp in file_paths:
+        try:
+            if fp.exists():
+                fp.unlink()
+                deleted_files += 1
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "message": f"已删除 {len(ids)} 条记录（{deleted_files} 个附件文件）",
+        "count": len(ids),
+    }
+
+
 @router.post("/clear")
 async def clear_logs(request: Request, form_csrf: str = Form("", alias="_csrf_token"), db: Session = Depends(get_db)):
     """清除所有处理记录和附件（含重试，防并发写锁）"""
@@ -187,23 +247,31 @@ async def export_csv(
     writer = csv.writer(output)
 
     writer.writerow([
-        "发件人", "收件时间", "主题", "分类", "转发邮箱",
-        "案件摘要", "AI解读", "涉及方", "邮件正文", "附件"
+        "发件人", "收件时间", "主题", "分类", "状态", "转发邮箱",
+        "案件摘要", "AI解读", "涉及方", "错误信息", "邮件正文", "附件"
     ])
 
     for log in logs:
         atts = attachment_map.get(log.id, [])
         attachment_names = "; ".join(att.filename for att in atts) if atts else ""
 
+        # 状态中文映射
+        status_map = {
+            "pending": "待处理", "analyzed": "已分析",
+            "forwarded": "已转发", "failed": "失败", "skipped": "已跳过"
+        }
+
         writer.writerow([
             log.sender or "",
             log.received_at.strftime("%Y-%m-%d %H:%M:%S") if log.received_at else "",
             log.subject or "",
             log.doc_type or "",
+            status_map.get(log.status, log.status or ""),
             log.target_email or "",
             log.case_summary or "",
             log.ai_interpretation or "",
             log.involved_parties or "",
+            log.error_message or "",
             log.body_text or log.body_preview or "",
             attachment_names,
         ])
@@ -261,8 +329,8 @@ async def export_attachments(
             if not att.file_path:
                 continue
 
-            # file_path 存储的是相对 DATA_DIR 的路径，如 attachments/2026-05-11/5/file.pdf
-            full_path = ATTACHMENTS_DIR.parent / att.file_path
+            # file_path 存储的是相对或绝对路径，resolve_attachment_path 统一处理
+            full_path = resolve_attachment_path(att.file_path)
             if not full_path.exists():
                 continue
 

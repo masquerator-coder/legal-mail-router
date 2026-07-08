@@ -117,8 +117,14 @@ async def edit_account(
     return RedirectResponse(url="/email-config", status_code=303)
 
 
-@router.get("/delete/{account_id}")
-async def delete_account(account_id: int, request: Request, db: Session = Depends(get_db)):
+@router.post("/delete/{account_id}")
+async def delete_account(
+    account_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
+    check_csrf(request, form_csrf)
     account = db.query(EmailAccount).filter_by(id=account_id).first()
     if account:
         remove_check_job(account_id)
@@ -128,8 +134,14 @@ async def delete_account(account_id: int, request: Request, db: Session = Depend
     return RedirectResponse(url="/email-config", status_code=303)
 
 
-@router.get("/toggle/{account_id}")
-async def toggle_account(account_id: int, request: Request, db: Session = Depends(get_db)):
+@router.post("/toggle/{account_id}")
+async def toggle_account(
+    account_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
+    check_csrf(request, form_csrf)
     account = db.query(EmailAccount).filter_by(id=account_id).first()
     if account:
         account.enabled = not account.enabled
@@ -138,7 +150,7 @@ async def toggle_account(account_id: int, request: Request, db: Session = Depend
             add_check_job(account.id, account.check_interval)
         else:
             remove_check_job(account.id)
-    flash(request, f"账户「{account.name}」已{'启用' if account.enabled else '停用'}", "success")
+        flash(request, f"账户「{account.name}」已{'启用' if account.enabled else '停用'}", "success")
     return RedirectResponse(url="/email-config", status_code=303)
 
 

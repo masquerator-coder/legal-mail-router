@@ -9,7 +9,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from pathlib import Path
 from typing import Optional
-from app.config import decrypt
+from app.config import decrypt, SYSTEM_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -24,86 +24,104 @@ def _safe_pct(val) -> str:
 
 def _build_email_body(
     to_name: str,
-    analysis: dict,
+    analyses: list[dict],
     original_subject: str,
     original_body: str = "",
     brief_mode: bool = False,
 ) -> str:
-    """构建邮件正文（支持完整版和摘要版）"""
+    """构建邮件正文（支持多分析结果）
+
+    analyses: LLM 分析结果列表，每组对应一份独立文书
+    """
     urgency_map = {"high": "🔴 紧急", "medium": "🟡 一般", "low": "🟢 普通"}
-    urgency_text = urgency_map.get(analysis.get("urgency"), "\U0001f7e1 一般")
 
     # 原邮件正文（截断过长内容）
     body_display = original_body or "（无正文）"
     if len(body_display) > 3000:
         body_display = body_display[:3000] + "\n... (原文过长已截断，请登录监控邮箱查看完整内容)"
 
+    is_multi = len(analyses) > 1
+
+    def _render_one(analysis: dict, idx: int = 0) -> str:
+        urgency_text = urgency_map.get(analysis.get("urgency"), "🟡 一般")
+        ai_interp = analysis.get('ai_interpretation', '')
+        header = f"\n── 第 {idx + 1} 组：{analysis.get('doc_type', '文书')} ──\n" if is_multi else ""
+        if brief_mode:
+            return f"""{header}📋 文书类型：{analysis.get('doc_type', '未知')}
+⚡ 紧急程度：{urgency_text}
+📝 案件摘要：{analysis.get('case_summary', '无')}
+🏛️ 涉及方：{analysis.get('involved_parties', '无')}
+📅 关键日期：{analysis.get('key_date', '无')}
+📎 案号：{analysis.get('case_number', '无')}
+📊 分析置信度：{_safe_pct(analysis.get('confidence'))}
+"""
+        else:
+            interp_section = ai_interp if ai_interp else "（暂无AI解读，请人工审核）"
+            return f"""{header}📋 文书类型：{analysis.get('doc_type', '未知')}
+⚡ 紧急程度：{urgency_text}
+📝 案件摘要：{analysis.get('case_summary', '无')}
+🏛️ 涉及方：{analysis.get('involved_parties', '无')}
+📅 关键日期：{analysis.get('key_date', '无')}
+📎 案号：{analysis.get('case_number', '无')}
+📊 分析置信度：{_safe_pct(analysis.get('confidence'))}
+
+🤖 AI 初步审核解读：
+{interp_section}
+"""
+
     if brief_mode:
-        # 摘要版：仅展示概要信息，提示查看附件
+        sections = []
+        for i, a in enumerate(analyses):
+            sections.append(_render_one(a, i))
+        brief_summary = "系统收到一封法律文书邮件，共分析 {} 份文书。\n".format(
+            len(analyses) if is_multi else ""
+        )
         return f"""您好 {to_name}，
 
-系统收到一封法律文书邮件，AI 分析结果如下：
-
-━━━━━━━━━━━━━━━━━━━━
-\U0001f4cb 文书类型：{analysis.get('doc_type', '未知')}
-\u26a1 紧急程度：{urgency_text}
-\U0001f4dd 案件摘要：{analysis.get('case_summary', '无')}
-\U0001f3db\ufe0f 涉及方：{analysis.get('involved_parties', '无')}
-\U0001f4c5 关键日期：{analysis.get('key_date', '无')}
-\U0001f4ce 案号：{analysis.get('case_number', '无')}
-\U0001f4ca 分析置信度：{_safe_pct(analysis.get('confidence'))}
-━━━━━━━━━━━━━━━━━━━━
+{brief_summary}
+{chr(10).join(sections)}━━━━━━━━━━━━━━━━━━━━
 
 📎 AI 初步审核解读详见附件《AI分析报告.docx》—— 请下载查阅完整解读内容。
 
 原邮件主题：{original_subject}
 
 ━━━━━━━━━━━━━━━━━━━━
-\U0001f4e7 原邮件正文：
+📧 原邮件正文：
 {body_display}
 ━━━━━━━━━━━━━━━━━━━━
 
 此为自动转发，如需查看完整原始邮件请登录监控邮箱。
 
 ---
-文书自动分拣系统
+|{SYSTEM_NAME}
 """
 
-    # 完整版正文（含AI解读）
-    ai_interp = analysis.get('ai_interpretation', '')
-    if not ai_interp:
-        ai_interp = '（暂无AI解读，请人工审核）'
+    # 完整版正文
+    sections = []
+    for i, a in enumerate(analyses):
+        sections.append(_render_one(a, i))
+    section_sep = "\n" + ("━" * 40) + "\n" if is_multi else ""
+    body_content = section_sep.join(sections)
 
     return f"""您好 {to_name}，
 
-系统收到一封法律文书邮件，AI 分析结果如下：
+系统收到一封法律文书邮件，{'共分析 {} 份文书。'.format(len(analyses)) if is_multi else ''}AI 分析结果如下：
 
-━━━━━━━━━━━━━━━━━━━━
-\U0001f4cb 文书类型：{analysis.get('doc_type', '未知')}
-\u26a1 紧急程度：{urgency_text}
-\U0001f4dd 案件摘要：{analysis.get('case_summary', '无')}
-\U0001f3db\ufe0f 涉及方：{analysis.get('involved_parties', '无')}
-\U0001f4c5 关键日期：{analysis.get('key_date', '无')}
-\U0001f4ce 案号：{analysis.get('case_number', '无')}
-\U0001f4ca 分析置信度：{_safe_pct(analysis.get('confidence'))}
-━━━━━━━━━━━━━━━━━━━━
-
-\U0001f916 AI 初步审核解读：
-{ai_interp}
+{body_content}
 
 ━━━━━━━━━━━━━━━━━━━━
 
 原邮件主题：{original_subject}
 
 ━━━━━━━━━━━━━━━━━━━━
-\U0001f4e7 原邮件正文：
+📧 原邮件正文：
 {body_display}
 ━━━━━━━━━━━━━━━━━━━━
 
 此为自动转发，如需查看完整原始邮件请登录监控邮箱。
 
 ---
-文书自动分拣系统
+|{SYSTEM_NAME}
 """
 
 
@@ -154,9 +172,9 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def _generate_analysis_docx(analysis: dict, original_subject: str) -> Optional[str]:
+def _generate_analysis_docx(analyses: list[dict], original_subject: str) -> Optional[str]:
     """
-    将 AI 分析结果生成为 .docx 文件，返回文件路径。
+    将 AI 分析结果生成为 .docx 文件（支持多份文书），返回文件路径。
 
     如果 python-docx 不可用，返回 None 并记录警告。
     """
@@ -169,54 +187,64 @@ def _generate_analysis_docx(analysis: dict, original_subject: str) -> Optional[s
         return None
 
     doc = Document()
+    is_multi = len(analyses) > 1
 
     # ── 标题 ──
     title = doc.add_heading("AI 初步审核解读报告", level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # ── 基本信息表 ──
-    doc.add_heading("基本信息", level=1)
-    table = doc.add_table(rows=8, cols=2, style="Light Grid Accent 1")
-    table.autofit = True
-
     urgency_map = {"high": "🔴 紧急", "medium": "🟡 一般", "low": "🟢 普通"}
-    fields = [
-        ("文书类型", analysis.get("doc_type", "未知")),
-        ("紧急程度", urgency_map.get(analysis.get("urgency"), "🟡 一般")),
-        ("案件摘要", analysis.get("case_summary", "无")),
-        ("涉及方", analysis.get("involved_parties", "无")),
-        ("关键日期", analysis.get("key_date", "无")),
-        ("案号", analysis.get("case_number", "无")),
-        ("分析置信度", _safe_pct(analysis.get("confidence"))),
-        ("原邮件主题", original_subject),
-    ]
-    for i, (key, val) in enumerate(fields):
-        row = table.rows[i]
-        row.cells[0].text = key
-        row.cells[1].text = str(val)
-        # 加粗第一列
-        for paragraph in row.cells[0].paragraphs:
-            for run in paragraph.runs:
-                run.bold = True
 
-    # ── AI 解读正文 ──
-    doc.add_heading("AI 初步审核解读", level=1)
-    ai_interp = analysis.get("ai_interpretation", "")
-    if ai_interp:
-        # 双重保障：清理可能残留的 markdown 标记
-        ai_interp = _strip_markdown(ai_interp)
-        for line in ai_interp.split("\n"):
-            p = doc.add_paragraph(line.strip())
-            p.paragraph_format.space_after = Pt(4)
-            p.paragraph_format.line_spacing = 1.35
-    else:
-        doc.add_paragraph("（暂无AI解读，请人工审核）")
+    for idx, analysis in enumerate(analyses):
+        if not analysis:
+            continue
+
+        if is_multi:
+            doc.add_heading(f"第 {idx + 1} 组：{analysis.get('doc_type', '文书')}", level=1)
+
+        # ── 基本信息表 ──
+        doc.add_heading("基本信息", level=2 if is_multi else 1)
+        table = doc.add_table(rows=8, cols=2, style="Light Grid Accent 1")
+        table.autofit = True
+
+        fields = [
+            ("文书类型", analysis.get("doc_type", "未知")),
+            ("紧急程度", urgency_map.get(analysis.get("urgency"), "🟡 一般")),
+            ("案件摘要", analysis.get("case_summary", "无")),
+            ("涉及方", analysis.get("involved_parties", "无")),
+            ("关键日期", analysis.get("key_date", "无")),
+            ("案号", analysis.get("case_number", "无")),
+            ("分析置信度", _safe_pct(analysis.get("confidence"))),
+            ("原邮件主题", original_subject),
+        ]
+        for i, (key, val) in enumerate(fields):
+            row = table.rows[i]
+            row.cells[0].text = key
+            row.cells[1].text = str(val)
+            for paragraph in row.cells[0].paragraphs:
+                for run in paragraph.runs:
+                    run.bold = True
+
+        # ── AI 解读正文 ──
+        doc.add_heading("AI 初步审核解读", level=2 if is_multi else 1)
+        ai_interp = analysis.get("ai_interpretation", "")
+        if ai_interp:
+            ai_interp = _strip_markdown(ai_interp)
+            for line in ai_interp.split("\n"):
+                p = doc.add_paragraph(line.strip())
+                p.paragraph_format.space_after = Pt(4)
+                p.paragraph_format.line_spacing = 1.35
+        else:
+            doc.add_paragraph("（暂无AI解读，请人工审核）")
+
+        if is_multi and idx < len(analyses) - 1:
+            doc.add_page_break()
 
     # ── 尾部信息 ──
     doc.add_paragraph("")
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = p.add_run("—— 文书自动分拣系统 自动生成 ——")
+    run = p.add_run(f"—— {SYSTEM_NAME} 自动生成 ——")
     run.font.size = Pt(9)
     run.font.color.rgb = RGBColor(128, 128, 128)
 
@@ -239,6 +267,7 @@ def forward_email(
     to_name: str,
     original_subject: str,
     original_body: str = "",
+    analyses_results: list[dict] = None,
     analysis_result: dict = None,
     attachment_paths: list[str] = None,
     analysis_output_mode: str = "content",
@@ -256,33 +285,52 @@ def forward_email(
         to_name: 收件人姓名
         original_subject: 原邮件主题
         original_body: 原邮件正文
-        analysis_result: LLM 分析结果 (含 ai_interpretation)
+        analyses_results: LLM 分析结果列表 (推荐，支持多文书)
+        analysis_result: 单条 LLM 分析结果 (兼容旧调用)
         attachment_paths: 附件路径列表
-        analysis_output_mode: 输出模式 — "content"=邮件正文, "attachment"=Word附件
+        analysis_output_mode: 输出模式
 
-    返回: (成功, 错误信息) — 失败时错误信息包含详细原因
+    返回: (成功, 错误信息)
     """
     smtp_password = decrypt(smtp_password_encrypted)
+
+    # 兼容旧调用：无 analyses_results 时包装 analysis_result
+    if analyses_results is None:
+        analyses = [analysis_result] if analysis_result else [{}]
+    else:
+        analyses = analyses_results if analyses_results else [{}]
 
     msg = MIMEMultipart()
     msg["From"] = from_email
     msg["To"] = to_email
-    # 安全检查：analysis_result 可能为 None（关键词匹配路径）
-    analysis = analysis_result or {}
-    llm_failed = analysis.get("llm_failed", False)
-    if llm_failed:
+
+    # 构建主题：去重后的文书类型
+    doc_types = []
+    any_failed = False
+    seen_dt = set()
+    for a in analyses:
+        if a:
+            if a.get("llm_failed"):
+                any_failed = True
+            dt = a.get("doc_type", "")
+            if dt and dt not in seen_dt:
+                doc_types.append(dt)
+                seen_dt.add(dt)
+    if any_failed:
         msg["Subject"] = f"【大模型分析失败】{original_subject}"
+    elif doc_types:
+        doc_type_str = " / ".join(doc_types)
+        msg["Subject"] = f"【{doc_type_str}】{original_subject}"
     else:
-        msg["Subject"] = f"【{analysis.get('doc_type', '法律文书')}】{original_subject}"
+        msg["Subject"] = f"【法律文书】{original_subject}"
     msg["X-Forwarded-By"] = "文书分拣系统"
     msg["X-Forwarded-For"] = from_email
 
     # ── 构建正文 ──
     if analysis_output_mode == "attachment":
-        # 附件模式：生成 Word 文档作为附件，正文仅保留摘要
-        docx_path = _generate_analysis_docx(analysis, original_subject)
+        docx_path = _generate_analysis_docx(analyses, original_subject)
         body = _build_email_body(
-            to_name, analysis, original_subject, original_body, brief_mode=True
+            to_name, analyses, original_subject, original_body, brief_mode=True
         )
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
@@ -293,9 +341,8 @@ def forward_email(
                 part["Content-Disposition"] = 'attachment; filename="AI分析报告.docx"'
                 msg.attach(part)
     else:
-        # 默认：邮件正文模式（完整版本）
         body = _build_email_body(
-            to_name, analysis, original_subject, original_body, brief_mode=False
+            to_name, analyses, original_subject, original_body, brief_mode=False
         )
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
@@ -531,7 +578,7 @@ def _generate_revision_docx(revision_text: str, doc_type: str,
     doc.add_paragraph("")
     footer = doc.add_paragraph()
     footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run_footer = footer.add_run("—— 文书自动分拣系统 自动生成 ——")
+    run_footer = footer.add_run(f"—— {SYSTEM_NAME} 自动生成 ——")
     run_footer.font.size = Pt(9)
     run_footer.font.color.rgb = RGBColor(128, 128, 128)
 
@@ -544,9 +591,34 @@ def _generate_revision_docx(revision_text: str, doc_type: str,
     return tmp.name
 
 
+def _extract_doc_title(filenames: list[str] | None) -> str | None:
+    """从附件文件名中提取文书标题，如 'XX项目-咨询合同.doc' → 'XX项目-咨询合同'"""
+    if not filenames:
+        return None
+    for fn in filenames:
+        if not fn:
+            continue
+        # 去掉扩展名
+        name = fn.rsplit(".", 1)[0] if "." in fn else fn
+        # 跳过太短或无意义的名字
+        if len(name) < 4:
+            continue
+        # 跳过常见非文书名
+        skip_words = ["unnamed", "attachment", "附件", "image", "未命名"]
+        if any(kw in name.lower() for kw in skip_words):
+            continue
+        return name
+    # 所有文件名都不合适，返回第一个去掉扩展名的
+    for fn in filenames:
+        if fn:
+            return fn.rsplit(".", 1)[0] if "." in fn else fn
+    return None
+
+
 def _fill_review_template(template_path: str, analysis: dict,
                           original_subject: str, sender: str = "",
-                          body_text: str = "") -> Optional[str]:
+                          body_text: str = "",
+                          attachment_filenames: list[str] = None) -> Optional[str]:
     """
     使用审核意见模板 DOCX，替换其中的 xxx 占位符生成审核意见。
 
@@ -579,7 +651,9 @@ def _fill_review_template(template_path: str, analysis: dict,
     case_summary = analysis.get("case_summary", "") or "（待确认）"
     # 从摘要中剥离金额表述，避免与模板自带的"合同价款xxx元"重复
     case_summary_clean = _strip_amount_phrases(case_summary)
-    contract_name = original_subject or "（待确认）"
+
+    # 从附件文件名提取文书标题，兜底用邮件主题
+    contract_name = _extract_doc_title(attachment_filenames) or original_subject or "（待确认）"
 
     # 尝试从正文/摘要中提取金额
     amount = _extract_amount(body_text or case_summary)
@@ -587,12 +661,15 @@ def _fill_review_template(template_path: str, analysis: dict,
     # ── P1: 替换 xxx ──
     if len(doc.paragraphs) > 1:
         p1 = doc.paragraphs[1]
+        now = datetime.now()
         replacements = [
-            (party_a, sender),          # 第1个xxx → 发来方
-            (party_b,),                 # 第2个xxx → 拟与...签订方
-            (contract_name,),           # 第3个xxx → 合同名称
-            (case_summary_clean,),      # 第4个xxx → 合同内容（已剥离金额）
-            (amount,),                  # 第5个xxx → 价款
+            (str(now.year),),           # 第1个xxx → 年份
+            (str(now.month),),           # 第2个xxx → 月份
+            (sender,),                   # 第3个xxx → 发来方
+            (party_b,),                  # 第4个xxx → 拟与...签订方
+            (contract_name,),            # 第5个xxx → 合同名称
+            (case_summary_clean,),       # 第6个xxx → 合同内容（已剥离金额）
+            (amount,),                   # 第7个xxx → 价款
         ]
         _replace_xxx_in_paragraph(p1, replacements)
 

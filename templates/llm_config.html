@@ -16,11 +16,17 @@
         <h3>{{ cfg.name }} {% if cfg.is_active %}<span class="badge badge-success" style="margin-left:8px;">激活</span>{% endif %}</h3>
         <div>
             {% if not cfg.is_active %}
-            <a href="/llm-config/activate/{{ cfg.id }}" class="btn btn-success btn-sm">✅ 激活</a>
+            <form method="post" action="/llm-config/activate/{{ cfg.id }}" style="display:inline;">
+                {{ csrf_token_input(request)|safe }}
+                <button type="submit" class="btn btn-success btn-sm">✅ 激活</button>
+            </form>
             {% endif %}
             <button class="btn btn-outline btn-sm" id="llm-test-btn-{{ cfg.id }}" onclick="testLLMConnection({{ cfg.id }})">🔗 测试连接</button>
             <button class="btn btn-outline btn-sm" onclick="openModal('edit-llm-modal-{{ cfg.id }}')">✏️ 编辑</button>
-            <a href="/llm-config/delete/{{ cfg.id }}" class="btn btn-danger btn-sm" onclick="return confirm('确定删除？')">🗑</a>
+            <form method="post" action="/llm-config/delete/{{ cfg.id }}" style="display:inline;" onsubmit="return confirm('确定删除？')">
+                {{ csrf_token_input(request)|safe }}
+                <button type="submit" class="btn btn-danger btn-sm">🗑</button>
+            </form>
         </div>
     </div>
     <div class="card-body">

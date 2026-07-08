@@ -5,7 +5,7 @@ import time
 import logging
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, PendingRollbackError
 from app.config import DB_PATH
 
 logger = logging.getLogger(__name__)
@@ -37,9 +37,9 @@ def db_retry_commit(db, max_retries: int = MAX_DB_RETRIES) -> None:
         try:
             db.commit()
             return
-        except (OperationalError, Exception) as e:
+        except (OperationalError, PendingRollbackError, Exception) as e:
             is_locked = "database is locked" in str(e)
-            is_pending_rollback = "PendingRollbackError" in type(e).__name__ or "rolled back" in str(e)
+            is_pending_rollback = isinstance(e, PendingRollbackError) or "rolled back" in str(e)
             if (is_locked or is_pending_rollback) and attempt < max_retries - 1:
                 logger.warning(
                     f"DB commit retry {attempt + 1}/{max_retries}: {e}"
@@ -49,7 +49,7 @@ def db_retry_commit(db, max_retries: int = MAX_DB_RETRIES) -> None:
                     db.rollback()
                 except Exception:
                     pass
-                time.sleep(DB_RETRY_DELAY * (attempt + 1))
+                time.sleep(min(DB_RETRY_DELAY * (2 ** attempt), 8) + 0.1)
             else:
                 raise
 
@@ -71,6 +71,51 @@ def _migrate_doc_templates(conn):
         conn.commit()
 
 
+def _migrate_routing_rules_account_ids(conn):
+    """自动迁移：routing_rules.account_id (Integer FK) → account_ids (Text 逗号分隔)"""
+    cols = {row[1]: row[2] for row in conn.execute(text("PRAGMA table_info(routing_rules)"))}
+
+    if "account_ids" in cols:
+        return  # 已迁移
+
+    if "account_id" not in cols:
+        return  # 旧列不存在，无需迁移
+
+    logger.info("迁移: routing_rules 添加 account_ids 列并复制数据")
+    # Step 1: 添加新列
+    conn.execute(text("ALTER TABLE routing_rules ADD COLUMN account_ids TEXT DEFAULT ''"))
+
+    # Step 2: 复制数据 (account_id → account_ids 文本化)
+    conn.execute(text(
+        "UPDATE routing_rules SET account_ids = CAST(account_id AS TEXT) "
+        "WHERE account_id IS NOT NULL"
+    ))
+
+    # Step 3: 删除旧索引
+    conn.execute(text("DROP INDEX IF EXISTS idx_routing_rules_account_id"))
+
+    conn.commit()
+    logger.info("迁移 routing_rules.account_ids 完成")
+
+
+def _migrate_email_log_doc_types(conn):
+    """自动迁移：为 email_logs 表补齐新增的 doc_types 列"""
+    cols = {row[1] for row in conn.execute(text("PRAGMA table_info(email_logs)"))}
+    if "doc_types" not in cols:
+        logger.info("迁移: email_logs 添加 doc_types 列")
+        conn.execute(text("ALTER TABLE email_logs ADD COLUMN doc_types TEXT"))
+        conn.commit()
+
+
+def _migrate_email_account_forward_to(conn):
+    """自动迁移：为 email_accounts 表补齐新增的 forward_to 列"""
+    cols = {row[1] for row in conn.execute(text("PRAGMA table_info(email_accounts)"))}
+    if "forward_to" not in cols:
+        logger.info("迁移: email_accounts 添加 forward_to 列")
+        conn.execute(text("ALTER TABLE email_accounts ADD COLUMN forward_to TEXT DEFAULT ''"))
+        conn.commit()
+
+
 def get_db():
     """FastAPI 依赖：获取数据库会话"""
     db = SessionLocal()
@@ -87,6 +132,9 @@ def init_db():
     with engine.connect() as conn:
         # ── 自动迁移：补齐新增的列 ──
         _migrate_doc_templates(conn)
+        _migrate_routing_rules_account_ids(conn)
+        _migrate_email_log_doc_types(conn)
+        _migrate_email_account_forward_to(conn)
 
         # 添加查询性能索引和 UNIQUE 约束（SQLite 用 IF NOT EXISTS 安全幂等）
         sqls = [
@@ -99,7 +147,6 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_attachments_log_id ON attachments(log_id)",
             # 路由规则匹配
             "CREATE INDEX IF NOT EXISTS idx_routing_rules_enabled_priority ON routing_rules(enabled, priority)",
-            "CREATE INDEX IF NOT EXISTS idx_routing_rules_account_id ON routing_rules(account_id)",
             # 文书模板查询
             "CREATE INDEX IF NOT EXISTS idx_doc_templates_account_id ON doc_templates(account_id)",
             "CREATE INDEX IF NOT EXISTS idx_doc_templates_doc_type ON doc_templates(doc_type)",

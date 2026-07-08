@@ -59,7 +59,7 @@ _running() {
 }
 
 _port_from_db() {
-    local port=8888
+    local port=8020
     if [ -f "$PROJECT_DIR/data/legal_mail.db" ]; then
         local db_port
         db_port=$(sqlite3 "$PROJECT_DIR/data/legal_mail.db" \

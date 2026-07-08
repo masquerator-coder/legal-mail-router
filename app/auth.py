@@ -22,6 +22,28 @@ router = APIRouter(tags=["认证"])
 AUTH_WHITELIST = {"/login", "/health", "/favicon.ico"}
 AUTH_PREFIX_WHITELIST = {"/static/"}
 
+
+def _get_client_ip(request: Request) -> str:
+    """获取真实客户端 IP，兼容反向代理场景
+
+    优先级：X-Forwarded-For > X-Real-IP > request.client.host
+    """
+    # X-Forwarded-For: client_ip, proxy1, proxy2, ...
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        # 取最左端的真实客户端 IP
+        first_ip = forwarded.split(",")[0].strip()
+        if first_ip:
+            return first_ip
+
+    # X-Real-IP: Nginx 等代理设置的直通头部
+    real_ip = request.headers.get("X-Real-IP", "")
+    if real_ip:
+        return real_ip.strip()
+
+    # 直连场景
+    return request.client.host if request.client else "unknown"
+
 # ── 登录频率限制（内存计数器）──
 
 _LOGIN_LOCKOUT_WINDOW = 900      # 15 分钟（秒）
@@ -81,6 +103,12 @@ def get_stored_password_hash(db: Session) -> str:
     return cfg.value if cfg else ""
 
 
+def get_stored_admin_username(db: Session) -> str:
+    """从数据库读取管理员用户名，默认 'admin'"""
+    cfg = db.query(DefaultConfig).filter_by(key="admin_username").first()
+    return cfg.value.strip() if cfg and cfg.value else "admin"
+
+
 def init_admin_password(db: Session):
     """初始化默认管理员密码（如不存在）"""
     existing = db.query(DefaultConfig).filter_by(key="admin_password").first()
@@ -99,7 +127,19 @@ def init_admin_password(db: Session):
         logger.warning("============================================")
         logger.warning("  初始管理员密码已生成，请登录后立即修改！")
         logger.warning("============================================")
+        # 同时输出到 stdout，让非日志用户也能看到
+        print("\n" + "=" * 50, flush=True)
+        print(f"  ⚖️  文书分拣系统 首次启动", flush=True)
+        print(f"  管理员用户名: admin", flush=True)
+        print(f"  初始密码:     {default_pw}", flush=True)
+        print(f"  ⚠️  请登录后立即修改密码！", flush=True)
+        print("=" * 50 + "\n", flush=True)
         return default_pw
+    # 确保 admin_username 存在
+    username_cfg = db.query(DefaultConfig).filter_by(key="admin_username").first()
+    if not username_cfg:
+        db.add(DefaultConfig(key="admin_username", value="admin"))
+        db.commit()
     return None
 
 
@@ -126,7 +166,7 @@ async def login(
     check_csrf(request, form_csrf)
 
     # 频率限制（根据客户端 IP）
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _get_client_ip(request)
     try:
         _check_login_rate_limit(client_ip)
     except HTTPException:
@@ -141,7 +181,8 @@ async def login(
         init_admin_password(db)
         stored = get_stored_password_hash(db)
 
-    if username != "admin" or not verify_password(password, stored):
+    admin_username = get_stored_admin_username(db)
+    if username != admin_username or not verify_password(password, stored):
         _record_login_failure(client_ip)
         return request.app.state.templates.TemplateResponse(request, "login.html", {
             "request": request,

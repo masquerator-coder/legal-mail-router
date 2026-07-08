@@ -1,6 +1,4 @@
-"""
-OCR 识别模块 — 支持 PaddleOCR / OpenAI Vision / 自定义
-"""
+"""OCR 识别模块 — 支持 PaddleOCR / OpenAI Vision / MinerU / 自定义"""
 import base64
 import logging
 import httpx
@@ -30,6 +28,8 @@ async def ocr_image(
         return await _ocr_paddleocr(image_bytes, ocr_cfg["api_url"])
     elif provider == "openai-vision":
         return await _ocr_openai_vision(image_bytes, ocr_cfg, filename)
+    elif provider == "mineru":
+        return await _ocr_mineru(image_bytes, ocr_cfg.get("api_url", ""), filename)
     else:
         logger.warning(f"Unknown OCR provider: {provider}")
         return ""
@@ -164,4 +164,47 @@ async def _ocr_openai_vision(image_bytes: bytes, ocr_cfg: dict, filename: str) -
         resp = await client.post(api_url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        try:
+            return data["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, TypeError) as e:
+            raw = str(data)[:200] if data else "(empty)"
+            raise ValueError(f"Vision API 响应格式异常: {raw}") from e
+
+
+async def _ocr_mineru(image_bytes: bytes, api_url: str, filename: str = "image.png") -> str:
+    """调用 MinerU 文档解析服务 (POST /file_parse)"""
+    import httpx
+    import re
+    if not api_url:
+        logger.warning("MinerU: api_url 为空")
+        return ""
+
+    # 归一化 URL：去除路径中的重复斜杠
+    api_url = re.sub(r'(?<!:)//+', '/', api_url)
+    base_url = api_url.rstrip("/")
+    if not base_url.endswith("/file_parse"):
+        base_url += "/file_parse"
+
+    files = {"files": (filename, image_bytes, "image/png")}
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(base_url, files=files)
+        resp.raise_for_status()
+        data = resp.json()
+
+    if data.get("status") != "completed":
+        logger.warning(f"MinerU 解析未完成: status={data.get('status')}")
+        return ""
+
+    # 按原始文件名查找结果
+    result = data.get("results", {}).get(filename, {})
+    md = result.get("md_content", "")
+    if not md:
+        # MinerU 可能去掉扩展名作为 key
+        stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+        for key, val in data.get("results", {}).items():
+            if key == stem or key == filename:
+                md = val.get("md_content", "")
+                break
+
+    logger.info(f"MinerU 解析完成: {filename} ({len(md)} 字符)")
+    return md.strip()

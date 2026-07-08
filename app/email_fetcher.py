@@ -5,6 +5,7 @@ import re
 import ssl
 import socket
 import email
+import hashlib
 import logging
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
@@ -21,6 +22,12 @@ _IMAP_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
+def _imap_astring(value: str) -> str:
+    """RFC 3501 4.3: 将任意字符串转为 IMAP ASTRING 格式（双引号字符串，转义 \\ 和 \"）"""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 @dataclass
 class ParsedEmail:
     """解析后的邮件"""
@@ -30,6 +37,7 @@ class ParsedEmail:
     date: datetime
     body_text: str
     attachments: list = field(default_factory=list)
+    headers: dict = field(default_factory=dict)  # 原始邮件头（关键头部的键值对）
 
 
 @dataclass
@@ -140,6 +148,9 @@ def _parse_email(raw_bytes: bytes) -> Optional[ParsedEmail]:
         return None
 
     message_id = msg.get("Message-ID", "")
+    # 缺少 Message-ID 时用邮件内容 hash 生成合成 ID，避免 UNIQUE 约束冲突
+    if not message_id:
+        message_id = "synth-" + hashlib.sha256(raw_bytes).hexdigest()
     subject = decode_mime_header(msg["Subject"])
     sender = decode_mime_header(msg["From"])
     date_str = msg["Date"]
@@ -152,6 +163,13 @@ def _parse_email(raw_bytes: bytes) -> Optional[ParsedEmail]:
     body = extract_body(msg)
     attachments = extract_attachments(msg)
 
+    # 提取关键邮件头用于转发副本检测等问题排查
+    headers = {}
+    for hdr in ["X-Forwarded-By", "X-Forwarded-For", "List-Id", "Precedence"]:
+        val = msg.get(hdr, "")
+        if val:
+            headers[hdr.lower()] = val
+
     return ParsedEmail(
         message_id=message_id,
         subject=subject,
@@ -159,6 +177,7 @@ def _parse_email(raw_bytes: bytes) -> Optional[ParsedEmail]:
         date=date,
         body_text=body,
         attachments=attachments,
+        headers=headers,
     )
 
 
@@ -226,7 +245,8 @@ class Mail163Fetcher:
         # ID command — required for 163.com
         self._cmd(b'A0002 ID ("name" "Thunderbird" "version" "128.0")', "A0002")
         lines = self._cmd(
-            f'A0003 LOGIN "{self.username}" "{self.password}"'.encode(), "A0003"
+            f'A0003 LOGIN {_imap_astring(self.username)} {_imap_astring(self.password)}'.encode(),
+            "A0003"
         )
         if not any("A0003 OK" in line for line in lines):
             raise Exception(f"163.com登录失败: {lines}")
@@ -236,30 +256,7 @@ class Mail163Fetcher:
         if not any("A0004 OK" in line for line in lines):
             raise Exception(f"SELECT INBOX 失败: {lines}")
 
-    def search_unseen(self, days: int = 7) -> list[str]:
-        """搜索未读邮件（最近N天）"""
-        since_date = datetime.now() - timedelta(days=days)
-        since_str = f"{since_date.day:02d}-{_IMAP_MONTHS[since_date.month - 1]}-{since_date.year}"
-
-        # 163.com SEARCH 只能用 SINCE，不能用 UNSEEN AND SINCE 组合
-        # 先搜 UNSEEN，再搜 SINCE，取并集后客户端过滤
-        unseen_ids = set()
-        recent_ids = set()
-
-        lines = self._cmd(b"A0005 SEARCH UNSEEN", "A0005")
-        for line in lines:
-            m = re.search(r"\* SEARCH (.+)", line)
-            if m:
-                unseen_ids.update(m.group(1).split())
-
-        lines = self._cmd(f'A0006 SEARCH SINCE {since_str}'.encode(), "A0006")
-        for line in lines:
-            m = re.search(r"\* SEARCH (.+)", line)
-            if m:
-                recent_ids.update(m.group(1).split())
-
-        # 取交集：既是未读又在最近N天内
-        return sorted(unseen_ids & recent_ids, key=int)
+    # 注意: search_unseen 已移除（改用 search_recent + 业务层去重）
 
     def search_recent(self, days: int = 7) -> list[str]:
         """搜索最近N天的全部邮件（含已读）"""
@@ -343,22 +340,27 @@ class StandardFetcher:
         if status != "OK":
             raise Exception(f"SELECT INBOX 失败: {data}")
 
-    def search_unseen(self, days: int = 7) -> list[str]:
-        """搜索未读邮件"""
-        since_date = datetime.now() - timedelta(days=days)
-        since_str = f"{since_date.day:02d}-{_IMAP_MONTHS[since_date.month - 1]}-{since_date.year}"
-
-        status, data = self._mail.search(None, f'(UNSEEN SINCE "{since_str}")')
-        if status != "OK" or not data or not data[0]:
-            return []
-        return data[0].split()
-
     def search_recent(self, days: int = 7) -> list[str]:
         """搜索最近N天全部邮件（含已读）"""
         since_date = datetime.now() - timedelta(days=days)
         since_str = f"{since_date.day:02d}-{_IMAP_MONTHS[since_date.month - 1]}-{since_date.year}"
         status, data = self._mail.search(None, f'SINCE "{since_str}"')
         if status != "OK" or not data or not data[0]:
+            logger.warning(
+                f"IMAP SEARCH 返回空结果(status={status})，可能原因："
+                f"日期格式不被服务器支持（使用的月份: {_IMAP_MONTHS[since_date.month - 1]}）。"
+                f"将尝试回退到 FETCH 全部邮件后按日期过滤..."
+            )
+            # 回退：拉取全部邮件后按日期在业务层过滤
+            try:
+                status, data = self._mail.search(None, "ALL")
+                if status == "OK" and data and data[0]:
+                    all_ids = data[0].split()
+                    # 只保留最近的 N 天邮件（在 FETCH 时按日期过滤）
+                    logger.info(f"回退搜索到 {len(all_ids)} 封邮件，将在提取时过滤日期")
+                    return all_ids[-200:]  # 最多取最近200封防止内存溢出
+            except Exception as fallback_err:
+                logger.error(f"回退搜索也失败: {fallback_err}")
             return []
         return data[0].split()
 
@@ -435,6 +437,7 @@ def fetch_new_emails(
         filter_senders = [s.strip().lower() for s in filter_sender.split(",") if s.strip()]
 
         results = []
+        filtered_count = 0
         for msg_id in msg_ids:
             try:
                 raw = fetcher.fetch_email(msg_id)
@@ -449,7 +452,8 @@ def fetch_new_emails(
                 if filter_senders:
                     sender_lower = parsed.sender.lower()
                     if any(fs in sender_lower for fs in filter_senders):
-                        logger.info(f"⛔ 跳过(发件人被过滤): {parsed.sender}")
+                        filtered_count += 1
+                        logger.info(f"⛔ 跳过(发件人被过滤) [{filtered_count}]: {parsed.sender}")
                         continue
 
                 # 不调用 mark_seen —— 去重完全依赖 DB 中的 Message-ID
@@ -459,6 +463,7 @@ def fetch_new_emails(
             except Exception as e:
                 logger.error(f"拉取邮件 {msg_id} 失败: {e}")
 
+        logger.info(f"发件人过滤完成: 保留 {len(results)} 封, 过滤 {filtered_count} 封")
         return results
 
     finally:
@@ -718,6 +723,152 @@ def extract_attachment_texts(parsed_email: ParsedEmail, max_chars: int = 6000, o
             combined = combined[:max_chars] + "\n... (附件内容已截断)"
     
     return combined, unocr_images
+
+
+def extract_per_attachment_texts(attachments: list[AttachmentInfo], ocr_cfg: dict | None = None, max_chars: int = 6000) -> dict:
+    """
+    按附件分别提取文本内容，供预分类和分组分析使用。
+    
+    attachments: 待提取的附件列表（可以是整封邮件的子集）
+    返回: {index: {"filename": str, "text": str, "images": list[dict]}}
+          images 为未被 OCR 处理的图片（供多模态 LLM 降级用）
+    """
+    from io import BytesIO
+
+    def _doc_antiword(data: bytes) -> str:
+        import subprocess, tempfile
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tf:
+                tf.write(data)
+                tmp_path = tf.name
+            try:
+                r = subprocess.run(["antiword", "-w", "0", tmp_path], capture_output=True, text=True, timeout=10)
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout.strip()
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        return ""
+
+    def _doc_ole(data: bytes) -> str:
+        try:
+            import olefile
+            ole = olefile.OleFileIO(data)
+            if ole.exists("WordDocument"):
+                text = ole.openstream("WordDocument").read().decode("utf-16-le", errors="replace")
+                readable = re.sub(r'[^\u4e00-\u9fff\u3000-\u303f\uff00-\uffefa-zA-Z0-9\s.,;:!?()（）《》【】\-+=/%@#&*"\']+', '\n', text)
+                lines = [ln.strip() for ln in readable.split('\n') if len(ln.strip()) > 2]
+                ole.close()
+                return '\n'.join(lines[:500])
+            ole.close()
+        except Exception:
+            pass
+        return ""
+
+    def _binary_fallback(data: bytes) -> str:
+        text = data.decode("utf-8", errors="replace")
+        readable = re.findall(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffefa-zA-Z0-9\s.,;:!?()（）《》【】\-+=/\\@#$&*\"']{4,}", text)
+        return "\n".join(readable[:300])
+
+    def _ocr_image(filename: str, content: bytes, ocr_cfg: dict | None) -> str:
+        try:
+            from app.ocr import ocr_image
+            import asyncio
+            result = asyncio.run(ocr_image(content, filename, ocr_cfg or {}))
+            return result or ""
+        except Exception as e:
+            logger.debug(f"OCR 失败: {filename}: {e}")
+            return ""
+
+    results = {}
+    for idx, att in enumerate(attachments):
+        filename = att.filename or "unknown"
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        content = att.content
+        if not content:
+            results[idx] = {"filename": filename, "text": "", "images": []}
+            continue
+
+        extracted = None
+        unocr_img = []
+        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                    "bmp": "image/bmp", "tiff": "image/tiff", "webp": "image/webp"}
+
+        try:
+            if ext in ("txt", "md", "csv", "log"):
+                extracted = content.decode("utf-8", errors="replace")
+            elif ext == "docx":
+                import docx
+                doc = docx.Document(BytesIO(content))
+                extracted = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            elif ext == "doc":
+                try:
+                    import docx
+                    doc = docx.Document(BytesIO(content))
+                    extracted = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+                except Exception:
+                    extracted = _doc_antiword(content) or _doc_ole(content) or _binary_fallback(content)
+            elif ext == "wps":
+                extracted = _doc_ole(content) or _binary_fallback(content)
+            elif ext == "pdf":
+                import fitz
+                doc = fitz.open(stream=content, filetype="pdf")
+                pages_text = []
+                pdf_images = []
+                for page in doc:
+                    text = page.get_text()
+                    if text.strip():
+                        pages_text.append(text)
+                    else:
+                        try:
+                            pix = page.get_pixmap(dpi=200)
+                            pdf_images.append(pix.tobytes("png"))
+                        except Exception:
+                            pass
+                doc.close()
+                extracted = "\n".join(pages_text) if pages_text else ""
+                if pdf_images and not extracted:
+                    ocr_texts = []
+                    for img_bytes in pdf_images:
+                        ocr_result = _ocr_image(f"{filename}_p.png", img_bytes, ocr_cfg)
+                        if ocr_result:
+                            ocr_texts.append(ocr_result)
+                    if ocr_texts:
+                        extracted = "\n".join(ocr_texts)
+                if not extracted and pdf_images:
+                    for img_bytes in pdf_images[:5]:
+                        unocr_img.append({"filename": f"{filename}_p.png", "content": img_bytes, "mime_type": "image/png"})
+            elif ext in ("xlsx", "xls"):
+                import openpyxl
+                wb = openpyxl.load_workbook(BytesIO(content), data_only=True)
+                rows = []
+                for sheet_name in wb.sheetnames[:3]:
+                    ws = wb[sheet_name]
+                    rows.append(f"[Sheet: {sheet_name}]")
+                    for row in ws.iter_rows(values_only=True, max_row=50):
+                        rows.append(" | ".join(str(c) if c is not None else "" for c in row))
+                extracted = "\n".join(rows[:200])
+                wb.close()
+            elif ext in ("jpg", "jpeg", "png", "bmp", "tiff", "webp"):
+                extracted = _ocr_image(filename, content, ocr_cfg)
+                if not extracted:
+                    unocr_img.append({"filename": filename, "content": content, "mime_type": mime_map.get(ext, "image/png")})
+            else:
+                logger.debug(f"跳过不支持的文件类型: {ext} ({filename})")
+        except Exception as e:
+            logger.error(f"提取附件 {filename} 文本失败: {e}")
+
+        results[idx] = {
+            "filename": filename,
+            "text": (extracted or "").strip()[:max_chars] if extracted else "",
+            "images": unocr_img,
+        }
+
+    return results
 
 
 def save_attachments(parsed_email: ParsedEmail, log_id: int, account_name: str = "unknown") -> list[dict]:

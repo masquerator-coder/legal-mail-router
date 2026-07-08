@@ -80,18 +80,20 @@ async def export_backup(db: Session = Depends(get_db)):
 
     # 路由规则
     for rule in db.query(RoutingRule).order_by(RoutingRule.id).all():
-        # 查找账户名
-        account_name = None
-        if rule.account_id:
-            acc = db.query(EmailAccount).filter_by(id=rule.account_id).first()
-            if acc:
-                account_name = acc.name
+        # 查找账户名列表
+        account_names = []
+        if rule.account_ids and rule.account_ids.strip():
+            ids = [int(x) for x in rule.account_ids.split(",") if x.strip().isdigit()]
+            for aid in ids:
+                acc = db.query(EmailAccount).filter_by(id=aid).first()
+                if acc:
+                    account_names.append(acc.name)
         data["routing_rules"].append({
             "doc_type": rule.doc_type,
             "keywords": rule.keywords,
             "target_email": rule.target_email,
             "target_name": rule.target_name,
-            "account_name": account_name,
+            "account_names": account_names,
             "smtp_host": rule.smtp_host,
             "smtp_port": rule.smtp_port,
             "smtp_username": rule.smtp_username,
@@ -235,26 +237,28 @@ async def import_backup(
                 db.add(cfg)
             stats["ocr"] += 1
 
-        # 导入路由规则 — 按 (account_id, doc_type, target_email) 三元组匹配，存在则更新，不存在则创建
+        # 导入路由规则 — 按 (doc_type, target_email) 匹配，存在则更新，不存在则创建
         for item in data.get("routing_rules", []):
-            account_id = None
-            if item.get("account_name"):
-                account_id = account_map.get(item["account_name"])
+            # 从 account_names（列表）或 account_name（旧格式兼容）构建 account_ids
+            account_ids_str = ""
+            names = item.get("account_names") or []
+            old_name = item.get("account_name")
+            if old_name and not names:
+                names = [old_name]
+            if names:
+                mapped_ids = [str(account_map[n]) for n in names if n in account_map]
+                account_ids_str = ",".join(mapped_ids)
+
             doc_type = item["doc_type"]
             target_email = item["target_email"]
-            # 匹配已有规则：同账户 + 同文书类型 + 同目标邮箱
-            query = db.query(RoutingRule).filter_by(
+            # 匹配已有规则：同文书类型 + 同目标邮箱
+            existing = db.query(RoutingRule).filter_by(
                 doc_type=doc_type, target_email=target_email
-            )
-            if account_id is not None:
-                query = query.filter_by(account_id=account_id)
-            else:
-                query = query.filter(RoutingRule.account_id.is_(None))
-            existing = query.first()
+            ).first()
             if existing:
                 existing.keywords = item.get("keywords", "")
                 existing.target_name = item.get("target_name", "")
-                existing.account_id = account_id
+                existing.account_ids = account_ids_str
                 existing.smtp_host = item.get("smtp_host", "")
                 existing.smtp_port = item.get("smtp_port", 587)
                 existing.smtp_username = item.get("smtp_username", "")
@@ -267,7 +271,7 @@ async def import_backup(
                     keywords=item.get("keywords", ""),
                     target_email=target_email,
                     target_name=item.get("target_name", ""),
-                    account_id=account_id,
+                    account_ids=account_ids_str,
                     smtp_host=item.get("smtp_host", ""),
                     smtp_port=item.get("smtp_port", 587),
                     smtp_username=item.get("smtp_username", ""),
