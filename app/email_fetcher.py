@@ -112,17 +112,27 @@ def extract_body(msg) -> str:
 
 
 def extract_attachments(msg) -> list[AttachmentInfo]:
-    """提取邮件附件"""
+    """提取邮件附件（支持 Content-Disposition: attachment 和 inline 两种方式）"""
     attachments = []
     if not msg.is_multipart():
         return attachments
 
     for part in msg.walk():
         content_disposition = str(part.get("Content-Disposition", ""))
-        if "attachment" not in content_disposition:
+        filename = part.get_filename()
+        content_type = part.get_content_type()
+
+        # 跳过邮件正文（纯文本/HTML）
+        if content_type in ("text/plain", "text/html") and not filename:
             continue
 
-        filename = part.get_filename()
+        # 包含以下任一条件即视为附件：
+        # 1. Content-Disposition 包含 "attachment"
+        # 2. 有文件名（即使 disposition 是 inline）
+        # 3. 非文本/非多部分且 Content-Disposition 包含 "inline"
+        if "attachment" not in content_disposition and not filename:
+            continue
+
         if filename:
             filename = decode_mime_header(filename)
 
@@ -133,7 +143,7 @@ def extract_attachments(msg) -> list[AttachmentInfo]:
         attachments.append(AttachmentInfo(
             filename=filename or "unnamed_attachment",
             content=content,
-            content_type=part.get_content_type(),
+            content_type=content_type,
         ))
 
     return attachments
