@@ -668,9 +668,6 @@ async function loadUpdateStatus() {
                 document.getElementById('apply-update-btn').disabled = false;
                 document.getElementById('apply-update-btn').style.opacity = '1';
             }
-        } else {
-            el.textContent = '（非 git 仓库）';
-        }
     } catch(e) {
         // 初始化静默失败
     }
