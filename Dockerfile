@@ -20,10 +20,10 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.li
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# 安装 Python 依赖
+# 安装 Python 依赖（使用国内 PyPI 镜像加速）
 COPY pyproject.toml .
-RUN pip install --no-cache-dir -e . && \
-    pip install --no-cache-dir uvicorn
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -e . && \
+    pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uvicorn
 
 # 复制应用代码
 COPY app/ ./app/
