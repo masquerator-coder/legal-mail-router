@@ -449,6 +449,46 @@
         </div>
     </div>
 
+    <!-- 自动更新 -->
+    <div class="card" style="margin-top:16px;">
+        <div class="card-header"><h3>🔄 自动更新</h3></div>
+        <div class="card-body">
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;">
+                <div class="form-group">
+                    <label class="checkbox-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" name="auto_update_enabled" value="true"
+                               {% if settings.auto_update_enabled == 'true' %}checked{% endif %}>
+                        <span>启用自动更新</span>
+                    </label>
+                    <div class="form-hint">定时从 gitcode.com 拉取新版本并自动重启</div>
+                </div>
+                <div class="form-group">
+                    <label for="auto_update_branch">跟踪分支</label>
+                    <input type="text" id="auto_update_branch" name="auto_update_branch"
+                           value="{{ settings.auto_update_branch }}"
+                           class="form-control" style="width:120px;" maxlength="50">
+                    <div class="form-hint">默认 main</div>
+                </div>
+                <div class="form-group">
+                    <label for="auto_update_interval_hours">检查间隔（小时）</label>
+                    <input type="number" id="auto_update_interval_hours" name="auto_update_interval_hours"
+                           value="{{ settings.auto_update_interval_hours }}"
+                           class="form-control" style="width:100px;"
+                           min="1" max="168">
+                    <div class="form-hint">1-168 小时</div>
+                </div>
+            </div>
+            <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
+                <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+                    <span id="update-version" style="font-size:13px;color:var(--text-muted);">——</span>
+                    <button type="button" class="btn btn-outline btn-sm" onclick="checkUpdate()" id="check-update-btn">🔍 检查更新</button>
+                    <button type="button" class="btn btn-primary btn-sm" onclick="applyUpdate()" id="apply-update-btn" disabled style="opacity:0.5;">⬇️ 应用更新</button>
+                    <span id="update-result" style="font-size:13px;"></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- 操作按钮 -->
     <div style="display:flex;gap:12px;align-items:center;margin-top:24px;">
         <button type="submit" class="btn btn-primary">💾 保存设置</button>
@@ -608,6 +648,113 @@ async function _csrfHeaders() {
     var csrf = document.querySelector('input[name="_csrf_token"]')?.value || '';
     return { 'X-CSRF-Token': csrf };
 }
+
+// ── 自动更新 ──
+
+async function loadUpdateStatus() {
+    try {
+        var resp = await fetch('/admin/update/status');
+        var data = await resp.json();
+        var el = document.getElementById('update-version');
+        if (data.is_git_repo) {
+            var info = data.current_commit ? '#' + data.current_commit : '';
+            if (data.current_branch) info += ' (' + data.current_branch + ')';
+            el.textContent = info;
+            if (data.update_available) {
+                document.getElementById('apply-update-btn').disabled = false;
+                document.getElementById('apply-update-btn').style.opacity = '1';
+            }
+        } else {
+            el.textContent = '（非 git 仓库）';
+        }
+    } catch(e) {
+        // 初始化静默失败
+    }
+}
+
+async function checkUpdate() {
+    var btn = document.getElementById('check-update-btn');
+    var result = document.getElementById('update-result');
+    btn.disabled = true;
+    btn.textContent = '⏳ 检查中...';
+    result.innerHTML = '';
+    var form = document.querySelector('form');
+    var csrfInput = form ? form.querySelector('input[name="_csrf_token"]') : null;
+    var csrfToken = csrfInput ? csrfInput.value : '';
+    try {
+        var resp = await fetch('/admin/update/check', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: '_csrf_token=' + encodeURIComponent(csrfToken),
+        });
+        var data = await resp.json();
+        var span = document.createElement('span');
+        if (data.success) {
+            if (data.update_available) {
+                span.style.color = '#38a169';
+                span.textContent = '✅ ' + data.message;
+                document.getElementById('apply-update-btn').disabled = false;
+                document.getElementById('apply-update-btn').style.opacity = '1';
+            } else {
+                span.style.color = '#38a169';
+                span.textContent = '✅ ' + data.message;
+            }
+        } else {
+            span.style.color = '#e53e3e';
+            span.textContent = '❌ ' + data.message;
+        }
+        result.appendChild(span);
+    } catch(e) {
+        var span = document.createElement('span');
+        span.style.color = '#e53e3e';
+        span.textContent = '❌ 请求失败: ' + (e.message || '未知');
+        result.appendChild(span);
+    }
+    btn.disabled = false;
+    btn.textContent = '🔍 检查更新';
+}
+
+async function applyUpdate() {
+    if (!confirm('确定要拉取最新代码并重启服务吗？重启期间约 3-5 秒不可用。')) return;
+    var btn = document.getElementById('apply-update-btn');
+    var result = document.getElementById('update-result');
+    btn.disabled = true;
+    btn.textContent = '⏳ 更新中...';
+    result.innerHTML = '';
+    var form = document.querySelector('form');
+    var csrfInput = form ? form.querySelector('input[name="_csrf_token"]') : null;
+    var csrfToken = csrfInput ? csrfInput.value : '';
+    try {
+        var resp = await fetch('/admin/update/apply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: '_csrf_token=' + encodeURIComponent(csrfToken),
+        });
+        var data = await resp.json();
+        var span = document.createElement('span');
+        if (data.success) {
+            span.style.color = '#38a169';
+            span.textContent = '✅ ' + data.message;
+            setTimeout(function() { location.reload(); }, 5000);
+        } else {
+            span.style.color = '#e53e3e';
+            span.textContent = '❌ ' + data.message;
+            btn.disabled = false;
+            btn.textContent = '⬇️ 应用更新';
+        }
+        result.appendChild(span);
+    } catch(e) {
+        var span = document.createElement('span');
+        span.style.color = '#e53e3e';
+        span.textContent = '❌ 请求失败: ' + (e.message || '未知');
+        result.appendChild(span);
+        btn.disabled = false;
+        btn.textContent = '⬇️ 应用更新';
+    }
+}
+
+// 页面加载时自动查询版本
+document.addEventListener('DOMContentLoaded', loadUpdateStatus);
 
 async function restartService() {
     var btn = document.getElementById('restart-btn');

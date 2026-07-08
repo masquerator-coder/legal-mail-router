@@ -178,6 +178,7 @@ from app.routes import (  # noqa: E402
     settings_router,
     backup_router,
     doc_templates_router,
+    auto_update_router,
 )
 
 app.include_router(dashboard_router)
@@ -189,6 +190,7 @@ app.include_router(ocr_router)
 app.include_router(settings_router)
 app.include_router(backup_router)
 app.include_router(doc_templates_router)
+app.include_router(auto_update_router)
 
 # 注册认证路由
 from app.auth import router as auth_router  # noqa: E402

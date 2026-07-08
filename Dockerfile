@@ -10,6 +10,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         tzdata \
         antiword \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 # 设置时区

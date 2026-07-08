@@ -46,6 +46,10 @@ SETTING_DEFAULTS = {
     "llm_timeout": "180",            # LLM 调用超时（秒），含分析 + 修改版文书
     "context_window_usage_ratio": "0.50",  # 输入占上下文窗口的比例（0.1-0.95）
     "token_estimation_method": "approximate",  # token估算方法: approximate / tiktoken
+    # ── 自动更新 ──
+    "auto_update_enabled": "false",          # 启用自动更新
+    "auto_update_branch": "main",            # 跟踪分支
+    "auto_update_interval_hours": "6",       # 检查间隔（小时）
     # ── 多附件分组分析 ──
     "attachment_grouping": "false",           # 启用多附件分组分析
     "classify_use_main_llm": "true",          # 预分类使用主LLM(true)/指定LLM(false)
@@ -137,6 +141,10 @@ async def save_settings(
     attachment_grouping: str = Form("false"),
     classify_use_main_llm: str = Form("true"),
     classify_llm_config_id: str = Form(""),
+    # ── 自动更新 ──
+    auto_update_enabled: str = Form("false"),
+    auto_update_branch: str = Form("main"),
+    auto_update_interval_hours: str = Form("6"),
     form_csrf: str = Form("", alias="_csrf_token"),
 ):
     """保存所有系统设置"""
@@ -173,6 +181,10 @@ async def save_settings(
     _save_setting(db, "attachment_grouping", "true" if attachment_grouping.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "classify_use_main_llm", "true" if classify_use_main_llm.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "classify_llm_config_id", classify_llm_config_id.strip())
+    # ── 自动更新 ──
+    _save_setting(db, "auto_update_enabled", "true" if auto_update_enabled.lower() in ("true", "on", "1") else "false")
+    _save_setting(db, "auto_update_branch", auto_update_branch.strip() or "main")
+    _save_setting(db, "auto_update_interval_hours", auto_update_interval_hours.strip() or "6")
     db_retry_commit(db)
 
     # 更新全局缓存
