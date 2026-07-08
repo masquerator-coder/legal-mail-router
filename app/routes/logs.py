@@ -93,9 +93,17 @@ async def log_detail(log_id: int, request: Request, db: Session = Depends(get_db
 
     import json
     llm_result = None
+    group_count = 0
     if log.llm_raw_response:
         try:
-            llm_result = json.loads(log.llm_raw_response)
+            parsed = json.loads(log.llm_raw_response)
+            # 多附件分组时存储为 JSON 数组 [analysis_1, analysis_2, ...]
+            # 模板按单分析设计，取第一条作为主分析
+            if isinstance(parsed, list):
+                group_count = len(parsed)
+                llm_result = parsed[0] if parsed else None
+            else:
+                llm_result = parsed
         except Exception:
             llm_result = {"raw": log.llm_raw_response}
 
@@ -107,6 +115,7 @@ async def log_detail(log_id: int, request: Request, db: Session = Depends(get_db
         "log": log,
         "llm_result": llm_result,
         "attachments": attachments,
+        "group_count": group_count,
         "scheduler_running": scheduler.running,
         "urgency_map": {"high": "🔴", "medium": "🟡", "low": "🟢"},
     })

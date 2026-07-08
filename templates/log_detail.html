@@ -32,12 +32,12 @@
     </div>
 </div>
 
-{% if llm_result %}
+{% if llm_result and llm_result is mapping %}
 <div class="card" style="margin-top:20px;">
     <div class="card-header"><h3>🤖 AI 分析结果</h3></div>
     <div class="card-body">
         <table class="table">
-            <tr><td style="width:120px; color:var(--text-muted);">文书类型</td><td><span class="badge badge-info" style="font-size:14px;">{{ llm_result.doc_type }}</span></td></tr>
+            <tr><td style="width:120px; color:var(--text-muted);">文书类型</td><td><span class="badge badge-info" style="font-size:14px;">{{ llm_result.doc_type }}</span>{% if group_count and group_count > 1 %} <span class="badge badge-default" style="font-size:12px; background:#e2e8f0;">共{{ group_count }}组</span>{% endif %}</td></tr>
             <tr><td style="color:var(--text-muted);">紧急程度</td><td>{{ urgency_map.get(llm_result.urgency, llm_result.urgency) }}</td></tr>
             <tr><td style="color:var(--text-muted);">案件摘要</td><td>{{ llm_result.case_summary }}</td></tr>
             {% if llm_result.ai_interpretation %}
@@ -46,8 +46,7 @@
             <tr><td style="color:var(--text-muted);">涉及方</td><td>{{ llm_result.involved_parties or log.involved_parties or '无' }}</td></tr>
             <tr><td style="color:var(--text-muted);">关键日期</td><td>{{ llm_result.key_date or '无' }}</td></tr>
             <tr><td style="color:var(--text-muted);">案号</td><td>{{ llm_result.case_number or '无' }}</td></tr>
-            <tr><td style="color:var(--text-muted);">律师类型</td><td>{{ llm_result.target_lawyer_type }}</td></tr>
-            <tr><td style="color:var(--text-muted);">置信度</td><td>{{ (llm_result.confidence * 100)|round(1) if llm_result.confidence is not none else 'N/A' }}%</td></tr>
+            <tr><td style="color:var(--text-muted);">置信度</td><td>{{ (llm_result.confidence * 100)|round(1) if llm_result.confidence is defined and llm_result.confidence is not none else 'N/A' }}%</td></tr>
         </table>
     </div>
 </div>
