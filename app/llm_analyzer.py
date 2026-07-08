@@ -436,6 +436,7 @@ async def generate_revision(
     template: str | None = None,
     max_tokens: int = 4000,
     temperature: float = 0.3,
+    timeout: int = 180,
 ) -> str | None:
     """
     根据 LLM 审核意见生成修改版文书。
@@ -491,7 +492,7 @@ async def generate_revision(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(api_url, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
