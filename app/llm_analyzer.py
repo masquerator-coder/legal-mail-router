@@ -231,7 +231,7 @@ async def analyze_email(
     payload = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": "你是一位资深法律文书分析专家。请先识别文书类型，再进行详细解读与审核。严格按JSON格式返回两阶段分析结果，不要包含markdown代码块标记。"},
+            {"role": "system", "content": "你是一位资深法律文书分析专家。请先识别文书类型，再进行详细解读与审核。严格按JSON格式返回两阶段分析结果，不要包含markdown代码块标记。禁止输出分析过程、思考步骤或推理说明，直接输出JSON。"},
             user_message,
         ],
         "max_tokens": max_tokens,
@@ -418,7 +418,8 @@ DEFAULT_REVISION_PROMPT = """你是一位资深法律文书撰写专家。根据
 - 【新增】和【修改】标记内的文本是最终版本文书的一部分
 - 【删除】标记内的文本仅为审阅参考（表示建议从文书中移除）
 - 未改动的段落直接输出原文，不要加任何标记
-- 直接输出文书全文，不要加「以下是修改版」等前言后语"""
+- 直接输出文书全文，不要加「以下是修改版」等前言后语
+- 禁止输出分析过程、思考步骤或推理说明，只输出修订后的文书正文"""
 
 
 async def generate_revision(
@@ -480,7 +481,7 @@ async def generate_revision(
     payload = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": "你是一位资深法律文书撰写专家。请根据审核意见和格式模板修订文书，用【新增】【修改】【删除】标记标注所有改动。直接输出完整文书，不加前言。"},
+            {"role": "system", "content": "你是一位资深法律文书撰写专家。请根据审核意见和格式模板修订文书，用【新增】【修改】【删除】标记标注所有改动。直接输出完整文书，不加前言。禁止输出分析过程、思考步骤或推理说明，只输出修订后的文书正文。"},
             {"role": "user", "content": prompt},
         ],
         "max_tokens": max_tokens,
