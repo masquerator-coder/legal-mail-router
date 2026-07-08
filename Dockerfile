@@ -6,7 +6,10 @@ LABEL description="文书分拣系统 - AI 驱动的法律邮件自动分拣与�
 WORKDIR /app
 
 # 安装系统依赖（PyMuPDF 需要）+ antiword 用于 .doc 文本提取
-RUN apt-get update && \
+# 使用国内 Debian 镜像加速（首次部署可用，后续可注释掉）
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list 2>/dev/null; \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
         tzdata \
         antiword \
