@@ -656,11 +656,15 @@ async function loadUpdateStatus() {
         var resp = await fetch('/admin/update/status');
         var data = await resp.json();
         var el = document.getElementById('update-version');
-        if (data.is_git_repo) {
-            var info = data.current_commit ? '#' + data.current_commit : '';
+        var info = data.version || '--';
+        if (data.is_git_repo && data.current_commit) {
+            info += ' | #' + data.current_commit;
             if (data.current_branch) info += ' (' + data.current_branch + ')';
-            el.textContent = info;
-            if (data.update_available) {
+        } else if (!data.is_git_repo) {
+            info += ' （非 git 仓库）';
+        }
+        el.textContent = info;
+        if (data.update_available) {
                 document.getElementById('apply-update-btn').disabled = false;
                 document.getElementById('apply-update-btn').style.opacity = '1';
             }

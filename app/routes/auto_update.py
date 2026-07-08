@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.routes.settings import _get_setting, _save_setting, SETTING_DEFAULTS
 from app.csrf import check_csrf
-from app.config import BASE_DIR
+from app.config import BASE_DIR, VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,7 @@ async def update_status(request: Request, db: Session = Depends(get_db)):
     last_check = _get_setting(db, "auto_update_last_check") or ""
 
     return {
+        "version": VERSION,
         "is_git_repo": is_git,
         "current_commit": commit,
         "current_branch": branch,

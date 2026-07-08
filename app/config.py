@@ -111,6 +111,7 @@ def decrypt(encrypted: str) -> str:
 
 # ========== 全局系统设置缓存 ==========
 
+VERSION = "v1.0"
 SYSTEM_NAME = "文书分发系统"
 SYSTEM_PORT = "8020"
 

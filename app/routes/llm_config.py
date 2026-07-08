@@ -175,3 +175,11 @@ async def test_llm(request: Request, config_id: int, form_csrf: str = Form("", a
         return {"success": True, "message": f"测试成功！\n返回：{result['case_summary']}"}
     except Exception as e:
         return {"success": False, "message": f"测试失败：{str(e)}"}
+
+
+@router.get("/default-prompt")
+async def get_default_prompt():
+    """返回当前系统默认提示词模板（用于前端“恢复默认模板”按钮）"""
+    from app.llm_analyzer import _get_default_prompt
+    prompt = _get_default_prompt()
+    return {"prompt": prompt}

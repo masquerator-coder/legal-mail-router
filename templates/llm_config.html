@@ -159,15 +159,16 @@
 
 {% block scripts %}
 <script>
-// 默认两阶段提示词模板
-{% raw %}
-var DEFAULT_PROMPT = "你是一位资深法律文书分析专家。请按以下两阶段分析邮件及附件内容：\n\n## 第一阶段：文书类型识别\n根据邮件标题、正文和附件内容，从以下类型中选择最匹配的文书类型：\n{doc_types}\n\n## 第二阶段：详细解读与审核\n无论文书类型，请进行以下全面分析：\n1. **案情摘要**：概括案件核心内容和涉及方\n2. **法律要点分析**：识别核心法律问题，分析适用的法律依据和裁判规则\n3. **关键信息提取**：案号、关键日期（开庭/答辩/上诉截止等）、涉及金额、管辖法院/机关等\n4. **风险提示**：潜在的法律风险、程序风险、时效风险、证据风险\n5. **处理建议**：应采取的下一步行动、需要准备的材料、注意事项、是否建议委托专业律师\n\n## 邮件信息\n- 发件人：{sender}\n- 主题：{subject}\n- 内容：\n{body}\n\n注意：如果下方有\"## 附件内容\"段落，请以附件原文为主要分析依据。\n\n## 输出格式\n请严格返回 JSON 格式（不要包含 markdown 代码块标记）：\n{\n  \"doc_type\": \"文书类型（从上述类型中选择）\",\n  \"case_summary\": \"一句话概括案件内容和涉及方\",\n  \"ai_interpretation\": \"第二阶段完整分析结果，包含：法律要点分析、关键信息提取、风险提示（按重要性分级）、处理建议。300-600字。\",\n  \"urgency\": \"high|medium|low\",\n  \"key_date\": \"关键日期或null\",\n  \"case_number\": \"案号或null\",\n  \"involved_parties\": \"涉及方名称（逗号分隔）\",\n  \"target_lawyer_type\": \"民事|刑事|行政|知识产权|劳动纠纷|公司商事|默认\",\n  \"confidence\": 0.0-1.0之间的置信度\n}";
-{% endraw %}
-
-function resetToDefault(textareaId) {
+async function resetToDefault(textareaId) {
     var ta = document.getElementById(textareaId);
     if (!ta) return;
-    ta.value = DEFAULT_PROMPT;
+    try {
+        var resp = await fetch('/llm-config/default-prompt');
+        var data = await resp.json();
+        ta.value = data.prompt || '';
+    } catch(e) {
+        showToast('获取默认模板失败: ' + (e.message || '未知'), 'error');
+    }
     ta.scrollTop = 0;
 }
 
