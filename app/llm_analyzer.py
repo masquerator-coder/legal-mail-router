@@ -65,9 +65,8 @@ DEFAULT_ANALYSIS_PROMPT = """你是一位资深法律文书分析专家。请按
   "key_date": "关键日期或null",
   "case_number": "案号或null",
   "involved_parties": "涉及方名称（逗号分隔）",
-  "target_lawyer_type": "民事|刑事|行政|知识产权|劳动纠纷|公司商事|默认",
   "confidence": 0.0-1.0之间的置信度
-}}"""
+}}"
 
 
 def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
@@ -169,7 +168,6 @@ async def analyze_email(
         "key_date": str | None,
         "case_number": str | None,
         "involved_parties": str,
-        "target_lawyer_type": str,
         "confidence": float,
     }
     """
@@ -276,7 +274,6 @@ async def analyze_email(
         "key_date": result.get("key_date"),
         "case_number": result.get("case_number"),
         "involved_parties": result.get("involved_parties", ""),
-        "target_lawyer_type": result.get("target_lawyer_type", "默认"),
         "confidence": float(result.get("confidence", 0.5)),
     }
 
@@ -291,7 +288,6 @@ def _fallback_analysis() -> dict:
         "key_date": None,
         "case_number": None,
         "involved_parties": "",
-        "target_lawyer_type": "默认",
         "confidence": 0.5,  # 非 0.0，避免被垃圾邮件过滤器误杀
     }
 

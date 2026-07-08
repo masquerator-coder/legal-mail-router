@@ -79,7 +79,7 @@
                 {% for att in log.attachments %}
                 <tr>
                     <td>{{ att.filename }}</td>
-                    <td>{{ (att.file_size / 1024)|round(1) }} KB</td>
+                    <td>{{ (att.file_size / 1024)|round(1) if att.file_size is not none else 'N/A' }} KB</td>
                 </tr>
                 {% endfor %}
             </tbody>
