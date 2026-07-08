@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 LABEL maintainer="legal-mail-router"
 LABEL description="文书分拣系统 - AI 驱动的法律邮件自动分拣与转发"
@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir -e . && \
 COPY app/ ./app/
 COPY templates/ ./templates/
 COPY static/ ./static/
+COPY config/ ./config/
 COPY LLM提示词.md ./
 
 # 创建数据目录
@@ -41,5 +42,7 @@ EXPOSE 8020
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://localhost:{os.environ.get(\"PORT\",\"8020\")}/health')" || exit 1
 
-# 启动（shell 形式支持环境变量替换）
-CMD python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT}
+# 启动（使用 entrypoint 脚本支持 PORT 环境变量）
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+ENTRYPOINT ["/docker-entrypoint.sh"]
