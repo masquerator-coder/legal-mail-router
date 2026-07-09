@@ -66,7 +66,7 @@ DEFAULT_ANALYSIS_PROMPT = """你是一位资深法律文书分析专家。请按
   "case_number": "案号或null",
   "involved_parties": "涉及方名称（逗号分隔）",
   "confidence": 0.0-1.0之间的置信度
-}}"
+}}"""
 
 
 def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
