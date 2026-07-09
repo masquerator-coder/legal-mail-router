@@ -76,6 +76,8 @@ async def export_backup(db: Session = Depends(get_db)):
             "api_key_encrypted": cfg.api_key_encrypted,
             "model_name": cfg.model_name,
             "is_active": cfg.is_active,
+            "connectivity_ok": cfg.connectivity_ok,
+            "pdf_capable": cfg.pdf_capable,
         })
 
     # 路由规则
@@ -225,6 +227,11 @@ async def import_backup(
                 existing.api_key_encrypted = item.get("api_key_encrypted", "")
                 existing.model_name = item.get("model_name", "")
                 existing.is_active = item.get("is_active", True)
+                # 恢复测试结果（仅导入 JSON 中有值时才覆盖，防止旧备份清空检测结果）
+                if "connectivity_ok" in item:
+                    existing.connectivity_ok = item["connectivity_ok"]
+                if "pdf_capable" in item:
+                    existing.pdf_capable = item["pdf_capable"]
             else:
                 cfg = OCRConfig(
                     name=ocr_name,
@@ -233,6 +240,8 @@ async def import_backup(
                     api_key_encrypted=item.get("api_key_encrypted", ""),
                     model_name=item.get("model_name", ""),
                     is_active=item.get("is_active", True),
+                    connectivity_ok=item.get("connectivity_ok"),
+                    pdf_capable=item.get("pdf_capable"),
                 )
                 db.add(cfg)
             stats["ocr"] += 1
