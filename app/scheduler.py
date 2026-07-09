@@ -412,6 +412,12 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
             ))
         db.flush()
 
+    # ── 提前提交，释放写锁 ──
+    # 后续 OCR、LLM 等外部调用耗时较长（10-180s），
+    # 如果在此期间持写事务，Web 端删除邮件日志将被阻塞至超时。
+    db.commit()
+    db.refresh(log)
+
 
     # ── 提取附件文本（per-attachment + combined） ──
     all_attachment_texts = ""
