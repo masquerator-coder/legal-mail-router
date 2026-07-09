@@ -19,12 +19,15 @@ async def list_accounts(request: Request, db: Session = Depends(get_db)):
     from app.models import DefaultConfig
     default_cfg = db.query(DefaultConfig).filter_by(key="default_check_interval").first()
     default_interval = int(default_cfg.value) if default_cfg and default_cfg.value else 30
+    global_blacklist_cfg = db.query(DefaultConfig).filter_by(key="global_sender_blacklist").first()
+    global_sender_blacklist = global_blacklist_cfg.value if global_blacklist_cfg and global_blacklist_cfg.value else ""
     return request.app.state.templates.TemplateResponse(request, "email_config.html", {
         "request": request,
         "active_page": "email_config",
         "accounts": accounts,
         "default_interval": default_interval,
         "scheduler_running": scheduler.running,
+        "global_sender_blacklist": global_sender_blacklist,
     })
 
 
@@ -317,3 +320,23 @@ def _test_connection_only(host, port, username, password_encrypted, provider_typ
         except Exception:
             pass
         return {"success": False, "message": str(e)}
+
+
+@router.post("/save-global-blacklist")
+async def save_global_blacklist(
+    request: Request,
+    db: Session = Depends(get_db),
+    global_sender_blacklist: str = Form(""),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
+    """保存全局发件人黑名单"""
+    check_csrf(request, form_csrf)
+    from app.models import DefaultConfig
+    cfg = db.query(DefaultConfig).filter_by(key="global_sender_blacklist").first()
+    if cfg:
+        cfg.value = global_sender_blacklist.strip()
+    else:
+        db.add(DefaultConfig(key="global_sender_blacklist", value=global_sender_blacklist.strip()))
+    db_retry_commit(db)
+    flash(request, "全局发件人黑名单已更新", "success")
+    return RedirectResponse(url="/email-config", status_code=303)

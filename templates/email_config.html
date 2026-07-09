@@ -76,6 +76,30 @@
 </div>
 {% endif %}
 
+<!-- 全局发件人黑名单 -->
+<div class="card" style="margin-top:20px;">
+    <div class="card-header"><h3>🚫 全局发件人黑名单</h3></div>
+    <div class="card-body">
+        <form method="post" action="/email-config/save-global-blacklist">
+            {{ csrf_token_input(request)|safe }}
+            <div class="form-group">
+                <label for="global_sender_blacklist">排除地址（每行一个或逗号分隔）</label>
+                <textarea id="global_sender_blacklist" name="global_sender_blacklist"
+                          class="form-control" rows="4"
+                          placeholder="spam@example.com&#10;noreply@xxx.com, advertising@yyy.com"
+                          style="font-family:monospace;font-size:13px;">{{ global_sender_blacklist }}</textarea>
+                <div class="form-hint" style="margin-top:6px;">
+                    所有邮箱检查时都跳过这些发件人的邮件。支持部分匹配：填入 <code>163.com</code> 会过滤所有来自 163.com 的邮件。
+                    与各个邮箱自己的「发件人过滤」结合使用——任一匹配即跳过。留空则不启用全局黑名单。
+                </div>
+            </div>
+            <div style="margin-top:12px;">
+                <button type="submit" class="btn btn-primary">💾 保存黑名单</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <!-- 编辑 Modal（移到 table 外部，避免无效HTML） -->
 {% if accounts %}
 {% for acc in accounts %}
