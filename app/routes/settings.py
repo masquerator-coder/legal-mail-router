@@ -54,6 +54,8 @@ SETTING_DEFAULTS = {
     "attachment_grouping": "false",           # 启用多附件分组分析
     "classify_use_main_llm": "true",          # 预分类使用主LLM(true)/指定LLM(false)
     "classify_llm_config_id": "",             # 预分类专用LLM配置ID
+    # ── 全局发件人黑名单 ──
+    "global_sender_blacklist": "",            # 全局排除地址（逗号分隔，所有邮箱共用）
 }
 
 
@@ -145,6 +147,8 @@ async def save_settings(
     auto_update_enabled: str = Form("false"),
     auto_update_branch: str = Form("main"),
     auto_update_interval_hours: str = Form("6"),
+    # ── 全局发件人黑名单 ──
+    global_sender_blacklist: str = Form(""),
     form_csrf: str = Form("", alias="_csrf_token"),
 ):
     """保存所有系统设置"""
@@ -185,6 +189,8 @@ async def save_settings(
     _save_setting(db, "auto_update_enabled", "true" if auto_update_enabled.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "auto_update_branch", auto_update_branch.strip() or "main")
     _save_setting(db, "auto_update_interval_hours", auto_update_interval_hours.strip() or "6")
+    # ── 全局发件人黑名单 ──
+    _save_setting(db, "global_sender_blacklist", global_sender_blacklist.strip())
     db_retry_commit(db)
 
     # 更新全局缓存

@@ -417,12 +417,16 @@ def fetch_new_emails(
     days: int = 7,
     filter_sender: str = "",
     download_attachments: bool = True,
+    global_blacklist: str = "",
 ) -> list[ParsedEmail]:
     """
     拉取最近N天的全部邮件（不依赖IMAP已读/未读标记）
     
     去重逻辑在上层 check_account() 中通过 EmailLog.message_id 实现。
     这里只负责从 IMAP 拉取原始邮件列表，不做任何标记操作。
+    
+    发件人过滤顺序：先合并全局黑名单 + 账户级黑名单，再统一过滤。
+    任一黑名单命中即跳过。
     """
     password = decrypt(password_encrypted)
 
@@ -444,7 +448,11 @@ def fetch_new_emails(
         msg_ids = fetcher.search_recent(days=days)
         logger.info(f"发现 {len(msg_ids)} 封最近 {days} 天邮件")
 
-        filter_senders = [s.strip().lower() for s in filter_sender.split(",") if s.strip()]
+        # ── 合并全局黑名单 + 账户级发件人过滤 ──
+        account_senders = [s.strip().lower() for s in filter_sender.split(",") if s.strip()]
+        global_senders = [s.strip().lower() for s in global_blacklist.split(",") if s.strip()]
+        # 合并去重（保持顺序不变不影响逻辑）
+        all_senders = account_senders + [s for s in global_senders if s not in account_senders]
 
         results = []
         filtered_count = 0
@@ -458,10 +466,10 @@ def fetch_new_emails(
                 if parsed is None:
                     continue
 
-                # 发件人过滤（黑名单：匹配的发件人将被跳过）
-                if filter_senders:
+                # 发件人过滤（黑名单：任一列表命中即跳过）
+                if all_senders:
                     sender_lower = parsed.sender.lower()
-                    if any(fs in sender_lower for fs in filter_senders):
+                    if any(fs in sender_lower for fs in all_senders):
                         filtered_count += 1
                         logger.info(f"⛔ 跳过(发件人被过滤) [{filtered_count}]: {parsed.sender}")
                         continue

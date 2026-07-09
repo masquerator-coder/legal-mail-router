@@ -109,7 +109,8 @@ def check_account(account_id: int):
             return  # account not found
 
         # ── 2. 拉取邮件 + 批量查重（独立会话，用完即关）──
-        new_emails, total = _fetch_and_dedup(ctx["account"], ctx["monitor_days"])
+        new_emails, total = _fetch_and_dedup(ctx["account"], ctx["monitor_days"],
+                                                global_blacklist=ctx.get("global_sender_blacklist", ""))
         if not new_emails:
             _update_progress(running=False, step="done", step_label="无新邮件")
             return
@@ -193,6 +194,8 @@ def _load_context(account_id: int) -> dict | None:
             "attachment_grouping": _read_setting("attachment_grouping", "false") == "true",
             "classify_use_main_llm": _read_setting("classify_use_main_llm", "true") == "true",
             "classify_llm_config_id": _read_setting("classify_llm_config_id", ""),
+            # ── 全局发件人黑名单 ──
+            "global_sender_blacklist": _read_setting("global_sender_blacklist", ""),
         }
     finally:
         db.close()
@@ -329,7 +332,7 @@ async def _classify_with_llm(api_url: str, api_key: str, model_name: str, prompt
     return json.loads(content)
 
 
-def _fetch_and_dedup(account, monitor_days: int) -> tuple[list, int]:
+def _fetch_and_dedup(account, monitor_days: int, global_blacklist: str = "") -> tuple[list, int]:
     """拉取邮件并批量查重（自包含，内部创建和销毁数据库会话用于查重）"""
     from app.database import SessionLocal
     from app.email_fetcher import fetch_new_emails
@@ -346,6 +349,7 @@ def _fetch_and_dedup(account, monitor_days: int) -> tuple[list, int]:
         days=monitor_days,
         filter_sender=account.filter_sender,
         download_attachments=account.download_attachments,
+        global_blacklist=global_blacklist,
     )
     if not emails:
         return [], 0
