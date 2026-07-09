@@ -128,6 +128,20 @@ def check_account(account_id: int):
                 email_db.commit()          # 成功 → 一次性提交全部变更
             except Exception as e:
                 email_db.rollback()        # 失败 → 干净回滚，不影响其他邮件
+                # 清理提前提交产生的 pending 孤立记录
+                # 如果 _process_one_email 已执行早期 commit（初始 EmailLog+Attachment 已持久化），
+                # 则 status="pending" 的记录不会被回滚，需手动清理以避免该邮件永不被重试。
+                if hasattr(eml, 'message_id') and eml.message_id:
+                    try:
+                        del_count = email_db.query(EmailLog).filter(
+                            EmailLog.message_id == eml.message_id,
+                            EmailLog.status == "pending",
+                        ).delete(synchronize_session=False)
+                        email_db.commit()
+                        if del_count:
+                            logger.info(f"已清理 pending 孤立记录: {eml.message_id}")
+                    except Exception:
+                        email_db.rollback()
                 logger.error(f"处理邮件 #{idx} ({eml.subject}) 失败: {e}", exc_info=True)
                 _update_progress(step="error", step_label=f"邮件{idx}失败: {str(e)[:60]}")
             finally:
