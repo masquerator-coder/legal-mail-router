@@ -54,7 +54,15 @@
 
 {% if log.error_message %}
 <div class="card" style="margin-top:20px; border-color: var(--danger);">
-    <div class="card-header" style="color:var(--danger);"><h3>⚠️ 错误信息</h3></div>
+    <div class="card-header" style="color:var(--danger);">
+        <h3 style="display:inline;">⚠️ 错误信息</h3>
+        {% if log.status == 'failed' %}
+        <form id="resendForm" style="display:inline; float:right;">
+            <input type="hidden" name="_csrf_token" value="{{ csrf_token_value(request) }}">
+            <button type="submit" class="btn btn-primary" style="font-size:13px;" onclick="return resendEmail(event, {{ log.id }})">↻ 重新转发</button>
+        </form>
+        {% endif %}
+    </div>
     <div class="card-body">
         <pre style="white-space:pre-wrap; font-size:13px; color:var(--danger);">{{ log.error_message }}</pre>
     </div>
@@ -96,4 +104,43 @@
     </div>
 </div>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+function resendEmail(event, logId) {
+    event.preventDefault();
+    var btn = event.target;
+    btn.disabled = true;
+    btn.textContent = '⏳ 转发中...';
+
+    var csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+
+    fetch('/logs/' + logId + '/resend', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-CSRF-Token': csrf,
+        },
+        body: '_csrf_token=' + encodeURIComponent(csrf),
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        if (data.success) {
+            location.reload();
+        } else {
+            alert('❌ ' + (data.message || '重新转发失败'));
+            btn.disabled = false;
+            btn.textContent = '↻ 重新转发';
+        }
+    })
+    .catch(function(err) {
+        alert('❌ 网络错误: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = '↻ 重新转发';
+    });
+
+    return false;
+}
+</script>
 {% endblock %}

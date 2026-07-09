@@ -257,6 +257,9 @@ def _generate_analysis_docx(analyses: list[dict], original_subject: str) -> Opti
     return tmp.name
 
 
+_SMTP_RETRY_DELAY = 5  # SMTP 重试间隔（秒）
+
+
 def forward_email(
     smtp_host: str,
     smtp_port: int,
@@ -271,6 +274,8 @@ def forward_email(
     analysis_result: dict = None,
     attachment_paths: list[str] = None,
     analysis_output_mode: str = "content",
+    retry_count: int = 2,
+    retry_delay: int = _SMTP_RETRY_DELAY,
 ) -> tuple:
     """
     转发邮件（含分析摘要 + AI解读 + 原邮件正文 + 附件）
@@ -289,6 +294,8 @@ def forward_email(
         analysis_result: 单条 LLM 分析结果 (兼容旧调用)
         attachment_paths: 附件路径列表
         analysis_output_mode: 输出模式
+        retry_count: SMTP 发送失败重试次数（默认 2 次）
+        retry_delay: 重试间隔秒数（默认 5 秒）
 
     返回: (成功, 错误信息)
     """
@@ -358,77 +365,84 @@ def forward_email(
                 part["Content-Disposition"] = f'attachment; filename="{path.name}"'
                 msg.attach(part)
 
-    # 发送
+    # 发送（带重试）
+    import time
+
+    last_error = ""
     server = None
-    try:
-        if smtp_port == 465:
-            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30)
-        else:
-            server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
-            server.starttls()
+    for attempt in range(1 + retry_count):
+        if attempt > 0:
+            logger.info(f"SMTP 重试 {attempt}/{retry_count}（等待 {retry_delay} 秒后）")
+            time.sleep(retry_delay)
 
-        server.login(smtp_username, smtp_password)
-        server.sendmail(from_email, [to_email], msg.as_string())
+        server = None
+        try:
+            if smtp_port == 465:
+                server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30)
+            else:
+                server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
+                server.starttls()
 
-        logger.info(f"邮件已转发: {original_subject} → {to_email}")
-        return True, None
+            server.login(smtp_username, smtp_password)
+            server.sendmail(from_email, [to_email], msg.as_string())
 
-    except smtplib.SMTPAuthenticationError as e:
-        error_msg = f"认证失败：账号或授权码错误 (SMTP AUTH 报错: {e})"
-        logger.error(f"转发邮件认证失败: {error_msg}")
-        return False, error_msg
+            logger.info(f"邮件已转发: {original_subject} → {to_email}")
+            return True, None
 
-    except smtplib.SMTPRecipientsRefused as e:
-        error_msg = f"收件人被拒绝：{to_email} (SMTP 报错: {e})"
-        logger.error(f"转发邮件收件人被拒绝: {error_msg}")
-        return False, error_msg
+        except smtplib.SMTPAuthenticationError as e:
+            last_error = f"认证失败：账号或授权码错误 (SMTP AUTH 报错: {e})"
+            logger.error(f"转发邮件认证失败({attempt}/{retry_count}): {last_error}")
+            # 认证失败不重试（配置问题，重试也没用）
+            return False, last_error
 
-    except smtplib.SMTPDataError as e:
-        error_msg = f"邮件数据被拒绝：服务器拒收邮件内容 (SMTP 报错: {e})"
-        logger.error(f"转发邮件数据错误: {error_msg}")
-        return False, error_msg
+        except smtplib.SMTPRecipientsRefused as e:
+            last_error = f"收件人被拒绝：{to_email} (SMTP 报错: {e})"
+            logger.error(f"转发邮件收件人被拒绝({attempt}/{retry_count}): {last_error}")
+            return False, last_error
 
-    except smtplib.SMTPConnectError as e:
-        error_msg = f"连接失败：无法连接到 {smtp_host}:{smtp_port} (SMTP 报错: {e})"
-        logger.error(f"转发邮件连接失败: {error_msg}")
-        return False, error_msg
+        except smtplib.SMTPSenderRefused as e:
+            last_error = f"发件人被拒绝：{from_email} (SMTP 报错: {e})"
+            logger.error(f"转发邮件发件人被拒绝({attempt}/{retry_count}): {last_error}")
+            return False, last_error
 
-    except smtplib.SMTPSenderRefused as e:
-        error_msg = f"发件人被拒绝：{from_email} (SMTP 报错: {e})"
-        logger.error(f"转发邮件发件人被拒绝: {error_msg}")
-        return False, error_msg
+        except smtplib.SMTPDataError as e:
+            last_error = f"邮件数据被拒绝：服务器拒收邮件内容 (SMTP 报错: {e})"
+            logger.error(f"转发邮件数据错误({attempt}/{retry_count}): {last_error}")
+            return False, last_error
 
-    except smtplib.SMTPServerDisconnected as e:
-        error_msg = f"服务器断开：{smtp_host} 在转发过程中断开连接 (SMTP 报错: {e})"
-        logger.error(f"转发邮件服务器断开: {error_msg}")
-        return False, error_msg
+        except smtplib.SMTPConnectError as e:
+            last_error = f"连接失败：无法连接到 {smtp_host}:{smtp_port} (SMTP 报错: {e})"
+            logger.error(f"转发邮件连接失败({attempt}/{retry_count}): {last_error}")
 
-    except smtplib.SMTPException as e:
-        error_msg = f"SMTP 错误：{smtp_host}:{smtp_port} (类型: {type(e).__name__}, 详情: {e})"
-        logger.error(f"转发邮件 SMTP 异常: {error_msg}")
-        return False, error_msg
+        except smtplib.SMTPServerDisconnected as e:
+            last_error = f"服务器断开：{smtp_host} 在转发过程中断开连接 (SMTP 报错: {e})"
+            logger.error(f"转发邮件服务器断开({attempt}/{retry_count}): {last_error}")
 
-    except TimeoutError:
-        error_msg = f"超时：连接 {smtp_host}:{smtp_port} 超过 30 秒无响应"
-        logger.error(f"转发邮件超时: {error_msg}")
-        return False, error_msg
+        except smtplib.SMTPException as e:
+            last_error = f"SMTP 错误：{smtp_host}:{smtp_port} (类型: {type(e).__name__}, 详情: {e})"
+            logger.error(f"转发邮件 SMTP 异常({attempt}/{retry_count}): {last_error}")
 
-    except ConnectionError as e:
-        error_msg = f"网络错误：无法连接到 {smtp_host}:{smtp_port} (详情: {e})"
-        logger.error(f"转发邮件网络错误: {error_msg}")
-        return False, error_msg
+        except TimeoutError:
+            last_error = f"超时：连接 {smtp_host}:{smtp_port} 超过 30 秒无响应"
+            logger.error(f"转发邮件超时({attempt}/{retry_count}): {last_error}")
 
-    except Exception as e:
-        error_msg = f"未知错误：转发到 {to_email} 失败 (类型: {type(e).__name__}, 详情: {e})"
-        logger.error(f"转发邮件失败: {error_msg}")
-        return False, error_msg
+        except ConnectionError as e:
+            last_error = f"网络错误：无法连接到 {smtp_host}:{smtp_port} (详情: {e})"
+            logger.error(f"转发邮件网络错误({attempt}/{retry_count}): {last_error}")
 
-    finally:
-        if server:
-            try:
-                server.quit()
-            except Exception:
-                pass
+        except Exception as e:
+            last_error = f"未知错误：转发到 {to_email} 失败 (类型: {type(e).__name__}, 详情: {e})"
+            logger.error(f"转发邮件失败({attempt}/{retry_count}): {last_error}")
+
+        finally:
+            if server:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+
+    # 所有重试都失败
+    return False, last_error
 
 
 def get_default_smtp_config(db_session) -> Optional[dict]:

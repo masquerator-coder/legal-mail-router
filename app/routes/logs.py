@@ -3,6 +3,8 @@
 """
 import csv
 import io
+import json
+import logging
 import zipfile
 from datetime import datetime
 from fastapi import APIRouter, Request, Depends, Query, Form
@@ -10,11 +12,14 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.database import get_db
-from app.models import EmailLog, Attachment
+from app.models import EmailLog, Attachment, EmailAccount, DefaultConfig
 from app.scheduler import scheduler
 from app.config import ATTACHMENTS_DIR, resolve_attachment_path
+from app.mail_forwarder import forward_email, get_default_smtp_config
 from app.csrf import check_csrf
 from urllib.parse import quote
+
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/logs", tags=["处理日志"])
 
 
@@ -119,6 +124,131 @@ async def log_detail(log_id: int, request: Request, db: Session = Depends(get_db
         "scheduler_running": scheduler.running,
         "urgency_map": {"high": "🔴", "medium": "🟡", "low": "🟢"},
     })
+
+
+def _infer_smtp_for_log(account, db) -> dict | None:
+    """从邮箱账户推断 SMTP 配置（同 scheduler._infer_smtp_from_account 逻辑）"""
+    host = account.imap_host.lower()
+    known_providers = {
+        "163.com": ("smtp.163.com", 465),
+        "126.com": ("smtp.126.com", 465),
+        "yeah.net": ("smtp.yeah.net", 465),
+        "qq.com": ("smtp.qq.com", 465),
+        "foxmail.com": ("smtp.qq.com", 465),
+        "gmail.com": ("smtp.gmail.com", 587),
+        "outlook.com": ("smtp.office365.com", 587),
+        "hotmail.com": ("smtp.office365.com", 587),
+        "office365.com": ("smtp.office365.com", 587),
+        "aliyun.com": ("smtp.aliyun.com", 465),
+    }
+    for domain, (smtp_host, smtp_port) in known_providers.items():
+        if domain in host:
+            return {
+                "host": smtp_host,
+                "port": smtp_port,
+                "username": account.username,
+                "password_encrypted": account.password_encrypted,
+            }
+    if host.startswith("imap."):
+        smtp_host = "smtp." + host[5:]
+        return {
+            "host": smtp_host,
+            "port": 587,
+            "username": account.username,
+            "password_encrypted": account.password_encrypted,
+        }
+    return None
+
+
+@router.post("/{log_id}/resend")
+async def resend_email(
+    log_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
+    """重新转发失败的邮件（不重新 LLM 分析，使用已有分析结果）"""
+    check_csrf(request, form_csrf)
+
+    log = db.query(EmailLog).filter_by(id=log_id).first()
+    if not log:
+        return {"success": False, "message": "记录不存在"}
+
+    if log.status != "failed":
+        return {"success": False, "message": "只能重新转发失败状态的邮件"}
+
+    # 获取邮箱账户
+    account = db.query(EmailAccount).filter_by(id=log.account_id).first()
+    if not account:
+        return {"success": False, "message": "关联邮箱账户不存在"}
+
+    # 获取 SMTP 配置
+    smtp = _infer_smtp_for_log(account, db) or get_default_smtp_config(db)
+    if not smtp:
+        return {"success": False, "message": "未配置 SMTP 服务器"}
+
+    # 解析已有的 LLM 分析结果
+    analyses = []
+    if log.llm_raw_response:
+        try:
+            parsed = json.loads(log.llm_raw_response)
+            if isinstance(parsed, list):
+                analyses = parsed
+            elif isinstance(parsed, dict):
+                analyses = [parsed]
+        except Exception:
+            pass
+
+    # 获取附件路径
+    atts = db.query(Attachment).filter_by(log_id=log.id).all()
+    attachment_paths = []
+    for att in atts:
+        if att.file_path:
+            fp = resolve_attachment_path(att.file_path)
+            if fp.exists():
+                attachment_paths.append(str(fp))
+
+    # 获取输出模式
+    mode_cfg = db.query(DefaultConfig).filter_by(key="analysis_output_mode").first()
+    analysis_output_mode = mode_cfg.value if mode_cfg and mode_cfg.value else "content"
+
+    # 解析目标邮箱
+    targets = [t.strip() for t in (log.target_email or "").split(",") if t.strip()]
+    if not targets:
+        return {"success": False, "message": "未配置转发目标邮箱"}
+
+    # 逐个转发
+    all_success = True
+    last_error = ""
+    for target in targets:
+        success, error_detail = forward_email(
+            smtp_host=smtp["host"],
+            smtp_port=smtp["port"],
+            smtp_username=smtp["username"],
+            smtp_password_encrypted=smtp["password_encrypted"],
+            from_email=smtp["username"],
+            to_email=target,
+            to_name="",
+            original_subject=log.subject or "",
+            original_body=log.body_text or log.body_preview or "",
+            analyses_results=analyses,
+            attachment_paths=attachment_paths,
+            analysis_output_mode=analysis_output_mode,
+        )
+        if not success:
+            all_success = False
+            last_error = f"SMTP: {smtp['host']}:{smtp['port']} → {target} | 原因: {error_detail}"
+            logger.error(f"重新转发失败: {last_error}")
+
+    # 更新状态
+    log.error_message = last_error if not all_success else None
+    log.status = "forwarded" if all_success else "failed"
+    db.commit()
+
+    return {
+        "success": all_success,
+        "message": "重新转发成功" if all_success else f"重新转发失败: {last_error}",
+    }
 
 
 @router.post("/delete-selected")
