@@ -60,6 +60,8 @@ class OCRConfig(Base):
     api_key_encrypted = Column(Text, default="", comment="加密的API Key(可为空)")
     model_name = Column(String(100), default="", comment="模型名称(vision模型需要)")
     is_active = Column(Boolean, default=True, comment="是否激活")
+    connectivity_ok = Column(Boolean, nullable=True, comment="连通性测试是否通过: true/false/null(未测)")
+    pdf_capable = Column(Boolean, nullable=True, comment="是否支持PDF直读: true/false/null(未测)")
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 

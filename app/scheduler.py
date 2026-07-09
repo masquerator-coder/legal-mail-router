@@ -170,6 +170,7 @@ def _load_context(account_id: int) -> dict | None:
                 "api_url": ocr_cfg_row.api_url,
                 "api_key": decrypt(ocr_cfg_row.api_key_encrypted) if ocr_cfg_row.api_key_encrypted else "",
                 "model_name": ocr_cfg_row.model_name,
+                "pdf_capable": ocr_cfg_row.pdf_capable,
             }
 
         def _read_setting(key: str, default: str = "") -> str:

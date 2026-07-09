@@ -208,3 +208,84 @@ async def _ocr_mineru(image_bytes: bytes, api_url: str, filename: str = "image.p
 
     logger.info(f"MinerU 解析完成: {filename} ({len(md)} 字符)")
     return md.strip()
+
+
+async def ocr_pdf(pdf_bytes: bytes, ocr_cfg: dict, filename: str = "document.pdf") -> str:
+    """直接提交 PDF 字节给 OCR 服务，返回识别文本。
+
+    适用于支持 PDF 直读的服务（如 MinerU + custom）。
+    对 PaddleOCR/OpenAI Vision 等不支持 PDF 的服务，预期会抛异常。
+
+    发送策略按 provider_type:
+      - mineru:   multipart POST /file_parse
+      - paddleocr: JSON {file: base64(pdf), fileType: 1}（预期失败）
+      - openai-vision: data:application/pdf 塞 image_url（预期失败）
+      - custom:   同 paddleocr 的 JSON 格式（约定格式）
+    """
+    provider = ocr_cfg.get("provider_type", "custom")
+    api_url = ocr_cfg.get("api_url", "")
+    if not api_url:
+        logger.warning("ocr_pdf: api_url 为空")
+        return ""
+
+    if provider == "mineru":
+        return await _ocr_mineru(pdf_bytes, api_url, filename)
+    elif provider in ("paddleocr", "custom"):
+        # paddleocr 格式: JSON + base64
+        b64 = base64.b64encode(pdf_bytes).decode()
+        payload = {"file": b64, "fileType": 1}
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(api_url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        # 尝试解析返回文本（不同版本 PaddleOCR 格式可能不同）
+        try:
+            ocr_results = data.get("result", {}).get("ocrResults", [])
+            texts = []
+            for ocr in ocr_results:
+                pruned = ocr.get("prunedResult", {})
+                rec_texts = pruned.get("rec_texts", [])
+                for t in rec_texts:
+                    if t.strip():
+                        texts.append(t.strip())
+            if texts:
+                return "\n".join(texts)
+        except Exception:
+            pass
+        # 兜底：尝试直接读 result.text
+        try:
+            return data.get("result", {}).get("text", "") or ""
+        except Exception:
+            return ""
+    elif provider == "openai-vision":
+        # 作为 data:application/pdf 塞 image_url（预期失败）
+        b64 = base64.b64encode(pdf_bytes).decode()
+        base_url = api_url.rstrip("/")
+        if not base_url.endswith("/chat/completions"):
+            base_url += "/chat/completions"
+        payload = {
+            "model": ocr_cfg.get("model_name", "gpt-4o"),
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "请识别文档中的所有文字，直接输出内容。"},
+                    {"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{b64}"}},
+                ]
+            }],
+            "max_tokens": 2000,
+        }
+        headers = {
+            "Authorization": f"Bearer {ocr_cfg.get('api_key', '')}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(base_url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        try:
+            return data["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError):
+            return ""
+    else:
+        logger.warning(f"ocr_pdf: 未知 provider_type {provider}")
+        return ""

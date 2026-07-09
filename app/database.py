@@ -116,6 +116,18 @@ def _migrate_email_account_forward_to(conn):
         conn.commit()
 
 
+def _migrate_ocr_config_capabilities(conn):
+    """自动迁移：为 ocr_config 表补齐 connectivity_ok 和 pdf_capable 列"""
+    cols = {row[1] for row in conn.execute(text("PRAGMA table_info(ocr_config)"))}
+    if "connectivity_ok" not in cols:
+        logger.info("迁移: ocr_config 添加 connectivity_ok 列")
+        conn.execute(text("ALTER TABLE ocr_config ADD COLUMN connectivity_ok BOOLEAN"))
+    if "pdf_capable" not in cols:
+        logger.info("迁移: ocr_config 添加 pdf_capable 列")
+        conn.execute(text("ALTER TABLE ocr_config ADD COLUMN pdf_capable BOOLEAN"))
+    conn.commit()
+
+
 def get_db():
     """FastAPI 依赖：获取数据库会话"""
     db = SessionLocal()
@@ -135,6 +147,7 @@ def init_db():
         _migrate_routing_rules_account_ids(conn)
         _migrate_email_log_doc_types(conn)
         _migrate_email_account_forward_to(conn)
+        _migrate_ocr_config_capabilities(conn)
 
         # 添加查询性能索引和 UNIQUE 约束（SQLite 用 IF NOT EXISTS 安全幂等）
         sqls = [

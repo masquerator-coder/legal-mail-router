@@ -795,11 +795,10 @@ def extract_per_attachment_texts(attachments: list[AttachmentInfo], ocr_cfg: dic
     def _ocr_image(filename: str, content: bytes, ocr_cfg: dict | None) -> str:
         try:
             from app.ocr import ocr_image
-            import asyncio
-            result = asyncio.run(ocr_image(content, filename, ocr_cfg or {}))
+            result = _run_async_safe(ocr_image(content, ocr_cfg or {}, filename))
             return result or ""
         except Exception as e:
-            logger.debug(f"OCR 失败: {filename}: {e}")
+            logger.warning(f"OCR 失败: {filename}: [{type(e).__name__}] {e}")
             return ""
 
     results = {}
@@ -833,33 +832,47 @@ def extract_per_attachment_texts(attachments: list[AttachmentInfo], ocr_cfg: dic
             elif ext == "wps":
                 extracted = _doc_ole(content) or _binary_fallback(content)
             elif ext == "pdf":
-                import fitz
-                doc = fitz.open(stream=content, filetype="pdf")
-                pages_text = []
-                pdf_images = []
-                for page in doc:
-                    text = page.get_text()
-                    if text.strip():
-                        pages_text.append(text)
-                    else:
-                        try:
-                            pix = page.get_pixmap(dpi=200)
-                            pdf_images.append(pix.tobytes("png"))
-                        except Exception:
-                            pass
-                doc.close()
-                extracted = "\n".join(pages_text) if pages_text else ""
-                if pdf_images and not extracted:
-                    ocr_texts = []
-                    for img_bytes in pdf_images:
-                        ocr_result = _ocr_image(f"{filename}_p.png", img_bytes, ocr_cfg)
-                        if ocr_result:
-                            ocr_texts.append(ocr_result)
-                    if ocr_texts:
-                        extracted = "\n".join(ocr_texts)
-                if not extracted and pdf_images:
-                    for img_bytes in pdf_images[:5]:
-                        unocr_img.append({"filename": f"{filename}_p.png", "content": img_bytes, "mime_type": "image/png"})
+                # ── PDF 直读路径（服务支持 PDF 时优先） ──
+                if ocr_cfg and ocr_cfg.get("pdf_capable") is True:
+                    from app.ocr import ocr_pdf
+                    try:
+                        pdf_text = _run_async_safe(ocr_pdf(content, ocr_cfg, filename))
+                        if pdf_text and pdf_text.strip():
+                            extracted = pdf_text.strip()
+                            logger.info(f"PDF 直读成功: {filename} ({len(extracted)} 字符)")
+                    except Exception as e:
+                        logger.warning(f"PDF 直读失败 {filename}，将回退逐页渲染: {e}")
+                        extracted = None
+
+                # ── 兜底：逐页渲染 + OCR ──
+                if not extracted:
+                    import fitz
+                    doc = fitz.open(stream=content, filetype="pdf")
+                    pages_text = []
+                    pdf_images = []
+                    for page in doc:
+                        text = page.get_text()
+                        if text.strip():
+                            pages_text.append(text)
+                        else:
+                            try:
+                                pix = page.get_pixmap(dpi=200)
+                                pdf_images.append(pix.tobytes("png"))
+                            except Exception:
+                                pass
+                    doc.close()
+                    extracted = "\n".join(pages_text) if pages_text else ""
+                    if pdf_images and not extracted:
+                        ocr_texts = []
+                        for img_bytes in pdf_images:
+                            ocr_result = _ocr_image(f"{filename}_p.png", img_bytes, ocr_cfg)
+                            if ocr_result:
+                                ocr_texts.append(ocr_result)
+                        if ocr_texts:
+                            extracted = "\n".join(ocr_texts)
+                    if not extracted and pdf_images:
+                        for img_bytes in pdf_images[:5]:
+                            unocr_img.append({"filename": f"{filename}_p.png", "content": img_bytes, "mime_type": "image/png"})
             elif ext in ("xlsx", "xls"):
                 import openpyxl
                 wb = openpyxl.load_workbook(BytesIO(content), data_only=True)

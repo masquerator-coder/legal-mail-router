@@ -18,6 +18,7 @@
                     <th>类型</th>
                     <th>API 地址</th>
                     <th>模型</th>
+                    <th>PDF 识别</th>
                     <th>状态</th>
                     <th>操作</th>
                 </tr>
@@ -40,6 +41,19 @@
                     <td style="font-size:12px; max-width:200px; overflow:hidden; text-overflow:ellipsis;">{{ cfg.api_url }}</td>
                     <td style="font-size:12px;">{{ cfg.model_name or '-' }}</td>
                     <td>
+                        {% if cfg.pdf_capable == True %}
+                            <span class="badge badge-success" title="支持 PDF 直读">📄 支持</span>
+                        {% elif cfg.pdf_capable == False %}
+                            <span class="badge badge-default" title="仅支持图片">🔲 仅图片</span>
+                        {% elif cfg.connectivity_ok == True %}
+                            <span class="badge badge-warning" title="连通正常，PDF 能力待检测">❓ 待测</span>
+                        {% elif cfg.connectivity_ok == False %}
+                            <span class="badge badge-danger" title="连通测试失败">🚫 不可达</span>
+                        {% else %}
+                            <span class="badge badge-default" title="未测试">-</span>
+                        {% endif %}
+                    </td>
+                    <td>
                         {% if cfg.is_active %}
                             <span class="badge badge-success">启用</span>
                         {% else %}
@@ -48,7 +62,7 @@
                     </td>
                     <td>
                         <button class="btn btn-outline btn-xs" onclick="testOCR({{ cfg.id }})">🔗 测试</button>
-                        <button class="btn btn-outline btn-xs" onclick='editOCR({{ cfg.id|tojson }}, {{ cfg.name|tojson }}, {{ cfg.provider_type|tojson }}, {{ cfg.api_url|tojson }}, {{ cfg.model_name|tojson }}, {{ cfg.is_active|lower }})'>✏️</button>
+                        <button class="btn btn-outline btn-xs" onclick='editOCR({{ cfg.id|tojson }}, {{ cfg.name|tojson }}, {{ cfg.provider_type|tojson }}, {{ cfg.api_url|tojson }}, {{ cfg.model_name|tojson }}, {{ cfg.is_active|lower }}, {{ cfg.pdf_capable|tojson }})'>✏️</button>
                         <form method="post" action="/ocr-config/delete/{{ cfg.id }}" style="display:inline;" onsubmit="return confirm('确定删除？')">
                             {{ csrf_token_input(request)|safe }}
                             <button type="submit" class="btn btn-outline btn-xs" style="color:var(--danger);">🗑</button>
@@ -90,7 +104,7 @@
                 <input type="text" name="name" id="cfg-name" value="OCR配置" class="form-control" required>
 
                 <label>提供商类型</label>
-                <select name="provider_type" id="cfg-provider" class="form-control">
+                <select name="provider_type" id="cfg-provider" class="form-control" onchange="togglePdfCapableField()">
                     <option value="paddleocr">PaddleOCR</option>
                     <option value="openai-vision">OpenAI Vision (多模态模型)</option>
                     <option value="mineru">MinerU (文档解析)</option>
@@ -106,6 +120,16 @@
 
                 <label>模型名称 <small>(Vision 类型需要)</small></label>
                 <input type="text" name="model_name" id="cfg-model" value="" class="form-control" placeholder="如 gpt-4o / Qwen2.5-VL-72B">
+
+                <div id="pdf-capable-field" style="display:none; margin-top:12px;">
+                    <label>PDF 直读支持</label>
+                    <select name="pdf_capable_manual" id="cfg-pdf" class="form-control">
+                        <option value="auto">自动检测（保存后点「测试」）</option>
+                        <option value="yes">支持直接提交 PDF</option>
+                        <option value="no">仅支持图片</option>
+                    </select>
+                    <small style="color:var(--text-muted);">仅「自定义」类型需要手动声明。已知类型自动处理。</small>
+                </div>
 
                 <label style="display:flex;align-items:center;gap:8px;margin-top:12px;">
                     <input type="hidden" name="is_active" value="false">
@@ -124,7 +148,13 @@
 
 {% block scripts %}
 <script>
-function editOCR(id, name, provider, url, model, active) {
+function togglePdfCapableField() {
+    var provider = document.getElementById('cfg-provider').value;
+    var field = document.getElementById('pdf-capable-field');
+    field.style.display = provider === 'custom' ? 'block' : 'none';
+}
+
+function editOCR(id, name, provider, url, model, active, pdfCapable) {
     document.getElementById('modal-title').textContent = '编辑 OCR 配置';
     document.getElementById('ocr-form').action = '/ocr-config/update/' + id;
     document.getElementById('cfg-name').value = name;
@@ -133,6 +163,16 @@ function editOCR(id, name, provider, url, model, active) {
     document.getElementById('cfg-model').value = model || '';
     document.getElementById('cfg-key').value = '';
     document.getElementById('cfg-active').checked = active;
+    // 根据 pdf_capable 设置手动开关
+    var pdfSelect = document.getElementById('cfg-pdf');
+    if (pdfCapable === true) {
+        pdfSelect.value = 'yes';
+    } else if (pdfCapable === false) {
+        pdfSelect.value = 'no';
+    } else {
+        pdfSelect.value = 'auto';
+    }
+    togglePdfCapableField();
     openModal('add-modal');
 }
 
@@ -144,30 +184,37 @@ async function testOCR(id) {
     resultDiv.style.display = 'block';
     resultDiv.style.background = '#edf2f7';
     resultDiv.style.color = '#4a5568';
-    resultDiv.textContent = '⏳ 正在测试 OCR 连接...';
+    resultDiv.innerHTML = '<strong>⏳ 正在测试 OCR 连接...</strong>';
     try {
         var resp = await fetch('/ocr-config/test/' + id, { method: 'POST' });
         var data = await resp.json();
         if (data.success) {
+            var html = '<strong style="font-size:16px;">✅ 测试完成</strong><br>';
+            if (data.details) {
+                html += '<ul style="margin:8px 0 0 0; padding-left:20px; font-size:13px; line-height:1.8;">';
+                data.details.forEach(function(d) { html += '<li>' + d + '</li>'; });
+                html += '</ul>';
+            }
             resultDiv.style.background = '#f0fff4';
             resultDiv.style.color = '#276749';
-            resultDiv.innerHTML = '';
-            var strongEl = document.createElement('strong');
-            strongEl.textContent = '✅ ' + data.message;
-            resultDiv.appendChild(strongEl);
+            resultDiv.innerHTML = html;
             showToast(data.message, 'success');
         } else {
             resultDiv.style.background = '#fff5f5';
             resultDiv.style.color = '#9b2c2c';
             resultDiv.innerHTML = '';
             var strongEl = document.createElement('strong');
-            strongEl.textContent = '❌ 连接失败';
+            strongEl.textContent = '❌ 测试失败';
             resultDiv.appendChild(strongEl);
-            resultDiv.appendChild(document.createElement('br'));
-            var spanEl = document.createElement('span');
-            spanEl.style.fontSize = '12px';
-            spanEl.textContent = data.message;
-            resultDiv.appendChild(spanEl);
+            if (data.details) {
+                data.details.forEach(function(d) {
+                    resultDiv.appendChild(document.createElement('br'));
+                    var span = document.createElement('span');
+                    span.style.fontSize = '12px';
+                    span.textContent = d;
+                    resultDiv.appendChild(span);
+                });
+            }
             showToast(data.message, 'error');
         }
     } catch(e) {
