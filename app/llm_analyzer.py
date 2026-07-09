@@ -4,6 +4,7 @@ LLM 分析模块 — 调用 OpenAI 兼容 API 分析法律文书
 import json
 import logging
 import re
+from datetime import date
 import httpx
 from app.config import decrypt
 from config.model_windows import KNOWN_MODEL_WINDOWS, DEFAULT_CONTEXT_WINDOW
@@ -72,8 +73,12 @@ DEFAULT_ANALYSIS_PROMPT = """你是一位资深法律文书分析专家。请按
 def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
                   body_max_chars: int = 8000,
                   kb_context: str = "",
-                  routing_doc_types: list = None) -> str:
+                  routing_doc_types: list = None,
+                  today_str: str = "") -> str:
     """构建分析 prompt。body_max_chars 为邮件正文字符上限（0=不截断）。"""
+    if not today_str:
+        from datetime import date
+        today_str = date.today().isoformat()
     template = custom_prompt if custom_prompt.strip() else _get_default_prompt()
 
     # 截断过长的正文
@@ -106,13 +111,13 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
         )
 
     # 自定义提示词可能不含 {doc_types}，仅默认模板使用
-    format_args = dict(subject=subject, sender=sender, body=body_truncated)
+    format_args = dict(subject=subject, sender=sender, body=body_truncated, today=today_str)
     if "{doc_types}" in template:
         format_args["doc_types"] = doc_types_str
 
     # ⚠️ 用户自定义提示词中可能包含未转义的 { }（如 JSON 示例格式）
     # 需要先保护已知占位符，转义其余花括号，再恢复占位符后调用 .format()
-    KNOWN_PLACEHOLDERS = {"{subject}", "{sender}", "{body}", "{doc_types}"}
+    KNOWN_PLACEHOLDERS = {"{subject}", "{sender}", "{body}", "{doc_types}", "{today}"}
     # 保护阶段：替换已知占位符为唯一哨兵
     sentinel_map = {}
     for i, ph in enumerate(KNOWN_PLACEHOLDERS):
@@ -234,7 +239,7 @@ async def analyze_email(
     payload = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": "你是一位资深法律文书分析专家。请先识别文书类型，再进行详细解读与审核。严格按JSON格式返回两阶段分析结果，不要包含markdown代码块标记。禁止输出分析过程、思考步骤或推理说明，直接输出JSON。"},
+            {"role": "system", "content": f"你是一位资深法律文书分析专家。请先识别文书类型，再进行详细解读与审核。严格按JSON格式返回两阶段分析结果，不要包含markdown代码块标记。禁止输出分析过程、思考步骤或推理说明，直接输出JSON。\n\n重要：当前真实日期是 {date.today().isoformat()}。你的训练知识截止日期较早，文书中的日期（包括当前日期附近的日期）在当前真实时间下是完全有效且合法的。请以当前日期为准判断时效问题，不要将合法日期判定为「未来日期」或「无效日期」。"},
             user_message,
         ],
         "max_tokens": max_tokens,
@@ -484,7 +489,7 @@ async def generate_revision(
     payload = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": "你是一位资深法律文书撰写专家。请根据审核意见和格式模板修订文书，用【新增】【修改】【删除】标记标注所有改动。直接输出完整文书，不加前言。禁止输出分析过程、思考步骤或推理说明，只输出修订后的文书正文。"},
+            {"role": "system", "content": f"你是一位资深法律文书撰写专家。请根据审核意见和格式模板修订文书，用【新增】【修改】【删除】标记标注所有改动。直接输出完整文书，不加前言。禁止输出分析过程、思考步骤或推理说明，只输出修订后的文书正文。\n\n重要日期参考：当前真实日期是 {date.today().isoformat()}。修订时请以当前日期为准填写或更新文书中的日期字段。"},
             {"role": "user", "content": prompt},
         ],
         "max_tokens": max_tokens,
