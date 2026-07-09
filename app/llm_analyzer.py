@@ -179,13 +179,16 @@ async def analyze_email(
                           routing_doc_types=None)
 
     # 预算检查（在提交前检测是否需要截断）
+    # 注意：预算计算用的 expected_output_tokens 不等同于 max_tokens（API 输出上限），
+    # max_tokens=102400 会把输入预算压到 1024 导致附件被全截掉。
+    expected_output_tokens = min(max_tokens, 2000)
     if context_window > 0:
         parts = {
             "template_with_body": prompt,
             "kb_context": kb_context,
             "attachment_texts": attachment_texts,
         }
-        parts = truncate_prompt_parts(parts, context_window, usage_ratio, max_tokens, token_method)
+        parts = truncate_prompt_parts(parts, context_window, usage_ratio, expected_output_tokens, token_method)
         prompt = parts["template_with_body"]
         kb_context = parts.get("kb_context", "")
         attachment_texts = parts.get("attachment_texts", "")
