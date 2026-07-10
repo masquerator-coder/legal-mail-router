@@ -883,8 +883,7 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
     """
     决定转发目标列表:
     - 垃圾过滤 → 跳过（返回空列表）
-    - 非法律文书 → 转发到默认邮箱
-    - 法律文书 → 按路由规则匹配（account_ids 匹配），兜底默认邮箱
+    - 非法律文书/法律文书 → 统一按路由规则匹配（account_ids 匹配），兜底默认邮箱
 
     返回 [{"email": str, "smtp_cfg": dict}, ...] 或空列表（跳过）
     """
@@ -906,23 +905,7 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
         log.error_message = "LLM 判定为非法律文书（低置信度）"
         return []
 
-    # ── 非法律文书 → 默认邮箱 ──
-    if analysis and llm_doc_type == "非法律文书":
-        default_email = db.query(DefaultConfig).filter_by(key="default_forward_email").first()
-        if default_email and default_email.value:
-            targets = [default_email.value.strip()]
-        else:
-            log.status = "failed"
-            log.error_message = "非法律文书未配置默认转发邮箱"
-            return []
-        log.target_email = targets[0]
-        smtp = _infer_smtp_from_account(account) or get_default_smtp_config(db)
-        if not smtp:
-            log.status = "failed"
-            log.error_message = "未配置 SMTP 服务器"
-            return []
-        return [{"email": t, "smtp_cfg": smtp} for t in targets]
-
+    # ── 非法律文书 → 也走路由规则（与法律文书同逻辑）──
     # ── 法律文书 → 查路由规则 ──
     targets = []
     seen = set()
