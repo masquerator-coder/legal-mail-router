@@ -694,6 +694,17 @@ def _fill_review_template(template_path: str, analysis: dict,
     # 尝试从正文/摘要中提取金额
     amount = _extract_amount(body_text or case_summary)
 
+    # ── 解析发件人：提取名称，兜底用邮箱 ──
+    import re
+    sender_email_match = re.search(r'<([^>]+)>', sender)
+    if sender_email_match:
+        sender_name = sender[:sender_email_match.start()].strip().strip('"').strip("'").strip()
+        sender_email = sender_email_match.group(1).strip()
+    else:
+        sender_name = ""
+        sender_email = sender.strip()
+    sender_display = sender_name or sender_email
+
     # ── P1: 替换 xxx ──
     if len(doc.paragraphs) > 1:
         p1 = doc.paragraphs[1]
@@ -701,7 +712,7 @@ def _fill_review_template(template_path: str, analysis: dict,
         replacements = [
             (str(now.year),),           # 第1个xxx → 年份
             (str(now.month),),           # 第2个xxx → 月份
-            (sender,),                   # 第3个xxx → 发来方
+            (sender_display,),           # 第3个xxx → 发来方名称
             (party_b,),                  # 第4个xxx → 拟与...签订方
             (contract_name,),            # 第5个xxx → 合同名称
             (case_summary_clean,),       # 第6个xxx → 合同内容（已剥离金额）
