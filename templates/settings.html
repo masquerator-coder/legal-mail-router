@@ -193,13 +193,14 @@
             </div>
 
             <div id="revision-prompt-group" style="margin-top:16px;display:none;">
-                <label for="revision_prompt">修订提示词模板</label>
+                <label for="revision_prompt">修订提示词模板
+                    <button type="button" class="btn btn-outline btn-xs" style="margin-left:8px;vertical-align:middle;" onclick="resetRevisionPrompt()">🔄 恢复默认</button>
+                </label>
                 <div style="display:flex;gap:8px;align-items:flex-start;">
                     <textarea id="revision_prompt" name="revision_prompt"
                               class="form-control" rows="6"
                               style="font-family:monospace;font-size:12px;flex:1;"
                               placeholder="留空使用系统默认提示词">{{ settings.revision_prompt }}</textarea>
-                    <button type="button" class="btn btn-outline btn-sm" style="white-space:nowrap;margin-top:0;" onclick="resetRevisionPrompt()">🔄 恢复默认</button>
                 </div>
                 <div class="form-hint">
                     自定义 LLM 修订提示词。占位符：{doc_type} {ai_interpretation} {original_text}。留空则使用内置默认提示词。<br>
