@@ -107,6 +107,15 @@ def _migrate_email_log_doc_types(conn):
         conn.commit()
 
 
+def _migrate_email_log_revision_instructions(conn):
+    """自动迁移：为 email_logs 表补齐新增的 revision_instructions 列"""
+    cols = {row[1] for row in conn.execute(text("PRAGMA table_info(email_logs)"))}
+    if "revision_instructions" not in cols:
+        logger.info("迁移: email_logs 添加 revision_instructions 列")
+        conn.execute(text("ALTER TABLE email_logs ADD COLUMN revision_instructions TEXT"))
+        conn.commit()
+
+
 def _migrate_email_account_forward_to(conn):
     """自动迁移：为 email_accounts 表补齐新增的 forward_to 列"""
     cols = {row[1] for row in conn.execute(text("PRAGMA table_info(email_accounts)"))}
@@ -146,6 +155,7 @@ def init_db():
         _migrate_doc_templates(conn)
         _migrate_routing_rules_account_ids(conn)
         _migrate_email_log_doc_types(conn)
+        _migrate_email_log_revision_instructions(conn)
         _migrate_email_account_forward_to(conn)
         _migrate_ocr_config_capabilities(conn)
 
