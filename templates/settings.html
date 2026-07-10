@@ -943,12 +943,19 @@ document.addEventListener('DOMContentLoaded', function() {
 function resetRevisionPrompt() {
     var ta = document.getElementById('revision_prompt');
     if (!ta) return;
-    var btn = event.target;
-    btn.disabled = true;
-    btn.textContent = '⏳ 加载中...';
+    var btn = event && event.target;
+    if (!btn) btn = document.querySelector('button[onclick="resetRevisionPrompt()"]');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ 加载中...'; }
     fetch('/settings/default-revision-prompt')
-        .then(function(r) { return r.json(); })
+        .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + r.statusText);
+            return r.json();
+        })
         .then(function(data) {
+            if (data.error) {
+                showToast('获取默认提示词失败: ' + data.error, 'error');
+                return;
+            }
             ta.value = data.prompt || '';
             ta.scrollTop = 0;
         })
@@ -956,8 +963,7 @@ function resetRevisionPrompt() {
             showToast('获取默认提示词失败: ' + (e.message || '未知'), 'error');
         })
         .finally(function() {
-            btn.disabled = false;
-            btn.textContent = '🔄 恢复默认';
+            if (btn) { btn.disabled = false; btn.textContent = '🔄 恢复默认'; }
         });
 }
 </script>

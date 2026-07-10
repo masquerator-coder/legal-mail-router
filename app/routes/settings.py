@@ -354,9 +354,13 @@ async def kb_health_check(api_base: str = "http://127.0.0.1:19828"):
 @router.get("/default-revision-prompt")
 async def get_default_revision_prompt():
     """获取系统默认修订提示词（从 修订提示词.md 或代码回退）"""
-    from app.llm_analyzer import _get_default_revision_prompt
-    prompt = _get_default_revision_prompt()
-    return {"prompt": prompt}
+    try:
+        from app.llm_analyzer import _get_default_revision_prompt
+        prompt = _get_default_revision_prompt()
+        return {"prompt": prompt}
+    except Exception as e:
+        logger.error(f"获取默认修订提示词失败: [{type(e).__name__}] {e}")
+        return {"prompt": "", "error": str(e)}
 
 
 def get_kb_config(db: Session) -> dict:
