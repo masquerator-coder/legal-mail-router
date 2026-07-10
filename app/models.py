@@ -117,6 +117,7 @@ class EmailLog(Base):
     doc_type = Column(String(50), comment="文书类型")
     case_summary = Column(Text, comment="案件摘要")
     ai_interpretation = Column(Text, comment="AI初步审核解读")
+    revision_instructions = Column(Text, comment="结构化修订指令JSON数组")
     urgency = Column(String(10), comment="紧急程度: high/medium/low")
     key_date = Column(String(50), comment="关键日期")
     case_number = Column(String(100), comment="案号")

@@ -627,6 +627,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
                         doc_type=g_analysis.get("doc_type", "其他法律文书"),
                         original_text=original_text,
                         ai_interpretation=g_analysis.get("ai_interpretation", ""),
+                        revision_instructions=json.dumps(g_analysis.get("revision_instructions", []), ensure_ascii=False),
                         custom_prompt=ctx.get("revision_prompt", ""),
                         template=template,
                         max_tokens=revision_max_tokens,
@@ -708,6 +709,20 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
         log.key_date = str(primary.get("key_date")) if primary and primary.get("key_date") else None
         log.case_number = primary.get("case_number") if primary else None
         log.involved_parties = str(primary.get("involved_parties", ""))[:500] if primary and primary.get("involved_parties") else None
+        # 拼接 revision_instructions（合并所有组的结构化修订指令）
+        all_instructions = []
+        for gi, a in enumerate(all_analyses):
+            ri = a.get("revision_instructions", [])
+            if ri and isinstance(ri, list) and len(ri) > 0:
+                if is_grouping:
+                    all_instructions.append({
+                        "group_index": gi + 1,
+                        "doc_type": a.get("doc_type", "文书"),
+                        "instructions": ri,
+                    })
+                else:
+                    all_instructions.extend(ri)
+        log.revision_instructions = json.dumps(all_instructions, ensure_ascii=False) if all_instructions else None
         log.status = "analyzed"
 
 

@@ -237,6 +237,28 @@ def _generate_analysis_docx(analyses: list[dict], original_subject: str) -> Opti
         else:
             doc.add_paragraph("（暂无AI解读，请人工审核）")
 
+        # ── 结构化修订指令 ──
+        ri_list = analysis.get("revision_instructions", [])
+        if ri_list and isinstance(ri_list, list) and len(ri_list) > 0:
+            doc.add_heading("结构化修订指令", level=2 if is_multi else 1)
+            ri_table = doc.add_table(rows=1, cols=4, style="Light Grid Accent 1")
+            ri_table.autofit = True
+            # 表头
+            for i, header in enumerate(["操作", "位置", "问题", "建议修改"]):
+                ri_table.rows[0].cells[i].text = header
+                for paragraph in ri_table.rows[0].cells[i].paragraphs:
+                    for run in paragraph.runs:
+                        run.bold = True
+            # 数据行
+            action_labels = {"modify": "修改", "add": "新增", "delete": "删除"}
+            for instr in ri_list:
+                row_cells = ri_table.add_row().cells
+                action = instr.get("action", "")
+                row_cells[0].text = action_labels.get(action, action)
+                row_cells[1].text = instr.get("target_location", "")
+                row_cells[2].text = instr.get("issue", "")
+                row_cells[3].text = instr.get("suggested_revision", "")
+
         if is_multi and idx < len(analyses) - 1:
             doc.add_page_break()
 

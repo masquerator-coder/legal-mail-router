@@ -88,8 +88,24 @@ DEFAULT_ANALYSIS_PROMPT = """你是一位资深法律文书分析专家。请按
   "key_date": "关键日期或null",
   "case_number": "案号或null",
   "involved_parties": "涉及方名称（逗号分隔）",
-  "confidence": 0.0-1.0之间的置信度
-}}"""
+  "confidence": 0.0-1.0之间的置信度,
+  "revision_instructions": [
+    {{
+      "target_location": "条款准确位置（如「第四条 违约责任 第2款」）",
+      "original_text_snippet": "原文中需修改的片段（精确引用原文）",
+      "issue": "问题描述（法律错误、风险隐患等）",
+      "suggested_revision": "建议修改后的完整表述",
+      "action": "modify | add | delete"
+    }}
+  ]
+}}
+
+关于 revision_instructions 的说明：
+- 合同/协议类文书必须生成该数组，每个条款问题一条记录。
+- 其他类型文书可选（如有明确的修改建议再生成）。
+- 若无明确的逐条修改建议，返回空数组 []。
+- 此字段是后续文书修订环节的精确操作指令，请确保每条指令清晰、完整、可执行。
+"""
 
 
 def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
@@ -417,22 +433,31 @@ def get_effective_context_window(
     return detect_context_window(api_url, api_key, model_name)
 
 
-DEFAULT_REVISION_PROMPT = """你是一位资深法律文书撰写专家。根据以下审核意见，对原始文书进行修订，输出完整的修改版文书。
+DEFAULT_REVISION_PROMPT = """你是一位资深法律文书撰写专家。根据以下审核意见和结构化修订指令，对原始文书进行修订，输出完整的修改版文书。
 
 ## 原始文书类型
 {doc_type}
 
-## AI 审核意见
+## 审核分析报告（仅供上下文参考）
 {ai_interpretation}
+
+## 结构化修订指令（优先执行）
+{revision_instructions}
 
 ## 原始文书全文
 {original_text}
 
 ## 修订要求
-1. 修正审核意见中指出的法律错误、程序瑕疵和表述不当
-2. 补充缺失的关键条款（违约责任、争议解决、送达地址、管辖约定等）
-3. 调整明显不平衡的权利义务条款
-4. 保持原文书的整体结构、段落顺序和行文风格
+1. 【优先执行】严格依据【结构化修订指令】中的 `action`、`target_location` 和 `suggested_revision` 进行改动。
+2. 【次要依据】如果结构化修订指令为空，再从审核分析报告中提取明确包含「修改建议」「建议修改为」「应改为」等措辞的句子作为依据。
+3. 补充缺失的关键条款（违约责任、争议解决、送达地址、管辖约定等）
+4. 调整明显不平衡的权利义务条款
+5. 保持原文书的整体结构、段落顺序和行文风格
+
+## 安全底线规则
+1. 若【结构化修订指令】中的建议与现行法律法规强制性规定明显冲突，忽略该指令，原文保留并标注【待核实】
+2. 若指令中的 `target_location` 在原文中无法精确定位，将该指令放在文末「补充修订」部分，并标注【待置入】
+3. 审核分析报告中的「案情摘要」「风险提示」「程序分析」仅供理解背景，不得作为修改来源
 
 {template_section}
 
@@ -459,6 +484,7 @@ async def generate_revision(
     doc_type: str,
     original_text: str,
     ai_interpretation: str,
+    revision_instructions: str = "",
     custom_prompt: str = "",
     template: str | None = None,
     max_tokens: int = 4000,
@@ -468,6 +494,8 @@ async def generate_revision(
     """
     根据 LLM 审核意见生成修改版文书。
 
+    revision_instructions: 结构化修订指令（JSON 数组字符串），
+        优先于 ai_interpretation 作为修订依据。
     template: 可选的文书格式模板，传入后 LLM 将严格遵循模板格式修订。
     返回修改后的文书全文（含改动标记），失败时返回 None。
     """
@@ -475,6 +503,11 @@ async def generate_revision(
 
     api_key = decrypt(api_key_encrypted)
     prompt_template = custom_prompt.strip() if custom_prompt.strip() else _get_default_revision_prompt()
+
+    # ── 格式化 revision_instructions ──
+    formatted_instructions = ""
+    if revision_instructions and revision_instructions.strip():
+        formatted_instructions = revision_instructions
 
     # ── 构建模板段 ──
     if template and template.strip():
@@ -493,12 +526,20 @@ async def generate_revision(
     else:
         template_section = ""
 
-    prompt = prompt_template.format(
+    # ── 构建 prompt（兼容含/不含 revision_instructions 占位符的模板）──
+    format_kwargs = dict(
         doc_type=doc_type,
         ai_interpretation=ai_interpretation,
+        revision_instructions=formatted_instructions,
         original_text=original_text[:8000],  # 截断过长的原文
         template_section=template_section,
     )
+    if "{revision_instructions}" in prompt_template:
+        prompt = prompt_template.format(**format_kwargs)
+    else:
+        # 旧版自定义模板不含 revision_instructions 占位符，移除该键
+        format_kwargs.pop("revision_instructions")
+        prompt = prompt_template.format(**format_kwargs)
 
     # 确保 api_url 以 /chat/completions 结尾
     if not api_url.endswith("/chat/completions"):

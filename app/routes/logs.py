@@ -114,6 +114,16 @@ async def log_detail(log_id: int, request: Request, db: Session = Depends(get_db
 
     attachments = db.query(Attachment).filter_by(log_id=log.id).all()
 
+    # 解析结构化修订指令
+    revision_instructions_parsed = None
+    if log.revision_instructions:
+        try:
+            parsed = json.loads(log.revision_instructions)
+            if parsed and (isinstance(parsed, list) and len(parsed) > 0):
+                revision_instructions_parsed = parsed
+        except Exception:
+            pass
+
     return request.app.state.templates.TemplateResponse(request, "log_detail.html", {
         "request": request,
         "active_page": "logs",
@@ -121,6 +131,7 @@ async def log_detail(log_id: int, request: Request, db: Session = Depends(get_db
         "llm_result": llm_result,
         "attachments": attachments,
         "group_count": group_count,
+        "revision_instructions": revision_instructions_parsed,
         "scheduler_running": scheduler.running,
         "urgency_map": {"high": "🔴", "medium": "🟡", "low": "🟢"},
     })

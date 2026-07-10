@@ -43,6 +43,47 @@
             {% if llm_result.ai_interpretation %}
             <tr><td style="color:var(--text-muted);">🤖 AI解读</td><td style="line-height:1.7; background:#f8fafc; padding:12px; border-radius:8px; white-space:pre-wrap;">{{ llm_result.ai_interpretation }}</td></tr>
             {% endif %}
+            {% if revision_instructions %}
+            <tr>
+                <td style="color:var(--text-muted); vertical-align:top;">📋 修订指令</td>
+                <td>
+                    <details>
+                        <summary style="cursor:pointer; color:var(--primary);">共 {{ revision_instructions|length }} 条结构化修订指令</summary>
+                        <div style="margin-top:8px;">
+                        {% for ri in revision_instructions %}
+                            {% if ri.instructions is defined and ri.instructions is iterable %}
+                                {# 分组模式：ri 是 {group_index, doc_type, instructions} #}
+                                <div style="margin-bottom:12px; padding:8px; background:#f1f5f9; border-radius:6px;">
+                                    <strong style="color:var(--text-muted);">第{{ ri.group_index }}组 - {{ ri.doc_type }}</strong>
+                                    <table style="width:100%; margin-top:4px; border-collapse:collapse; font-size:13px;">
+                                    {% for instr in ri.instructions %}
+                                        <tr style="border-bottom:1px solid #e2e8f0;">
+                                            <td style="padding:6px 4px; width:80px; color:var(--text-muted);">{{ instr.action | upper }}</td>
+                                            <td style="padding:6px 4px;"><strong>{{ instr.target_location }}</strong></td>
+                                            <td style="padding:6px 4px; color:#64748b;">{{ instr.issue }}</td>
+                                        </tr>
+                                    {% endfor %}
+                                    </table>
+                                </div>
+                            {% else %}
+                                {# 非分组模式：ri 是单个指令 #}
+                                <div style="margin-bottom:6px; padding:6px 8px; background:#f8fafc; border-left:3px solid var(--primary); border-radius:4px;">
+                                    <span style="display:inline-block; min-width:60px; padding:2px 6px; border-radius:4px; font-size:12px; font-weight:bold; color:white;
+                                        {% if ri.action == 'delete' %} background:#ef4444;
+                                        {% elif ri.action == 'add' %} background:#22c55e;
+                                        {% else %} background:#3b82f6; {% endif %}">
+                                        {{ ri.action | upper }}
+                                    </span>
+                                    <strong style="margin-left:8px;">{{ ri.target_location }}</strong>
+                                    <div style="margin-top:4px; color:#64748b; font-size:13px;">{{ ri.issue }}</div>
+                                </div>
+                            {% endif %}
+                        {% endfor %}
+                        </div>
+                    </details>
+                </td>
+            </tr>
+            {% endif %}
             <tr><td style="color:var(--text-muted);">涉及方</td><td>{{ llm_result.involved_parties or log.involved_parties or '无' }}</td></tr>
             <tr><td style="color:var(--text-muted);">关键日期</td><td>{{ llm_result.key_date or '无' }}</td></tr>
             <tr><td style="color:var(--text-muted);">案号</td><td>{{ llm_result.case_number or '无' }}</td></tr>
