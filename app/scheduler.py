@@ -38,6 +38,32 @@ _check_progress = {
     "started_at": None,   # 开始时间 ISO
 }
 
+# 默认主要文书类型列表：这些类型的文书会生成修改版
+# 佐证材料、司法公文、兜底类型不会生成修改版
+REVISION_CANDIDATE_TYPES = frozenset({
+    "合同协议",
+    "起诉状",
+    "答辩状",
+    "上诉状",
+    "仲裁申请书",
+    "执行申请书",
+    "保全申请书",
+    "行政复议申请书",
+    "律师函",
+    "法律意见书",
+    "代理词",
+    "辩护词",
+    "和解协议",
+    "承诺书",
+})
+
+
+def _should_generate_revision(doc_type: str | None) -> bool:
+    """判断该文书类型是否应生成修改版（仅主要文书需要修订）"""
+    if not doc_type:
+        return False
+    return doc_type.strip() in REVISION_CANDIDATE_TYPES
+
 
 def get_progress() -> dict:
     """获取当前执行进度"""
@@ -568,10 +594,11 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
         if g_failed:
             all_llm_failed = True
 
-        # 修改版文书生成（逐组）
+        # 修改版文书生成（逐组）——仅主要文书类型生成修改版
         if (ctx.get("revision_enabled")
                 and not g_failed
                 and g_analysis
+                and _should_generate_revision(g_analysis.get("doc_type"))
                 and llm_cfg):
             try:
                 from app.llm_analyzer import get_effective_context_window, generate_revision
