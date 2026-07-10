@@ -378,14 +378,19 @@ def forward_email(
     # ── 原邮件附件（带路径遍历防御）──
     from app.config import ATTACHMENTS_DIR
     _allowed_base = ATTACHMENTS_DIR.parent.resolve()
+    import tempfile
+    _temp_dir = Path(tempfile.gettempdir()).resolve()
 
     if attachment_paths:
         for file_path in attachment_paths:
             path = Path(file_path)
-            # 路径遍历防御：只允许访问 ATTACHMENTS_DIR 目录树内的文件
+            # 路径遍历防御：只允许访问 ATTACHMENTS_DIR 目录树或系统临时目录内的文件
+            # 系统生成的修改版文书/审核意见/AI分析报告在 TEMP 目录下，需放行
             try:
                 resolved = path.resolve()
-                if not (_allowed_base in resolved.parents or resolved == _allowed_base):
+                is_in_attachments = _allowed_base in resolved.parents or resolved == _allowed_base
+                is_in_temp = _temp_dir in resolved.parents or resolved == _temp_dir
+                if not (is_in_attachments or is_in_temp):
                     logger.warning(f"附件路径越界（已跳过）: {file_path}")
                     continue
             except (ValueError, OSError, RuntimeError):
