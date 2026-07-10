@@ -2,7 +2,7 @@
 法律知识库客户端 — 单元测试
 """
 import pytest
-from app.kb_client import format_search_results
+from app.services.kb_client import format_search_results
 
 
 class TestFormatSearchResults:

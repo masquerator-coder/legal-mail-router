@@ -9,7 +9,7 @@ from app.models import RoutingRule, DefaultConfig, EmailAccount
 from app.config import encrypt
 from app.flash import flash
 from app.csrf import check_csrf
-from app.scheduler import scheduler
+from app.services.scheduler import scheduler
 router = APIRouter(prefix="/routing", tags=["路由规则"])
 
 

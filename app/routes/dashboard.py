@@ -35,7 +35,7 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
     active_llm = db.query(LLMConfig).filter_by(is_active=True).first()
     recent_logs = db.query(EmailLog).order_by(EmailLog.created_at.desc()).limit(10).all()
 
-    from app.scheduler import scheduler
+    from app.services.scheduler import scheduler
     jobs = scheduler.get_jobs() if scheduler.running else []
     default_interval = _get_default_interval(db)
 
@@ -69,7 +69,7 @@ async def trigger_manual_check(request: Request, form_csrf: str = Form("", alias
     import threading
     import logging
     logger = logging.getLogger(__name__)
-    from app.scheduler import check_account
+    from app.services.scheduler import check_account
 
     def run_checks():
         for acc in accounts:
@@ -113,5 +113,5 @@ async def save_settings(
 @router.get("/progress")
 async def get_progress(request: Request):
     """获取当前执行进度"""
-    from app.scheduler import get_progress as scheduler_progress
+    from app.services.scheduler import get_progress as scheduler_progress
     return scheduler_progress()

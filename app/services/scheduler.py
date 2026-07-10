@@ -66,8 +66,9 @@ def _should_generate_revision(doc_type: str | None) -> bool:
 
 
 def get_progress() -> dict:
-    """获取当前执行进度"""
-    return copy.deepcopy(_check_progress)
+    """获取当前执行进度（线程安全）"""
+    with _progress_lock:
+        return copy.deepcopy(_check_progress)
 
 
 _progress_lock = threading.Lock()
@@ -103,11 +104,13 @@ def add_check_job(account_id: int, interval_minutes: int):
 
 
 def remove_check_job(account_id: int):
-    """移除邮件检查任务"""
+    """移除邮件检查任务，同时清理账户锁（防内存泄漏）"""
     job_id = _make_job_id(account_id)
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
         logger.info(f"已移除检查任务: {job_id}")
+    with _account_locks_lock:
+        _account_locks.pop(account_id, None)
 
 
 def check_account(account_id: int):
@@ -303,8 +306,8 @@ B) 包含多份独立的不同文书 → 各自成组
 示例3（只有1个附件）: {{"groups": [[0]]}}
 """
     try:
-        from app.email_fetcher import _run_async_safe
-        from app.llm_analyzer import analyze_email
+        from app.services.email_fetcher import _run_async_safe
+        from app.services.llm_analyzer import analyze_email
         from app.config import decrypt
         
         api_key = decrypt(classify_llm.api_key_encrypted) if classify_llm.api_key_encrypted else ""
@@ -376,7 +379,7 @@ async def _classify_with_llm(api_url: str, api_key: str, model_name: str, prompt
 def _fetch_and_dedup(account, monitor_days: int, global_blacklist: str = "") -> tuple[list, int]:
     """拉取邮件并批量查重（自包含，内部创建和销毁数据库会话用于查重）"""
     from app.database import SessionLocal
-    from app.email_fetcher import fetch_new_emails
+    from app.services.email_fetcher import fetch_new_emails
     from app.models import EmailLog
 
     _update_progress(step="scanning", step_label="正在扫描邮件列表...")
@@ -414,8 +417,8 @@ def _fetch_and_dedup(account, monitor_days: int, global_blacklist: str = "") -> 
 def _process_one_email(eml, idx: int, ctx: dict, db):
     """处理单封邮件：保存附件 → 分组 → LLM 分析 → 路由匹配 → 转发"""
     from app.models import EmailLog, Attachment, DefaultConfig
-    from app.email_fetcher import save_attachments, extract_attachment_texts, extract_per_attachment_texts
-    from app.mail_forwarder import forward_email
+    from app.services.email_fetcher import save_attachments, extract_attachment_texts, extract_per_attachment_texts
+    from app.services.mail_forwarder import forward_email
 
     account = ctx["account"]
     llm_cfg = ctx["llm_cfg"]
@@ -485,7 +488,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     body_max_chars = 8000
     try:
         from app.routes.settings import get_kb_config, _get_setting
-        from app.kb_client import search_and_format
+        from app.services.kb_client import search_and_format
         kb_cfg = get_kb_config(db)
         try:
             kb_max_chars = int(_get_setting(db, "kb_search_max_chars") or "5000")
@@ -519,7 +522,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     token_method = "approximate"
     try:
         from app.routes.settings import _get_setting
-        from app.llm_analyzer import get_effective_context_window, detect_context_window
+        from app.services.llm_analyzer import get_effective_context_window, detect_context_window
         from app.config import decrypt
 
         # 读取 DB 中的上下文窗口设置
@@ -601,10 +604,10 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
                 and _should_generate_revision(g_analysis.get("doc_type"))
                 and llm_cfg):
             try:
-                from app.llm_analyzer import get_effective_context_window, generate_revision
+                from app.services.llm_analyzer import get_effective_context_window, generate_revision
                 from app.config import decrypt
-                from app.mail_forwarder import _generate_revision_docx
-                from app.email_fetcher import _run_async_safe
+                from app.services.mail_forwarder import _generate_revision_docx
+                from app.services.email_fetcher import _run_async_safe
 
                 context_window = get_effective_context_window(
                     ctx.get("context_window_tokens", "0"),
@@ -659,7 +662,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
                 and g_analysis
                 and ctx.get("review_template_path")):
             try:
-                from app.mail_forwarder import _fill_review_template
+                from app.services.mail_forwarder import _fill_review_template
                 from app.config import BASE_DIR
 
                 template_full_path = BASE_DIR / ctx["review_template_path"]
@@ -801,8 +804,8 @@ def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: li
                       usage_ratio: float = 0.50,
                       token_method: str = "approximate") -> tuple[dict | None, bool]:
     """执行 LLM 分析（含重试），返回 (analysis, llm_failed)"""
-    from app.email_fetcher import _run_async_safe
-    from app.llm_analyzer import analyze_email
+    from app.services.email_fetcher import _run_async_safe
+    from app.services.llm_analyzer import analyze_email
 
     if not llm_cfg:
         return None, False
@@ -888,7 +891,7 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
     返回 [{"email": str, "smtp_cfg": dict}, ...] 或空列表（跳过）
     """
     from app.models import DefaultConfig, RoutingRule
-    from app.mail_forwarder import get_default_smtp_config
+    from app.services.mail_forwarder import get_default_smtp_config
 
     llm_doc_type = analysis.get("doc_type", "") if analysis else ""
     llm_confidence = analysis.get("confidence", 0.5) if analysis else 0.0
@@ -1053,7 +1056,7 @@ def start_scheduler():
 def shutdown_scheduler():
     """关闭调度器（最多等待 30 秒让正在执行的任务完成，保障数据一致性）"""
     if scheduler.running:
-        scheduler.shutdown(wait=True, timeout=30)
+        scheduler.shutdown(wait=True)
         logger.info("调度器已关闭")
 
 
@@ -1180,7 +1183,7 @@ def _format_uptime(started_at) -> str:
 
 def _get_smtp_config_for_report(db) -> Optional[dict]:
     """获取用于发送日报的 SMTP 配置（优先级：系统默认SMTP → 第一个邮箱账户推断）"""
-    from app.mail_forwarder import get_default_smtp_config
+    from app.services.mail_forwarder import get_default_smtp_config
     from app.models import EmailAccount
 
     # 优先使用系统默认 SMTP

@@ -84,7 +84,7 @@ def _save_setting(db: Session, key: str, value: str):
 @router.get("")
 async def settings_page(request: Request, db: Session = Depends(get_db)):
     """系统设置页面"""
-    from app.scheduler import scheduler
+    from app.services.scheduler import scheduler
 
     settings = _get_all_settings(db)
     accounts = db.query(EmailAccount).filter_by(enabled=True).all()
@@ -266,6 +266,7 @@ async def restart_service(request: Request, form_csrf: str = Form("", alias="_cs
             subprocess.Popen(
                 ["cmd.exe", "/c", cmd],
                 close_fds=True,
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
                 cwd=str(Path(__file__).resolve().parent.parent.parent),
             )
         else:
@@ -274,11 +275,15 @@ async def restart_service(request: Request, form_csrf: str = Form("", alias="_cs
             subprocess.Popen(
                 ["/bin/sh", "-c", startup],
                 close_fds=True,
+                start_new_session=True,
                 cwd=str(Path(__file__).resolve().parent.parent.parent),
             )
         # 向自身发送 SIGTERM 触发 uvicorn 优雅关闭（lifespan shutdown 会执行）
         if sys.platform == "win32":
-            os.kill(os.getpid(), signal.CTRL_BREAK_EVENT)
+            # Windows: os.kill 会杀死整个进程组（包括刚启动的子进程）
+            # 改用 os._exit 直接从当前进程退出，不影响已 DETACHED 的子进程
+            import os as _os
+            _os._exit(0)
         else:
             os.kill(os.getpid(), signal.SIGTERM)
 
@@ -317,7 +322,7 @@ async def detect_context_window_endpoint(request: Request, db: Session = Depends
     """探测当前 LLM 模型的上下文窗口大小"""
     from app.models import LLMConfig
     from app.config import decrypt
-    from app.llm_analyzer import detect_context_window
+    from app.services.llm_analyzer import detect_context_window
 
     llm = db.query(LLMConfig).filter_by(is_active=True).first()
     if not llm:
@@ -340,7 +345,7 @@ async def detect_context_window_endpoint(request: Request, db: Session = Depends
 @router.get("/kb-health")
 async def kb_health_check(api_base: str = "http://127.0.0.1:19828"):
     """测试知识库连接（服务端代理，避免浏览器 CORS 限制）"""
-    from app.kb_client import health_check
+    from app.services.kb_client import health_check
     try:
         ok = await health_check(api_base)
         if ok:
@@ -355,7 +360,7 @@ async def kb_health_check(api_base: str = "http://127.0.0.1:19828"):
 async def get_default_revision_prompt():
     """获取系统默认修订提示词（从 修订提示词.md 或代码回退）"""
     try:
-        from app.llm_analyzer import _get_default_revision_prompt
+        from app.services.llm_analyzer import _get_default_revision_prompt
         prompt = _get_default_revision_prompt()
         return {"prompt": prompt}
     except Exception as e:

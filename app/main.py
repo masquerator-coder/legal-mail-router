@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.database import init_db
-from app.scheduler import start_scheduler, shutdown_scheduler, scheduler, schedule_cleanup_job, schedule_daily_report_job
+from app.services.scheduler import start_scheduler, shutdown_scheduler, scheduler, schedule_cleanup_job, schedule_daily_report_job
 from app.config import BASE_DIR, load_system_settings, SYSTEM_NAME
 
 # 日志配置
@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI):
     # 加载已有邮箱账户的调度任务
     from app.database import SessionLocal
     from app.models import EmailAccount
-    from app.scheduler import add_check_job
+    from app.services.scheduler import add_check_job
 
     db = SessionLocal()
     try:

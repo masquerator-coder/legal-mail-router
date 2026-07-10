@@ -375,14 +375,25 @@ def forward_email(
         )
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-    # ── 原邮件附件 ──
+    # ── 原邮件附件（带路径遍历防御）──
+    from app.config import ATTACHMENTS_DIR
+    _allowed_base = ATTACHMENTS_DIR.parent.resolve()
+
     if attachment_paths:
         for file_path in attachment_paths:
             path = Path(file_path)
-            if not path.exists():
+            # 路径遍历防御：只允许访问 ATTACHMENTS_DIR 目录树内的文件
+            try:
+                resolved = path.resolve()
+                _allowed_base in resolved.parents or resolved == _allowed_base
+            except (ValueError, OSError, RuntimeError):
+                logger.warning(f"附件路径解析失败（已跳过）: {file_path}")
+                continue
+
+            if not resolved.exists():
                 logger.warning(f"附件不存在: {file_path}")
                 continue
-            with open(path, "rb") as f:
+            with open(resolved, "rb") as f:
                 part = MIMEApplication(f.read(), Name=path.name)
                 part["Content-Disposition"] = f'attachment; filename="{path.name}"'
                 msg.attach(part)

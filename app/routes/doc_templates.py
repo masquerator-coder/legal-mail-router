@@ -9,7 +9,7 @@ from app.database import get_db
 from app.models import DocTemplate, EmailAccount
 from app.flash import flash
 from app.csrf import check_csrf
-from app.scheduler import scheduler
+from app.services.scheduler import scheduler
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/doc-templates", tags=["文书模板"])

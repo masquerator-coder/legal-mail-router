@@ -13,9 +13,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.database import get_db
 from app.models import EmailLog, Attachment, EmailAccount, DefaultConfig
-from app.scheduler import scheduler
+from app.services.scheduler import scheduler
 from app.config import ATTACHMENTS_DIR, resolve_attachment_path
-from app.mail_forwarder import forward_email, get_default_smtp_config
+from app.services.mail_forwarder import forward_email, get_default_smtp_config
 from app.csrf import check_csrf
 from urllib.parse import quote
 

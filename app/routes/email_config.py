@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db, db_retry_commit
 from app.models import EmailAccount
 from app.config import encrypt
-from app.scheduler import add_check_job, remove_check_job, scheduler
+from app.services.scheduler import add_check_job, remove_check_job, scheduler
 from app.flash import flash
 from app.csrf import check_csrf
 router = APIRouter(prefix="/email-config", tags=["邮箱配置"])

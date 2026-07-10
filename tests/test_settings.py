@@ -67,12 +67,12 @@ class TestPortDefaults:
     """端口相关默认值"""
 
     def test_config_system_port(self):
-        from app.config import SYSTEM_PORT
+        from app.settings import SYSTEM_PORT
         assert SYSTEM_PORT == "8020"
 
     def test_config_set_system_port(self):
-        import app.config as cfg
+        import app.settings as cfg
         original = cfg.SYSTEM_PORT
         cfg.set_system_port("9999")
         assert cfg.SYSTEM_PORT == "9999"
-        cfg.set_system_port(original)  # 恢复
+        cfg.set_system_port(original)

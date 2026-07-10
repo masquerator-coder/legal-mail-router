@@ -58,6 +58,16 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+def _get_schema_version(conn) -> int:
+    """从 PRAGMA user_version 读取当前 schema 版本号"""
+    row = conn.execute(text("PRAGMA user_version")).fetchone()
+    return row[0] if row else 0
+
+
+def _set_schema_version(conn, version: int):
+    conn.execute(text(f"PRAGMA user_version = {version}"))
+
+
 def _migrate_doc_templates(conn):
     """自动迁移：为 doc_templates 表补齐新增的 account_id 列"""
     # 检查列是否存在
@@ -147,34 +157,38 @@ def get_db():
 
 
 def init_db():
-    """创建所有表并添加关键索引 + 自动迁移"""
+    """创建所有表并添加关键索引 + 自动迁移（基于 SQLite PRAGMA user_version）"""
     Base.metadata.create_all(bind=engine)
 
     with engine.connect() as conn:
-        # ── 自动迁移：补齐新增的列 ──
-        _migrate_doc_templates(conn)
-        _migrate_routing_rules_account_ids(conn)
-        _migrate_email_log_doc_types(conn)
-        _migrate_email_log_revision_instructions(conn)
-        _migrate_email_account_forward_to(conn)
-        _migrate_ocr_config_capabilities(conn)
+        current_version = _get_schema_version(conn)
+
+        # ── 版本 1: 基础列迁移 ──
+        if current_version < 1:
+            _migrate_doc_templates(conn)
+            _migrate_routing_rules_account_ids(conn)
+            _migrate_email_log_doc_types(conn)
+            _migrate_email_log_revision_instructions(conn)
+            _migrate_email_account_forward_to(conn)
+            _migrate_ocr_config_capabilities(conn)
+            _set_schema_version(conn, 1)
+
+        # ── 版本 2+: 未来新迁移在此追加 ──
+        # if current_version < 2:
+        #     ... (new migration steps)
+        #     _set_schema_version(conn, 2)
 
         # 添加查询性能索引和 UNIQUE 约束（SQLite 用 IF NOT EXISTS 安全幂等）
         sqls = [
-            # EmailLog 核心查询
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_email_logs_message_id ON email_logs(message_id)",
             "CREATE INDEX IF NOT EXISTS idx_email_logs_created_at ON email_logs(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_email_logs_status ON email_logs(status)",
             "CREATE INDEX IF NOT EXISTS idx_email_logs_account_id ON email_logs(account_id)",
-            # 附件关联
             "CREATE INDEX IF NOT EXISTS idx_attachments_log_id ON attachments(log_id)",
-            # 路由规则匹配
             "CREATE INDEX IF NOT EXISTS idx_routing_rules_enabled_priority ON routing_rules(enabled, priority)",
-            # 文书模板查询
             "CREATE INDEX IF NOT EXISTS idx_doc_templates_account_id ON doc_templates(account_id)",
             "CREATE INDEX IF NOT EXISTS idx_doc_templates_doc_type ON doc_templates(doc_type)",
             "CREATE INDEX IF NOT EXISTS idx_doc_templates_is_default ON doc_templates(is_default)",
-            # 文书模板唯一约束：同账户同类型仅一个模板（全局/账户各自唯一）
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_templates_global_unique ON doc_templates(doc_type) WHERE account_id IS NULL",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_templates_account_type_unique ON doc_templates(account_id, doc_type) WHERE account_id IS NOT NULL",
         ]

@@ -25,11 +25,10 @@ COPY pyproject.toml .
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -e . && \
     pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uvicorn
 
-# 复制应用代码
+# 复制应用代码（config/ 已合并到 app/services/ 中）
 COPY app/ ./app/
 COPY templates/ ./templates/
 COPY static/ ./static/
-COPY config/ ./config/
 COPY LLM提示词.md ./
 
 # 创建数据目录

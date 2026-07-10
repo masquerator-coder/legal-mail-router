@@ -7,8 +7,8 @@ import re
 from datetime import date
 import httpx
 from app.config import decrypt
-from config.model_windows import KNOWN_MODEL_WINDOWS, DEFAULT_CONTEXT_WINDOW
-from app.prompt_budget import estimate_tokens, truncate_prompt_parts
+from app.services.model_windows import KNOWN_MODEL_WINDOWS, DEFAULT_CONTEXT_WINDOW
+from app.services.prompt_budget import estimate_tokens, truncate_prompt_parts
 
 logger = logging.getLogger(__name__)
 
@@ -302,27 +302,68 @@ async def analyze_email(
 
     try:
         result = json.loads(content)
+        validated = _validate_llm_output(result)
+        return validated
     except json.JSONDecodeError:
         # 尝试从内容中提取 JSON
         import re
         match = re.search(r"\{[\s\S]*\}", content)
         if match:
-            result = json.loads(match.group())
-        else:
-            logger.error(f"无法解析 LLM 响应: {content[:200]}")
-            return _fallback_analysis()
+            try:
+                result = json.loads(match.group())
+                return _validate_llm_output(result)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        logger.error(f"无法解析 LLM 响应: {content[:200]}")
+        return _fallback_analysis()
+    except (ValueError, TypeError) as e:
+        logger.error(f"LLM 响应校验失败: {e}, content={content[:200]}")
+        return _fallback_analysis()
 
-    # 标准化字段
+
+_VALID_URGENCIES = frozenset({"high", "medium", "low"})
+_ALLOWED_DOC_TYPE_SUFFIXES = ("书", "函", "状", "协议", "合同", "证明", "单", "令", "通知", "文书")
+
+
+def _validate_llm_output(result: dict) -> dict:
+    """
+    对 LLM 返回的 JSON 做 schema 校验和字段标准化。
+    如果关键字段缺失或类型错误，抛出 ValueError。
+    """
+    if not isinstance(result, dict):
+        raise ValueError("LLM 输出不是对象")
+
+    doc_type = str(result.get("doc_type", "")).strip()
+    if not doc_type:
+        doc_type = "其他法律文书"
+
+    urgency = str(result.get("urgency", "medium")).strip().lower()
+    if urgency not in _VALID_URGENCIES:
+        urgency = "medium"
+
+    confidence_raw = result.get("confidence", 0.5)
+    try:
+        confidence = float(confidence_raw)
+        confidence = max(0.0, min(1.0, confidence))
+    except (ValueError, TypeError):
+        confidence = 0.5
+
     return {
-        "doc_type": result.get("doc_type", "其他法律文书"),
-        "case_summary": result.get("case_summary", ""),
-        "ai_interpretation": result.get("ai_interpretation", ""),
-        "urgency": result.get("urgency", "medium"),
-        "key_date": result.get("key_date"),
-        "case_number": result.get("case_number"),
-        "involved_parties": result.get("involved_parties", ""),
-        "confidence": float(result.get("confidence", 0.5)),
+        "doc_type": doc_type,
+        "case_summary": str(result.get("case_summary", "") or ""),
+        "ai_interpretation": str(result.get("ai_interpretation", "") or ""),
+        "urgency": urgency,
+        "key_date": str(result.get("key_date")) if result.get("key_date") else None,
+        "case_number": str(result.get("case_number")) if result.get("case_number") else None,
+        "involved_parties": str(result.get("involved_parties", "") or ""),
+        "confidence": confidence,
     }
+
+
+_LLM_ANALYSIS_SCHEMA = frozenset({
+    "doc_type", "case_summary", "ai_interpretation", "urgency",
+    "key_date", "case_number", "involved_parties", "confidence",
+})
 
 
 def _fallback_analysis() -> dict:

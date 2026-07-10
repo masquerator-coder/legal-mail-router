@@ -515,9 +515,8 @@
                     </p>
                     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                         <a href="/backup/export" class="btn btn-primary">📥 导出</a>
-                        <form method="post" action="/backup/import" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:center;">
-                            {{ csrf_token_input(request)|safe }}
-                            <input type="file" name="file" accept=".json" required
+                        <form method="post" action="/backup/import" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:center;margin:0;padding:0;">
+                            <input type="file" name="file" accept=".json"
                                    style="font-size:13px;padding:6px;border:1px solid var(--border);border-radius:6px;max-width:160px;">
                             <button type="submit" class="btn btn-primary" style="white-space:nowrap;">📤 恢复</button>
                         </form>
@@ -525,38 +524,37 @@
                 </div>
             </div>
         </div>
-    </div>
 
-    <!-- 操作按钮 -->
-    <div style="display:flex;gap:12px;align-items:center;margin-top:24px;">
-        <button type="submit" class="btn btn-primary">💾 保存设置</button>
-        <a href="/dashboard" class="btn btn-outline">取消</a>
-    </div>
-
+        <!-- 操作按钮 -->
+        <div style="display:flex;gap:12px;align-items:center;margin-top:24px;">
+            <button type="submit" class="btn btn-primary">💾 保存设置</button>
+            <a href="/dashboard" class="btn btn-outline">取消</a>
+        </div>
     </form>
 
-    <!-- 修改密码 -->
-    <div class="card" style="margin-top:24px;">
-        <div class="card-header"><h3>🔒 修改登录密码</h3></div>
-        <div class="card-body">
-            <div class="form-group">
-                <label for="old_password">原密码</label>
-                <input type="password" id="old_password" class="form-control" style="width:260px;" placeholder="输入当前密码">
-            </div>
-            <div class="form-group" style="margin-top:16px;">
-                <label for="new_password">新密码</label>
-                <input type="password" id="new_password" class="form-control" style="width:260px;" placeholder="至少 6 位">
-            </div>
-            <div class="form-group" style="margin-top:16px;">
-                <label for="confirm_password">确认新密码</label>
-                <input type="password" id="confirm_password" class="form-control" style="width:260px;" placeholder="再次输入新密码">
-            </div>
-            <div style="margin-top:16px;">
-                <button type="button" class="btn btn-primary" onclick="changePassword()" id="change-pw-btn">
-                    🔑 修改密码
-                </button>
-                <span id="change-pw-msg" style="margin-left:12px;font-size:13px;"></span>
-            </div>
+</div>  <!-- 关闭主容器 div -->
+
+<!-- 修改密码（独立于主表单之外） -->
+<div class="card" style="margin-top:24px;">
+    <div class="card-header"><h3>🔒 修改登录密码</h3></div>
+    <div class="card-body">
+        <div class="form-group">
+            <label for="old_password">原密码</label>
+            <input type="password" id="old_password" class="form-control" style="width:260px;" placeholder="输入当前密码">
+        </div>
+        <div class="form-group" style="margin-top:16px;">
+            <label for="new_password">新密码</label>
+            <input type="password" id="new_password" class="form-control" style="width:260px;" placeholder="至少 6 位">
+        </div>
+        <div class="form-group" style="margin-top:16px;">
+            <label for="confirm_password">确认新密码</label>
+            <input type="password" id="confirm_password" class="form-control" style="width:260px;" placeholder="再次输入新密码">
+        </div>
+        <div style="margin-top:16px;">
+            <button type="button" class="btn btn-primary" onclick="changePassword()" id="change-pw-btn">
+                🔑 修改密码
+            </button>
+            <span id="change-pw-msg" style="margin-left:12px;font-size:13px;"></span>
         </div>
     </div>
 </div>
@@ -963,5 +961,29 @@ function resetRevisionPrompt() {
             if (btn) { btn.disabled = false; btn.textContent = '🔄 恢复默认'; }
         });
 }
+
+
+// 配置备份恢复 — 动态创建表单提交
+function restoreBackup() {
+    var fileInput = document.getElementById('restore-file');
+    if (!fileInput || !fileInput.files.length) {
+        showToast('请先选择备份文件', 'error');
+        return;
+    }
+    fileInput.name = 'file';
+    var tempForm = document.createElement('form');
+    tempForm.method = 'POST';
+    tempForm.action = '/backup/import';
+    tempForm.enctype = 'multipart/form-data';
+    tempForm.style.display = 'none';
+    var csrfOrig = document.querySelector('input[name="_csrf_token"]');
+    if (csrfOrig) {
+        tempForm.appendChild(csrfOrig.cloneNode());
+    }
+    tempForm.appendChild(fileInput.cloneNode(true));
+    document.body.appendChild(tempForm);
+    tempForm.submit();
+}
+
 </script>
 {% endblock %}

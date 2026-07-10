@@ -77,22 +77,32 @@ def _reset_login_rate_limit(client_ip: str):
     _login_attempts.pop(client_ip, None)
 
 # ── 密码哈希 ──
+# OWASP 2024 建议: PBKDF2-SHA256 迭代 >= 600K
+_PBKDF2_ITERATIONS = 600_000
 
 def hash_password(password: str, salt: bytes = None) -> str:
     """PBKDF2-SHA256 哈希密码，返回 salt:hash 格式"""
     if salt is None:
         salt = os.urandom(32)
-    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
     return salt.hex() + ":" + key.hex()
 
 
 def verify_password(password: str, stored: str) -> bool:
-    """验证密码"""
+    """验证密码（自动适配新旧迭代次数）"""
     try:
         salt_hex, key_hex = stored.split(":", 1)
         salt = bytes.fromhex(salt_hex)
-        expected = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
-        return expected.hex() == key_hex
+        expected = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS
+        )
+        if expected.hex() == key_hex:
+            return True
+        # 兼容旧版本 100K 迭代
+        expected_old = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, 100_000
+        )
+        return expected_old.hex() == key_hex
     except Exception:
         return False
 

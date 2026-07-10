@@ -9,7 +9,7 @@ from app.models import LLMConfig
 from app.config import encrypt, decrypt
 from app.flash import flash
 from app.csrf import check_csrf
-from app.scheduler import scheduler
+from app.services.scheduler import scheduler
 router = APIRouter(prefix="/llm-config", tags=["LLM配置"])
 
 
@@ -135,7 +135,7 @@ async def activate_llm_config(
 async def detect_model(request: Request, config_id: int, form_csrf: str = Form("", alias="_csrf_token"), db: Session = Depends(get_db)):
     """检测模型类型并更新配置"""
     check_csrf(request, form_csrf)
-    from app.ocr import detect_model_type
+    from app.services.ocr import detect_model_type
     config = db.query(LLMConfig).filter_by(id=config_id).first()
     if not config:
         return {"success": False, "message": "配置不存在"}
@@ -155,7 +155,7 @@ async def detect_model(request: Request, config_id: int, form_csrf: str = Form("
 async def test_llm(request: Request, config_id: int, form_csrf: str = Form("", alias="_csrf_token"), db: Session = Depends(get_db)):
     """测试 LLM 连接"""
     check_csrf(request, form_csrf)
-    from app.llm_analyzer import analyze_email
+    from app.services.llm_analyzer import analyze_email
     config = db.query(LLMConfig).filter_by(id=config_id).first()
     if not config:
         return {"success": False, "message": "配置不存在"}
@@ -180,6 +180,6 @@ async def test_llm(request: Request, config_id: int, form_csrf: str = Form("", a
 @router.get("/default-prompt")
 async def get_default_prompt():
     """返回当前系统默认提示词模板（用于前端“恢复默认模板”按钮）"""
-    from app.llm_analyzer import _get_default_prompt
+    from app.services.llm_analyzer import _get_default_prompt
     prompt = _get_default_prompt()
     return {"prompt": prompt}

@@ -5,10 +5,10 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import OCRConfig
 from app.config import encrypt, decrypt
-from app.scheduler import scheduler
+from app.services.scheduler import scheduler
 from app.flash import flash
 from app.csrf import check_csrf
-from app.ocr_test_data import PREBUILT_TEST_PDF
+from app.services.ocr_test_data import PREBUILT_TEST_PDF
 
 router = APIRouter(prefix="/ocr-config", tags=["OCR配置"])
 
@@ -147,8 +147,8 @@ async def test_ocr_config(
 
     # ─── 第1步：测试 PNG 连通性 ───
     try:
-        from app.ocr import ocr_image
-        from app.ocr_test_data import PREBUILT_TEST_PNG
+        from app.services.ocr import ocr_image
+        from app.services.ocr_test_data import PREBUILT_TEST_PNG
         await ocr_image(PREBUILT_TEST_PNG, ocr_cfg, "test.png")
         results["connectivity_ok"] = True
         results["details"].append("✅ PNG 连通性测试通过")
@@ -174,7 +174,7 @@ async def test_ocr_config(
     else:
         # custom / 未知类型 → 发预制测试 PDF 探测
         try:
-            from app.ocr import ocr_pdf
+            from app.services.ocr import ocr_pdf
             text = await ocr_pdf(PREBUILT_TEST_PDF, ocr_cfg, "test.pdf")
             if text and "OCR-PDF-TEST-2024" in text:
                 results["pdf_capable"] = True

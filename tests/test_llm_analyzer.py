@@ -2,7 +2,7 @@
 LLM 分析器 — prompt 构建 & 截断逻辑测试
 """
 import pytest
-from app.llm_analyzer import build_prompt, DEFAULT_ANALYSIS_PROMPT
+from app.services.llm_analyzer import build_prompt, DEFAULT_ANALYSIS_PROMPT
 
 
 class TestBuildPrompt:
@@ -93,15 +93,10 @@ class TestDefaultPrompt:
     def test_default_prompt_exists(self):
         assert DEFAULT_ANALYSIS_PROMPT
         assert "doc_type" in DEFAULT_ANALYSIS_PROMPT
-        assert "Role" in DEFAULT_ANALYSIS_PROMPT
-        assert "资深律师" in DEFAULT_ANALYSIS_PROMPT
-        # RGTO 结构
-        assert "Goal" in DEFAULT_ANALYSIS_PROMPT
-        assert "Task" in DEFAULT_ANALYSIS_PROMPT
-        # 合同审查增强
-        assert "审查条款完整性" in DEFAULT_ANALYSIS_PROMPT
-        assert "对客户不利的条款" in DEFAULT_ANALYSIS_PROMPT
-        assert "合同特别审查" in DEFAULT_ANALYSIS_PROMPT
+        assert "资深" in DEFAULT_ANALYSIS_PROMPT
+        assert "第一阶段" in DEFAULT_ANALYSIS_PROMPT
+        assert "第二阶段" in DEFAULT_ANALYSIS_PROMPT
+        assert "revision_instructions" in DEFAULT_ANALYSIS_PROMPT
 
     def test_all_required_fields_in_output_format(self):
         """输出格式包含所有必要字段"""

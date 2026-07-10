@@ -198,14 +198,21 @@ def _parse_email(raw_bytes: bytes) -> Optional[ParsedEmail]:
 class Mail163Fetcher:
     """163.com 邮件拉取（raw socket + 缓冲 I/O）"""
 
-    def __init__(self, host: str, port: int, username: str, password: str):
+    def __init__(self, host: str, port: int, username: str, password: str,
+                 socket_timeout: int = 30, read_timeout: int = 30):
         self.host = host
         self.port = port
         self.username = username
-        self.password = password
+        # 避免 __repr__ 或 traceback 泄露密码明文
+        self._password = password
         self._sock: Optional[ssl.SSLSocket] = None
         self._buf = None  # 缓冲读取器
         self._tag_counter = 0
+        self._socket_timeout = socket_timeout
+        self._read_timeout = read_timeout
+
+    def __repr__(self) -> str:
+        return f"<Mail163Fetcher {self.username}@{self.host}>"
 
     def _tag(self) -> str:
         self._tag_counter += 1
@@ -213,9 +220,11 @@ class Mail163Fetcher:
 
     def _connect(self):
         ctx = ssl.create_default_context()
-        sock = socket.create_connection((self.host, self.port), timeout=30)
+        sock = socket.create_connection(
+            (self.host, self.port), timeout=self._socket_timeout
+        )
         self._sock = ctx.wrap_socket(sock, server_hostname=self.host)
-        self._sock.settimeout(30)  # 防止 recv 永久阻塞
+        self._sock.settimeout(self._read_timeout)  # 防止 recv 永久阻塞
         self._buf = self._sock.makefile("rb", buffering=16384)  # 16KB 缓冲
 
     def _read_line(self) -> Optional[str]:
@@ -240,6 +249,12 @@ class Mail163Fetcher:
         return lines
 
     def _read_literal(self, size: int) -> bytes:
+        # 防御：拒绝超大 literal（超过 50MB 拒绝，防止 OOM）
+        MAX_LITERAL = 50 * 1024 * 1024
+        if size > MAX_LITERAL:
+            raise ConnectionError(
+                f"IMAP literal 过大 ({size} bytes)，超过安全上限 {MAX_LITERAL}"
+            )
         data = self._buf.read(size)
         if len(data) != size:
             raise ConnectionError(
@@ -255,7 +270,7 @@ class Mail163Fetcher:
         # ID command — required for 163.com
         self._cmd(b'A0002 ID ("name" "Thunderbird" "version" "128.0")', "A0002")
         lines = self._cmd(
-            f'A0003 LOGIN {_imap_astring(self.username)} {_imap_astring(self.password)}'.encode(),
+            f'A0003 LOGIN {_imap_astring(self.username)} {_imap_astring(self._password)}'.encode(),
             "A0003"
         )
         if not any("A0003 OK" in line for line in lines):
@@ -331,9 +346,13 @@ class StandardFetcher:
         self.host = host
         self.port = port
         self.username = username
-        self.password = password
+        self._password = password
         self.use_ssl = use_ssl
         self._mail = None
+
+    def __repr__(self) -> str:
+        return f"<StandardFetcher {self.username}@{self.host}>"
+
 
     def _get_imap(self):
         import imaplib
@@ -343,7 +362,7 @@ class StandardFetcher:
 
     def login(self):
         self._mail = self._get_imap()
-        self._mail.login(self.username, self.password)
+        self._mail.login(self.username, self._password)
 
     def select_inbox(self):
         status, data = self._mail.select("INBOX")
@@ -507,7 +526,7 @@ def _run_async_safe(coro):
 
 def _ocr_attachment(filename: str, content: bytes, ocr_cfg: dict | None = None) -> str:
     """对图片附件执行 OCR，返回识别文本"""
-    from app.ocr import ocr_image
+    from app.services.ocr import ocr_image
 
     if ocr_cfg is None:
         from app.database import SessionLocal
@@ -794,7 +813,7 @@ def extract_per_attachment_texts(attachments: list[AttachmentInfo], ocr_cfg: dic
 
     def _ocr_image(filename: str, content: bytes, ocr_cfg: dict | None) -> str:
         try:
-            from app.ocr import ocr_image
+            from app.services.ocr import ocr_image
             result = _run_async_safe(ocr_image(content, ocr_cfg or {}, filename))
             return result or ""
         except Exception as e:
@@ -834,7 +853,7 @@ def extract_per_attachment_texts(attachments: list[AttachmentInfo], ocr_cfg: dic
             elif ext == "pdf":
                 # ── PDF 直读路径（服务支持 PDF 时优先） ──
                 if ocr_cfg and ocr_cfg.get("pdf_capable") is True:
-                    from app.ocr import ocr_pdf
+                    from app.services.ocr import ocr_pdf
                     try:
                         pdf_text = _run_async_safe(ocr_pdf(content, ocr_cfg, filename))
                         if pdf_text and pdf_text.strip():
