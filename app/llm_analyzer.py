@@ -34,6 +34,28 @@ def _get_default_prompt() -> str:
     return DEFAULT_ANALYSIS_PROMPT
 
 
+# ── 默认修订提示词模板 ──
+# 优先从项目根目录的 修订提示词.md 读取，不存在时使用内嵌模板
+_REVISION_PROMPT_FILE = None  # 缓存文件路径
+
+
+def _get_default_revision_prompt() -> str:
+    """获取默认修订提示词模板：优先从 修订提示词.md 读取，不存在时用内嵌模板"""
+    global _REVISION_PROMPT_FILE
+    if _REVISION_PROMPT_FILE is None:
+        from app.config import BASE_DIR
+        _REVISION_PROMPT_FILE = BASE_DIR / "修订提示词.md"
+
+    try:
+        if _REVISION_PROMPT_FILE.exists():
+            text = _REVISION_PROMPT_FILE.read_text(encoding="utf-8")
+            if text.strip():
+                return text
+    except Exception:
+        logger.warning("读取 修订提示词.md 失败，使用内嵌默认模板")
+    return DEFAULT_REVISION_PROMPT
+
+
 DEFAULT_ANALYSIS_PROMPT = """你是一位资深法律文书分析专家。请按以下两阶段分析邮件及附件内容：
 
 ## 第一阶段：文书类型识别
@@ -452,7 +474,7 @@ async def generate_revision(
     from app.config import decrypt
 
     api_key = decrypt(api_key_encrypted)
-    prompt_template = custom_prompt.strip() if custom_prompt.strip() else DEFAULT_REVISION_PROMPT
+    prompt_template = custom_prompt.strip() if custom_prompt.strip() else _get_default_revision_prompt()
 
     # ── 构建模板段 ──
     if template and template.strip():
