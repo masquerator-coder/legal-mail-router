@@ -194,10 +194,13 @@
 
             <div id="revision-prompt-group" style="margin-top:16px;display:none;">
                 <label for="revision_prompt">修订提示词模板</label>
-                <textarea id="revision_prompt" name="revision_prompt"
-                          class="form-control" rows="6"
-                          style="font-family:monospace;font-size:12px;"
-                          placeholder="留空使用系统默认提示词">{{ settings.revision_prompt }}</textarea>
+                <div style="display:flex;gap:8px;align-items:flex-start;">
+                    <textarea id="revision_prompt" name="revision_prompt"
+                              class="form-control" rows="6"
+                              style="font-family:monospace;font-size:12px;flex:1;"
+                              placeholder="留空使用系统默认提示词">{{ settings.revision_prompt }}</textarea>
+                    <button type="button" class="btn btn-outline btn-sm" style="white-space:nowrap;margin-top:0;" onclick="resetRevisionPrompt()">🔄 恢复默认</button>
+                </div>
                 <div class="form-hint">
                     自定义 LLM 修订提示词。占位符：{doc_type} {ai_interpretation} {original_text}。留空则使用内置默认提示词。<br>
                     💡 <strong>修订提示词</strong> 控制 LLM <strong>如何修改</strong>（修正规则、语气、标记规范），而
@@ -935,5 +938,27 @@ document.addEventListener('DOMContentLoaded', function() {
     var useMainRadio = document.querySelector('input[name="classify_use_main_llm"][value="true"]');
     toggleClassifyLlmSelect(useMainRadio ? !useMainRadio.checked : false);
 });
+
+// 🔄 恢复修订提示词为系统默认
+function resetRevisionPrompt() {
+    var ta = document.getElementById('revision_prompt');
+    if (!ta) return;
+    var btn = event.target;
+    btn.disabled = true;
+    btn.textContent = '⏳ 加载中...';
+    fetch('/settings/default-revision-prompt')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            ta.value = data.prompt || '';
+            ta.scrollTop = 0;
+        })
+        .catch(function(e) {
+            showToast('获取默认提示词失败: ' + (e.message || '未知'), 'error');
+        })
+        .finally(function() {
+            btn.disabled = false;
+            btn.textContent = '🔄 恢复默认';
+        });
+}
 </script>
 {% endblock %}

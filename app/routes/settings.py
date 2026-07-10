@@ -351,6 +351,14 @@ async def kb_health_check(api_base: str = "http://127.0.0.1:19828"):
         return {"success": False, "message": f"连接失败: {e}"}
 
 
+@router.get("/default-revision-prompt")
+async def get_default_revision_prompt():
+    """获取系统默认修订提示词（从 修订提示词.md 或代码回退）"""
+    from app.llm_analyzer import _get_default_revision_prompt
+    prompt = _get_default_revision_prompt()
+    return {"prompt": prompt}
+
+
 def get_kb_config(db: Session) -> dict:
     """读取法律知识库（LLM Wiki）配置，供 LLM 分析流程使用"""
     return {
