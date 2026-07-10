@@ -23,7 +23,7 @@ class TestSettingsDefaults:
             "system_name", "system_port",
             "default_check_interval", "monitor_days",
             "log_retention_days", "llm_retry_interval", "llm_max_retries",
-            "analysis_output_mode", "revision_enabled", "revision_prompt",
+            "analysis_output_mode", "revision_enabled",
             "revision_highlight", "context_window_tokens",
             "review_template_enabled", "review_template_path",
             "admin_email", "daily_report_enabled", "daily_report_time",

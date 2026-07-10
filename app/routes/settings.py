@@ -26,9 +26,8 @@ SETTING_DEFAULTS = {
     "log_retention_days": "90",  # 默认 90 天；设为 0 表示永久保留（不推荐）
     "llm_retry_interval": "10",  # LLM 分析重试间隔（秒）
     "llm_max_retries": "3",      # LLM 分析最大重试次数
-    "analysis_output_mode": "content",  # AI解读输出模式: content=邮件正文, attachment=Word附件
+    "analysis_output_mode": "attachment",  # AI解读输出模式: content=邮件正文, attachment=Word附件
     "revision_enabled": "false",        # 是否生成修改版文书
-    "revision_prompt": "",              # 自定义修订提示词(空=使用默认)
     "revision_highlight": "true",       # 色彩标注改动（蓝色新增/红色修改/删除线建议删除）
     "context_window_tokens": "0",       # 上下文窗口大小(0=自动探测)
     "review_template_enabled": "false", # 启用审核意见模板
@@ -121,7 +120,6 @@ async def save_settings(
     llm_max_retries: int = Form(3),
     analysis_output_mode: str = Form("content"),
     revision_enabled: str = Form("false"),
-    revision_prompt: str = Form(""),
     revision_highlight: str = Form("true"),
     context_window_tokens: str = Form("0"),
     review_template_enabled: str = Form("false"),
@@ -163,7 +161,6 @@ async def save_settings(
     _save_setting(db, "llm_max_retries", str(llm_max_retries))
     _save_setting(db, "analysis_output_mode", analysis_output_mode)
     _save_setting(db, "revision_enabled", "true" if revision_enabled.lower() in ("true", "on", "1") else "false")
-    _save_setting(db, "revision_prompt", revision_prompt)
     _save_setting(db, "revision_highlight", "true" if revision_highlight.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "context_window_tokens", context_window_tokens.strip())
     _save_setting(db, "review_template_enabled", "true" if review_template_enabled.lower() in ("true", "on", "1") else "false")
@@ -354,18 +351,6 @@ async def kb_health_check(api_base: str = "http://127.0.0.1:19828"):
             return {"success": False, "message": "知识库服务不可达"}
     except Exception as e:
         return {"success": False, "message": f"连接失败: {e}"}
-
-
-@router.get("/default-revision-prompt")
-async def get_default_revision_prompt():
-    """获取系统默认修订提示词（从 修订提示词.md 或代码回退）"""
-    try:
-        from app.services.llm_analyzer import _get_default_revision_prompt
-        prompt = _get_default_revision_prompt()
-        return {"prompt": prompt}
-    except Exception as e:
-        logger.error(f"获取默认修订提示词失败: [{type(e).__name__}] {e}")
-        return {"prompt": "", "error": str(e)}
 
 
 def get_kb_config(db: Session) -> dict:

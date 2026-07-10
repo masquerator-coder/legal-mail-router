@@ -385,7 +385,9 @@ def forward_email(
             # 路径遍历防御：只允许访问 ATTACHMENTS_DIR 目录树内的文件
             try:
                 resolved = path.resolve()
-                _allowed_base in resolved.parents or resolved == _allowed_base
+                if not (_allowed_base in resolved.parents or resolved == _allowed_base):
+                    logger.warning(f"附件路径越界（已跳过）: {file_path}")
+                    continue
             except (ValueError, OSError, RuntimeError):
                 logger.warning(f"附件路径解析失败（已跳过）: {file_path}")
                 continue
@@ -505,7 +507,7 @@ def _parse_revision_markers(text: str) -> list[tuple[str, str]]:
     tag: "normal" | "add" | "modify" | "delete"
     """
     import re
-    pattern = r'【(新增|修改|删除)】(.*?)【/\1】'
+    pattern = r'【(新增|修改|删除)】(.*?)(?:【/\1】|/【\1】)'
     segments = []
     last_end = 0
 

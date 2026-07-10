@@ -52,7 +52,7 @@
             </tr>
             <tr>
                 <td style="border:none; color:var(--text-muted);">参数</td>
-                <td style="border:none; font-size:13px;">max_tokens={{ cfg.max_tokens }}, temperature={{ cfg.temperature }}</td>
+                <td style="border:none; font-size:13px;">max_tokens=<span id="mt-val-{{ cfg.id }}">{{ cfg.max_tokens }}</span>, temperature={{ cfg.temperature }}</td>
             </tr>
             {% if cfg.analysis_prompt %}
             <tr>
@@ -79,7 +79,12 @@
                 <div class="form-group"><label>API Key (留空不修改)</label><input class="form-control" type="password" name="api_key"></div>
                 <div class="form-group"><label>模型名称</label><input class="form-control" name="model_name" value="{{ cfg.model_name }}" required></div>
                 <div class="form-row">
-                    <div class="form-group"><label>max_tokens</label><input class="form-control" type="number" name="max_tokens" value="{{ cfg.max_tokens }}"></div>
+                    <div class="form-group"><label>max_tokens</label>
+                        <div style="display:flex; gap:6px; align-items:center;">
+                            <input class="form-control" type="number" name="max_tokens" value="{{ cfg.max_tokens }}" style="flex:1;" id="mt-input-{{ cfg.id }}">
+                            <button type="button" class="btn btn-xs btn-outline" id="mt-btn-{{ cfg.id }}" onclick="detectMaxTokens({{ cfg.id }})" style="white-space:nowrap;">🔍 探测</button>
+                        </div>
+                    </div>
                     <div class="form-group"><label>temperature</label><input class="form-control" type="number" step="0.1" name="temperature" value="{{ cfg.temperature }}"></div>
                 </div>
                 <div class="form-group">
@@ -191,6 +196,29 @@ async function detectModelType(id) {
         showToast('请求失败: ' + e, 'error');
     }
     btn.textContent = '🔍 检测';
+    btn.disabled = false;
+}
+
+async function detectMaxTokens(id) {
+    var btn = document.getElementById('mt-btn-' + id);
+    var input = document.getElementById('mt-input-' + id);
+    var val = document.getElementById('mt-val-' + id);
+    btn.textContent = '⏳...';
+    btn.disabled = true;
+    try {
+        var resp = await fetch('/llm-config/detect-max-tokens/' + id, { method: 'POST' });
+        var data = await resp.json();
+        if (data.success) {
+            if (input) input.value = data.max_tokens;
+            if (val) val.textContent = data.max_tokens;
+            showToast('探测完成: max_tokens=' + data.max_tokens + ' (上下文窗口 ' + data.context_window.toLocaleString() + ')', 'success');
+        } else {
+            showToast(data.message, 'error');
+        }
+    } catch(e) {
+        showToast('请求失败: ' + e, 'error');
+    }
+    btn.textContent = '🔍 探测';
     btn.disabled = false;
 }
 </script>

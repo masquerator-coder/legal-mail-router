@@ -228,7 +228,6 @@ def _load_context(account_id: int) -> dict | None:
             "llm_retry_interval": int(_read_setting("llm_retry_interval", "10")),
             "llm_max_retries": int(_read_setting("llm_max_retries", "3")),
             "revision_enabled": _read_setting("revision_enabled", "false") == "true",
-            "revision_prompt": _read_setting("revision_prompt", ""),
             "revision_highlight": _read_setting("revision_highlight", "true") == "true",
             "context_window_tokens": _read_setting("context_window_tokens", "0"),
             "review_template_enabled": _read_setting("review_template_enabled", "false") == "true",
@@ -559,6 +558,8 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     all_llm_failed = False
     revision_paths = []
     review_paths = []
+    # 防附件文件名重复计数器
+    _seen_revision_names = {}  # base_name → count
 
     for g_idx, indices in enumerate(groups):
         # 组装该组的附件文本和图片
@@ -597,47 +598,17 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
         if g_failed:
             all_llm_failed = True
 
-        # 修改版文书生成（逐组）——仅主要文书类型生成修改版
+        # 修改版文书生成（逐组）——使用单阶段 LLM 输出的 revised_document
         if (ctx.get("revision_enabled")
                 and not g_failed
                 and g_analysis
                 and _should_generate_revision(g_analysis.get("doc_type"))
                 and llm_cfg):
             try:
-                from app.services.llm_analyzer import get_effective_context_window, generate_revision
-                from app.config import decrypt
                 from app.services.mail_forwarder import _generate_revision_docx
-                from app.services.email_fetcher import _run_async_safe
 
-                context_window = get_effective_context_window(
-                    ctx.get("context_window_tokens", "0"),
-                    llm_cfg.api_url,
-                    decrypt(llm_cfg.api_key_encrypted) if llm_cfg.api_key_encrypted else "",
-                    llm_cfg.model_name,
-                )
-                original_truncation = int(context_window * 0.45)
-                revision_max_tokens = max(1000, min(int(context_window * 0.05), 16000))
+                revision_text = g_analysis.get("revised_document")
 
-                original_text = (group_attachment_texts if group_attachment_texts else eml.body_text)[:original_truncation]
-                template = _load_doc_template(db, g_analysis.get("doc_type", ""), ctx["account"].id)
-
-                _update_progress(step="analyzing", step_label=f"正在生成修改版文书({group_label})...")
-                revision_text = _run_async_safe(
-                    generate_revision(
-                        api_url=llm_cfg.api_url,
-                        api_key_encrypted=llm_cfg.api_key_encrypted,
-                        model_name=llm_cfg.model_name,
-                        doc_type=g_analysis.get("doc_type", "其他法律文书"),
-                        original_text=original_text,
-                        ai_interpretation=g_analysis.get("ai_interpretation", ""),
-                        revision_instructions=json.dumps(g_analysis.get("revision_instructions", []), ensure_ascii=False),
-                        custom_prompt=ctx.get("revision_prompt", ""),
-                        template=template,
-                        max_tokens=revision_max_tokens,
-                        temperature=llm_cfg.temperature,
-                        timeout=ctx.get("llm_timeout", 180),
-                    )
-                )
                 if revision_text:
                     rev_path = _generate_revision_docx(
                         revision_text=revision_text,
@@ -648,8 +619,16 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
                     if rev_path:
                         revision_paths.append(rev_path)
                         suffix = f"-{g_analysis.get('doc_type', '文书')}" if is_grouping else ""
+                        base_name = f"修改版文书{suffix}.docx"
+                        if base_name in _seen_revision_names:
+                            _seen_revision_names[base_name] += 1
+                            ext_dot = base_name.rfind(".")
+                            dedup_name = base_name[:ext_dot] + f"_{_seen_revision_names[base_name]}" + base_name[ext_dot:]
+                        else:
+                            _seen_revision_names[base_name] = 0
+                            dedup_name = base_name
                         attachment_records.append({
-                            "filename": f"修改版文书{suffix}.docx",
+                            "filename": dedup_name,
                             "file_path": rev_path,
                             "file_size": os.path.getsize(rev_path),
                         })
@@ -680,8 +659,16 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
                 if review_path:
                     review_paths.append(review_path)
                     suffix = f"-{g_analysis.get('doc_type', '文书')}" if is_grouping else ""
+                    rev_base_name = f"审核意见{suffix}.docx"
+                    if rev_base_name in _seen_revision_names:
+                        _seen_revision_names[rev_base_name] += 1
+                        ext_dot = rev_base_name.rfind(".")
+                        rev_dedup_name = rev_base_name[:ext_dot] + f"_{_seen_revision_names[rev_base_name]}" + rev_base_name[ext_dot:]
+                    else:
+                        _seen_revision_names[rev_base_name] = 0
+                        rev_dedup_name = rev_base_name
                     attachment_records.append({
-                        "filename": f"审核意见{suffix}.docx",
+                        "filename": rev_dedup_name,
                         "file_path": review_path,
                         "file_size": os.path.getsize(review_path),
                     })
@@ -757,7 +744,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     for att in attachment_records:
         full_attachment_paths.append(str(resolve_attachment_path(att["file_path"])))
     output_mode_cfg = db.query(DefaultConfig).filter_by(key="analysis_output_mode").first()
-    analysis_output_mode = output_mode_cfg.value if output_mode_cfg and output_mode_cfg.value else "content"
+    analysis_output_mode = output_mode_cfg.value if output_mode_cfg and output_mode_cfg.value else "attachment"
 
     all_success = True
     last_error = ""
@@ -808,7 +795,19 @@ def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: li
     from app.services.llm_analyzer import analyze_email
 
     if not llm_cfg:
-        return None, False
+        fallback = {
+            "doc_type": "其他法律文书",
+            "case_summary": "未配置LLM模型，请前往系统设置配置LLM",
+            "ai_interpretation": "⚠️ 大模型未配置，无法进行AI分析，请人工审核。",
+            "urgency": "medium",
+            "key_date": None,
+            "case_number": None,
+            "involved_parties": "",
+            "confidence": 0.5,
+            "revised_document": None,
+            "llm_failed": True,
+        }
+        return fallback, True
 
     _update_progress(step="analyzing", step_label="正在 LLM 分析...")
 
@@ -852,6 +851,8 @@ def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: li
             log.case_number = analysis.get("case_number")
             log.involved_parties = str(analysis.get("involved_parties", ""))[:500] if analysis.get("involved_parties") else None
             log.status = "analyzed"
+            # 注意：以上 log.xxx 写操作在组循环中会被 caller 合并覆盖（行 662-698），
+            # 此处保留以兼容直接调用 _run_llm_analysis 的非循环场景。
 
             if attempt > 0:
                 logger.info(f"LLM 分析重试成功（第 {attempt} 次）")

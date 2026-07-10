@@ -2,7 +2,7 @@
 LLM 分析器 — prompt 构建 & 截断逻辑测试
 """
 import pytest
-from app.services.llm_analyzer import build_prompt, DEFAULT_ANALYSIS_PROMPT
+from app.services.llm_analyzer import build_prompt
 
 
 class TestBuildPrompt:
@@ -84,26 +84,4 @@ class TestBuildPrompt:
         )
         assert "合同协议" in prompt
         assert "起诉状" in prompt
-        assert "非法律文书" in prompt
-
-
-class TestDefaultPrompt:
-    """默认提示词模板"""
-
-    def test_default_prompt_exists(self):
-        assert DEFAULT_ANALYSIS_PROMPT
-        assert "doc_type" in DEFAULT_ANALYSIS_PROMPT
-        assert "资深" in DEFAULT_ANALYSIS_PROMPT
-        assert "第一阶段" in DEFAULT_ANALYSIS_PROMPT
-        assert "第二阶段" in DEFAULT_ANALYSIS_PROMPT
-        assert "revision_instructions" in DEFAULT_ANALYSIS_PROMPT
-
-    def test_all_required_fields_in_output_format(self):
-        """输出格式包含所有必要字段"""
-        required = [
-            "doc_type", "case_summary", "ai_interpretation",
-            "urgency", "key_date", "case_number",
-            "involved_parties", "confidence"
-        ]
-        for field in required:
-            assert field in DEFAULT_ANALYSIS_PROMPT, f"Missing field: {field}"
+        assert "revised_document" in prompt

@@ -18,7 +18,7 @@ _PROMPT_FILE = None  # 缓存文件路径
 
 
 def _get_default_prompt() -> str:
-    """获取默认提示词模板：优先从 LLM提示词.md 读取，不存在时用内嵌模板"""
+    """获取默认提示词模板：仅从 LLM提示词.md 读取，文件不存在时记录错误"""
     global _PROMPT_FILE
     if _PROMPT_FILE is None:
         from app.config import BASE_DIR
@@ -29,84 +29,10 @@ def _get_default_prompt() -> str:
             text = _PROMPT_FILE.read_text(encoding="utf-8")
             if text.strip():
                 return text
-    except Exception:
-        logger.warning("读取 LLM提示词.md 失败，使用内嵌默认模板")
-    return DEFAULT_ANALYSIS_PROMPT
-
-
-# ── 默认修订提示词模板 ──
-# 优先从项目根目录的 修订提示词.md 读取，不存在时使用内嵌模板
-_REVISION_PROMPT_FILE = None  # 缓存文件路径
-
-
-def _get_default_revision_prompt() -> str:
-    """获取默认修订提示词模板：优先从 修订提示词.md 读取，不存在时用内嵌模板"""
-    global _REVISION_PROMPT_FILE
-    if _REVISION_PROMPT_FILE is None:
-        from app.config import BASE_DIR
-        _REVISION_PROMPT_FILE = BASE_DIR / "修订提示词.md"
-
-    try:
-        if _REVISION_PROMPT_FILE.exists():
-            text = _REVISION_PROMPT_FILE.read_text(encoding="utf-8")
-            if text.strip():
-                return text
-    except Exception:
-        logger.warning("读取 修订提示词.md 失败，使用内嵌默认模板")
-    return DEFAULT_REVISION_PROMPT
-
-
-DEFAULT_ANALYSIS_PROMPT = """你是一位资深法律文书分析专家。请按以下两阶段分析邮件及附件内容：
-
-## 第一阶段：文书类型识别
-根据邮件标题、正文和附件内容，从以下类型中选择最匹配的文书类型：
-{doc_types}
-
-## 第二阶段：详细解读与审核
-无论文书类型，请进行以下全面分析：
-1. **案情摘要**：概括案件核心内容和涉及方
-2. **法律要点分析**：识别核心法律问题，分析适用的法律依据和裁判规则
-3. **关键信息提取**：案号、关键日期（开庭/答辩/上诉截止等）、涉及金额、管辖法院/机关等
-4. **风险提示**：潜在的法律风险、程序风险、时效风险、证据风险
-5. **处理建议**：应采取的下一步行动、需要准备的材料、注意事项、是否建议委托专业律师
-
-## 邮件信息
-- 发件人：{sender}
-- 主题：{subject}
-- 内容：
-{body}
-
-注意：如果下方有"## 附件内容"段落，请以附件原文为主要分析依据。附件可能包含合同全文、判决书原文、起诉状、证据清单等。
-
-## 输出格式
-请严格返回 JSON 格式（不要包含 markdown 代码块标记）：
-{{
-  "doc_type": "文书类型（从上述类型中选择）",
-  "case_summary": "一句话概括案件内容和涉及方",
-  "ai_interpretation": "第二阶段完整分析结果，包含：法律要点分析、关键信息提取、风险提示（按重要性分级）、处理建议。300-600字。",
-  "urgency": "high|medium|low",
-  "key_date": "关键日期或null",
-  "case_number": "案号或null",
-  "involved_parties": "涉及方名称（逗号分隔）",
-  "confidence": 0.0-1.0之间的置信度,
-  "revision_instructions": [
-    {{
-      "target_location": "条款准确位置（如「第四条 违约责任 第2款」）",
-      "original_text_snippet": "原文中需修改的片段（精确引用原文）",
-      "issue": "问题描述（法律错误、风险隐患等）",
-      "suggested_revision": "建议修改后的完整表述",
-      "action": "modify | add | delete"
-    }}
-  ]
-}}
-
-关于 revision_instructions 的说明：
-- 合同/协议类文书必须生成该数组，每个条款问题一条记录。
-- 其他类型文书可选（如有明确的修改建议再生成）。
-- 若无明确的逐条修改建议，返回空数组 []。
-- `ai_interpretation` 中不得重复 `revision_instructions` 中的具体修改措辞（仅概括修改方向和风险原因，一句话即可）。
-- 此字段是后续文书修订环节的精确操作指令，请确保每条指令清晰、完整、可执行。
-"""
+    except Exception as e:
+        logger.error(f"读取 LLM提示词.md 失败: [{type(e).__name__}] {e}")
+    logger.error("LLM提示词.md 不存在或为空，无法加载分析提示词")
+    return ""
 
 
 def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
@@ -278,7 +204,7 @@ async def analyze_email(
     payload = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": f"你是一位资深法律文书分析专家。请先识别文书类型，再进行详细解读与审核。严格按JSON格式返回两阶段分析结果，不要包含markdown代码块标记。禁止输出分析过程、思考步骤或推理说明，直接输出JSON。\n\n重要：当前真实日期是 {date.today().isoformat()}。你的训练知识截止日期较早，文书中的日期（包括当前日期附近的日期）在当前真实时间下是完全有效且合法的。请以当前日期为准判断时效问题，不要将合法日期判定为「未来日期」或「无效日期」。"},
+            {"role": "system", "content": f"你是一位资深法律文书分析专家。请先识别文书类型，再进行详细解读与审核。严格按JSON格式返回分析结果和修订文书，不要包含markdown代码块标记。禁止输出分析过程、思考步骤或推理说明，直接输出JSON。\n\n重要：当前真实日期是 {date.today().isoformat()}（这是今天的实际日期，你仅需据此计算时效和截止日等时间）"},
             user_message,
         ],
         "max_tokens": max_tokens,
@@ -305,7 +231,21 @@ async def analyze_email(
         validated = _validate_llm_output(result)
         return validated
     except json.JSONDecodeError:
-        # 尝试从内容中提取 JSON
+        # 尝试修复常见 JSON 问题（revised_document 中未转义的换行符等）
+        import re
+        repaired = content
+        repaired = re.sub(r'(?<=: )"(?:[^"\\]|\\.)*?\K(?<!\\)\n', '\\n', repaired)
+        repaired = re.sub(r',\s*}', '}', repaired)
+        repaired = re.sub(r',\s*]', ']', repaired)
+        try:
+            result = json.loads(repaired)
+            validated = _validate_llm_output(result)
+            logger.info("JSON 修复后解析成功")
+            return validated
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # 尝试从内容中提取 JSON 对象
         import re
         match = re.search(r"\{[\s\S]*\}", content)
         if match:
@@ -357,12 +297,14 @@ def _validate_llm_output(result: dict) -> dict:
         "case_number": str(result.get("case_number")) if result.get("case_number") else None,
         "involved_parties": str(result.get("involved_parties", "") or ""),
         "confidence": confidence,
+        "revised_document": str(result.get("revised_document")) if result.get("revised_document") else None,
     }
 
 
 _LLM_ANALYSIS_SCHEMA = frozenset({
     "doc_type", "case_summary", "ai_interpretation", "urgency",
     "key_date", "case_number", "involved_parties", "confidence",
+    "revised_document",
 })
 
 
@@ -377,6 +319,7 @@ def _fallback_analysis() -> dict:
         "case_number": None,
         "involved_parties": "",
         "confidence": 0.5,  # 非 0.0，避免被垃圾邮件过滤器误杀
+        "revised_document": None,
     }
 
 
@@ -473,145 +416,3 @@ def get_effective_context_window(
         except ValueError:
             pass
     return detect_context_window(api_url, api_key, model_name)
-
-
-DEFAULT_REVISION_PROMPT = """你是一位资深法律文书撰写专家。根据以下审核意见和结构化修订指令，对原始文书进行修订，输出完整的修改版文书。
-
-## 原始文书类型
-{doc_type}
-
-## 审核分析报告（仅供上下文参考）
-{ai_interpretation}
-
-## 结构化修订指令（优先执行）
-{revision_instructions}
-
-## 原始文书全文
-{original_text}
-
-## 修订要求
-1. 【优先执行】严格依据【结构化修订指令】中的 `action`、`target_location` 和 `suggested_revision` 进行改动。
-2. 【次要依据】如果结构化修订指令为空，再从审核分析报告中提取明确包含「修改建议」「建议修改为」「应改为」等措辞的句子作为依据。
-3. 补充缺失的关键条款（违约责任、争议解决、送达地址、管辖约定等）——**【触发条件】** 仅当结构化修订指令中**明确提及**「缺失XX条款」「建议补充XX」或指令中有 `action: "add"` 的记录时，方可进行补充；若修订指令为空或未提及，**严禁擅自增补**任何实体性条款。
-4. 调整明显不平衡的权利义务条款
-5. 保持原文书的整体结构、段落顺序和行文风格
-
-## 安全底线规则
-1. 若【结构化修订指令】中的建议与现行法律法规强制性规定明显冲突，忽略该指令，原文保留并标注【待核实】
-2. 若指令中的 `target_location` 在原文中无法精确定位，将该指令放在文末「补充修订」部分，并标注【待置入】
-3. 若 `target_location` 描述的是「自然段中的具体语句」而非编号条款，请基于 `original_text_snippet` 在全文进行**模糊/语义匹配定位**；若匹配到唯一位置则直接修改该位置；若匹配到多个或零个位置，再移至文末【待置入】
-4. 审核分析报告中的「案情摘要」「风险提示」「程序分析」仅供理解背景，不得作为修改来源
-
-{template_section}
-
-## 输出格式 — 改动标记规范
-输出完整修改版文书全文。所有改动必须用以下标记标注：
-
-- 【新增】补充的条款或内容【/新增】
-- 【修改】改动后的表述【/修改】
-- 【删除】建议删除的原文【/删除】
-
-规则：
-- 标记可以跨行，但不能嵌套
-- 【新增】和【修改】标记内的文本是最终版本文书的一部分
-- 【删除】标记内的文本仅为审阅参考（表示建议从文书中移除）
-- 未改动的段落直接输出原文，不要加任何标记
-- 直接输出文书全文，不要加「以下是修改版」等前言后语
-- 禁止输出分析过程、思考步骤或推理说明，只输出修订后的文书正文"""
-
-
-async def generate_revision(
-    api_url: str,
-    api_key_encrypted: str,
-    model_name: str,
-    doc_type: str,
-    original_text: str,
-    ai_interpretation: str,
-    revision_instructions: str = "",
-    custom_prompt: str = "",
-    template: str | None = None,
-    max_tokens: int = 4000,
-    temperature: float = 0.3,
-    timeout: int = 180,
-) -> str | None:
-    """
-    根据 LLM 审核意见生成修改版文书。
-
-    revision_instructions: 结构化修订指令（JSON 数组字符串），
-        优先于 ai_interpretation 作为修订依据。
-    template: 可选的文书格式模板，传入后 LLM 将严格遵循模板格式修订。
-    返回修改后的文书全文（含改动标记），失败时返回 None。
-    """
-    from app.config import decrypt
-
-    api_key = decrypt(api_key_encrypted)
-    prompt_template = custom_prompt.strip() if custom_prompt.strip() else _get_default_revision_prompt()
-
-    # ── 格式化 revision_instructions ──
-    formatted_instructions = ""
-    if revision_instructions and revision_instructions.strip():
-        formatted_instructions = revision_instructions
-
-    # ── 构建模板段 ──
-    if template and template.strip():
-        template_section = (
-            "## 文书格式模板（必须遵循）\n\n"
-            "以下是「{doc_type}」的标准格式模板。修订后的文书必须在以下方面与模板保持一致：\n"
-            "1. **格式**：标题层级、段落编号方式、签章位置\n"
-            "2. **内容结构**：各部分的名称、顺序和必备要素\n"
-            "3. **写作逻辑**：论证方式、法言法语风格\n\n"
-            f"模板如下：\n"
-            "───────────────────────────────\n"
-            f"{template.strip()[:3000]}\n"
-            "───────────────────────────────\n\n"
-            "请严格按照上述模板组织修订后的文书。模板中标注的 [xxx] 占位符号需从原始文书中提取实际信息填入。"
-        )
-    else:
-        template_section = ""
-
-    # ── 构建 prompt（兼容含/不含 revision_instructions 占位符的模板）──
-    format_kwargs = dict(
-        doc_type=doc_type,
-        ai_interpretation=ai_interpretation,
-        revision_instructions=formatted_instructions,
-        original_text=original_text[:8000],  # 截断过长的原文
-        template_section=template_section,
-    )
-    if "{revision_instructions}" in prompt_template:
-        prompt = prompt_template.format(**format_kwargs)
-    else:
-        # 旧版自定义模板不含 revision_instructions 占位符，移除该键
-        format_kwargs.pop("revision_instructions")
-        prompt = prompt_template.format(**format_kwargs)
-
-    # 确保 api_url 以 /chat/completions 结尾
-    if not api_url.endswith("/chat/completions"):
-        api_url = api_url.rstrip("/") + "/chat/completions"
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": f"你是一位资深法律文书撰写专家。请根据审核意见和格式模板修订文书，用【新增】【修改】【删除】标记标注所有改动。直接输出完整文书，不加前言。禁止输出分析过程、思考步骤或推理说明，只输出修订后的文书正文。\n\n重要日期参考：当前真实日期是 {date.today().isoformat()}。修订时请以当前日期为准填写或更新文书中的日期字段。"},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(api_url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-        revision = data["choices"][0]["message"]["content"].strip()
-        if revision:
-            logger.info(f"修改版文书生成成功 ({len(revision)} 字符)")
-            return revision
-        return None
-    except Exception as e:
-        logger.error(f"修改版文书生成失败: [{type(e).__name__}] {e}")
-        return None

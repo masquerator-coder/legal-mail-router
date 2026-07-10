@@ -151,6 +151,40 @@ async def detect_model(request: Request, config_id: int, form_csrf: str = Form("
         return {"success": False, "message": f"检测失败: {str(e)[:200]}"}
 
 
+@router.post("/detect-max-tokens/{config_id}")
+async def detect_max_tokens(request: Request, config_id: int, form_csrf: str = Form("", alias="_csrf_token"), db: Session = Depends(get_db)):
+    """探测 LLM 推荐 max_tokens 并更新配置"""
+    check_csrf(request, form_csrf)
+    from app.services.llm_analyzer import detect_context_window
+    config = db.query(LLMConfig).filter_by(id=config_id).first()
+    if not config:
+        return {"success": False, "message": "配置不存在"}
+
+    try:
+        api_key = decrypt(config.api_key_encrypted)
+        context_window = detect_context_window(config.api_url, api_key, config.model_name)
+
+        # 根据上下文窗口计算推荐 max_tokens
+        if context_window >= 1_000_000:
+            recommended = 64000
+        elif context_window >= 200_000:
+            recommended = 32000
+        elif context_window >= 128_000:
+            recommended = 16000
+        elif context_window >= 64_000:
+            recommended = 8192
+        elif context_window >= 32_000:
+            recommended = 4096
+        else:
+            recommended = 4096
+
+        config.max_tokens = recommended
+        db.commit()
+        return {"success": True, "max_tokens": recommended, "context_window": context_window}
+    except Exception as e:
+        return {"success": False, "message": f"探测失败: {str(e)[:200]}"}
+
+
 @router.post("/test/{config_id}")
 async def test_llm(request: Request, config_id: int, form_csrf: str = Form("", alias="_csrf_token"), db: Session = Depends(get_db)):
     """测试 LLM 连接"""
