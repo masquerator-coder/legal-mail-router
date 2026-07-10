@@ -87,6 +87,7 @@
                     <th style="width:36px;"><input type="checkbox" id="select-all" onchange="toggleSelectAll(this.checked)" title="全选/取消全选"></th>
                     <th>时间</th>
                     <th>发件人</th>
+                    <th>发件人地址</th>
                     <th>主题</th>
                     <th>分类</th>
                     <th>转发邮箱</th>
@@ -99,7 +100,8 @@
                 <tr>
                     <td style="text-align:center;"><input type="checkbox" class="log-checkbox" value="{{ log.id }}" onchange="updateSelection()"></td>
                     <td style="font-size:12px; white-space:nowrap;">{{ log.created_at.strftime('%m-%d %H:%M') if log.created_at else '-' }}</td>
-                    <td style="font-size:12px; max-width:150px; overflow:hidden; text-overflow:ellipsis;">{{ log.sender or '-' }}</td>
+                    <td style="font-size:12px; max-width:150px; overflow:hidden; text-overflow:ellipsis;">{{ (log.sender | format_sender).name or log.sender or '-' }}</td>
+                    <td style="font-size:12px; max-width:220px; overflow:hidden; text-overflow:ellipsis; color:var(--text-muted);">{{ (log.sender | format_sender).email or '-' }}</td>
                     <td style="font-size:13px; max-width:280px; overflow:hidden; text-overflow:ellipsis;">
                         <a href="/logs/detail/{{ log.id }}" style="text-decoration:none; color:var(--primary);">{{ log.subject or '(无主题)' }}</a>
                     </td>

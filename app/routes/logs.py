@@ -386,7 +386,7 @@ async def export_csv(
     writer = csv.writer(output)
 
     writer.writerow([
-        "发件人", "收件时间", "主题", "分类", "状态", "转发邮箱",
+        "发件人", "发件人地址", "收件时间", "主题", "分类", "状态", "转发邮箱",
         "案件摘要", "AI解读", "涉及方", "错误信息", "邮件正文", "附件"
     ])
 
@@ -400,8 +400,22 @@ async def export_csv(
             "forwarded": "已转发", "failed": "失败", "skipped": "已跳过"
         }
 
+        # 提取发件人名称和邮箱
+        sender_raw = log.sender or ""
+        sender_name = ""
+        sender_email = sender_raw
+        import re
+        email_match = re.search(r'<([^>]+)>', sender_raw)
+        if email_match:
+            sender_email = email_match.group(1).strip()
+            sender_name = sender_raw[:email_match.start()].strip().strip('"').strip("'").strip()
+        else:
+            sender_email = sender_raw.strip()
+            sender_name = ""
+
         writer.writerow([
-            log.sender or "",
+            sender_name or sender_raw,
+            sender_email,
             log.received_at.strftime("%Y-%m-%d %H:%M:%S") if log.received_at else "",
             log.subject or "",
             log.doc_type or "",
