@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request, Depends, Form, UploadFile, File
 from fastapi.responses import StreamingResponse, RedirectResponse
 from sqlalchemy.orm import Session
 from app.database import get_db, db_retry_commit
-from app.models import EmailAccount, LLMConfig, OCRConfig, RoutingRule, DefaultConfig
+from app.models import EmailAccount, LLMConfig, OCRConfig, RoutingRule, DefaultConfig, DocTemplate
 from app.flash import flash
 from app.csrf import check_csrf
 import io
@@ -27,13 +27,14 @@ async def backup_page(request: Request):
 async def export_backup(db: Session = Depends(get_db)):
     """导出所有配置为 JSON 文件（加密字段保持密文）"""
     data = {
-        "version": 1,
+        "version": 2,
         "exported_at": datetime.now().isoformat(),
         "system_name": "文书分发系统",
         "email_accounts": [],
         "llm_config": [],
         "ocr_config": [],
         "routing_rules": [],
+        "doc_templates": [],  # v2 新增：文书模板
         "system_settings": [],
     }
 
@@ -104,11 +105,32 @@ async def export_backup(db: Session = Depends(get_db)):
             "enabled": rule.enabled,
         })
 
-    # 系统设置
+    # 文书模板
+    for tpl in db.query(DocTemplate).order_by(DocTemplate.id).all():
+        account_name = None
+        if tpl.account_id:
+            acc = db.query(EmailAccount).filter_by(id=tpl.account_id).first()
+            if acc:
+                account_name = acc.name
+        data["doc_templates"].append({
+            "account_name": account_name,  # null = 全局模板
+            "name": tpl.name,
+            "doc_type": tpl.doc_type,
+            "content": tpl.content,
+            "description": tpl.description,
+            "is_default": tpl.is_default,
+        })
+
+    # 系统设置（classify_llm_config_id 用名称代替脆弱的数字 ID）
     for cfg in db.query(DefaultConfig).order_by(DefaultConfig.key).all():
+        value = cfg.value
+        if cfg.key == "classify_llm_config_id" and value and value.isdigit():
+            llm = db.query(LLMConfig).filter_by(id=int(value)).first()
+            if llm:
+                value = f"__name__:{llm.name}"
         data["system_settings"].append({
             "key": cfg.key,
-            "value": cfg.value,
+            "value": value,
         })
 
     json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
@@ -146,7 +168,7 @@ async def import_backup(
         flash(request, "无效的备份文件：缺少 version 字段", "error")
         return RedirectResponse(url="/backup", status_code=303)
 
-    stats = {"accounts": 0, "llm": 0, "ocr": 0, "rules": 0, "settings": 0}
+    stats = {"accounts": 0, "llm": 0, "ocr": 0, "rules": 0, "templates": 0, "settings": 0}
 
     try:
         # 先建立账户名→ID 映射（用于关联路由规则）
@@ -291,10 +313,55 @@ async def import_backup(
                 db.add(rule)
             stats["rules"] += 1
 
+        # 导入文书模板 — 按 (account_name, name) 匹配，存在则更新，不存在则创建
+        for item in data.get("doc_templates", []):
+            account_id = None
+            account_name = item.get("account_name")
+            if account_name and account_name in account_map:
+                account_id = account_map[account_name]
+
+            # 匹配已有模板：同账户（或全局） + 同模板名称
+            existing = None
+            if account_id is not None:
+                existing = db.query(DocTemplate).filter_by(
+                    account_id=account_id, name=item["name"]
+                ).first()
+            else:
+                existing = db.query(DocTemplate).filter_by(
+                    account_id=None, name=item["name"]
+                ).first()
+
+            if existing:
+                existing.doc_type = item.get("doc_type", "")
+                existing.content = item.get("content", "")
+                existing.description = item.get("description", "")
+                existing.is_default = item.get("is_default", False)
+            else:
+                tpl = DocTemplate(
+                    account_id=account_id,
+                    name=item["name"],
+                    doc_type=item.get("doc_type", ""),
+                    content=item.get("content", ""),
+                    description=item.get("description", ""),
+                    is_default=item.get("is_default", False),
+                )
+                db.add(tpl)
+            stats["templates"] += 1
+
         # 导入系统设置 — 按 key 匹配，存在则更新，不存在则创建
+        # 处理 classify_llm_config_id：将 __name__:xxx 解析回当前数据库中的 ID
+        llm_name_to_id = {}
+        for llm in db.query(LLMConfig).all():
+            llm_name_to_id[llm.name] = llm.id
+
         for item in data.get("system_settings", []):
             key = item["key"]
             value = item.get("value", "")
+            # 解析 classify_llm_config_id 的名称引用
+            if key == "classify_llm_config_id" and value.startswith("__name__:"):
+                llm_name = value[9:]
+                resolved_id = llm_name_to_id.get(llm_name, "")
+                value = str(resolved_id) if resolved_id else ""
             existing = db.query(DefaultConfig).filter_by(key=key).first()
             if existing:
                 existing.value = value
@@ -304,12 +371,15 @@ async def import_backup(
 
         db_retry_commit(db)
 
-        flash(
-            request,
-            f"配置恢复成功！邮箱 {stats['accounts']} 个、LLM {stats['llm']} 个、"
-            f"OCR {stats['ocr']} 个、规则 {stats['rules']} 条、设置 {stats['settings']} 项",
-            "success",
-        )
+        parts = [
+            f"邮箱 {stats['accounts']} 个",
+            f"LLM {stats['llm']} 个",
+            f"OCR {stats['ocr']} 个",
+            f"规则 {stats['rules']} 条",
+            f"模板 {stats['templates']} 个",
+            f"设置 {stats['settings']} 项",
+        ]
+        flash(request, "配置恢复成功！" + "、".join(parts), "success")
 
     except Exception as e:
         db.rollback()
