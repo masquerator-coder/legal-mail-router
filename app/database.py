@@ -126,6 +126,15 @@ def _migrate_email_log_revision_instructions(conn):
         conn.commit()
 
 
+def _migrate_email_log_recipient(conn):
+    """自动迁移：为 email_logs 表补齐新增的 recipient 列"""
+    cols = {row[1] for row in conn.execute(text("PRAGMA table_info(email_logs)"))}
+    if "recipient" not in cols:
+        logger.info("迁移: email_logs 添加 recipient 列")
+        conn.execute(text("ALTER TABLE email_logs ADD COLUMN recipient TEXT"))
+        conn.commit()
+
+
 def _migrate_email_account_forward_to(conn):
     """自动迁移：为 email_accounts 表补齐新增的 forward_to 列"""
     cols = {row[1] for row in conn.execute(text("PRAGMA table_info(email_accounts)"))}
@@ -173,10 +182,10 @@ def init_db():
             _migrate_ocr_config_capabilities(conn)
             _set_schema_version(conn, 1)
 
-        # ── 版本 2+: 未来新迁移在此追加 ──
-        # if current_version < 2:
-        #     ... (new migration steps)
-        #     _set_schema_version(conn, 2)
+        # ── 版本 2: email_logs 收件人列（幂等，兼容已升到 v1 的存量库） ──
+        if current_version < 2:
+            _migrate_email_log_recipient(conn)
+            _set_schema_version(conn, 2)
 
         # 添加查询性能索引和 UNIQUE 约束（SQLite 用 IF NOT EXISTS 安全幂等）
         sqls = [

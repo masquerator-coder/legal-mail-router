@@ -36,6 +36,7 @@ class ParsedEmail:
     sender: str
     date: datetime
     body_text: str
+    recipient: str = ""  # 收件人（To + Cc，Bcc 收到时回退投递地址）
     attachments: list = field(default_factory=list)
     headers: dict = field(default_factory=dict)  # 原始邮件头（关键头部的键值对）
 
@@ -163,6 +164,21 @@ def _parse_email(raw_bytes: bytes) -> Optional[ParsedEmail]:
         message_id = "synth-" + hashlib.sha256(raw_bytes).hexdigest()
     subject = decode_mime_header(msg["Subject"])
     sender = decode_mime_header(msg["From"])
+    # 收件人：To + Cc；若均为空（密送 Bcc 收到），回退到投递地址头
+    recipient_parts = [
+        p for p in (
+            decode_mime_header(msg["To"]),
+            decode_mime_header(msg["Cc"]),
+        ) if p
+    ]
+    if not recipient_parts:
+        delivered = (
+            decode_mime_header(msg["Delivered-To"])
+            or decode_mime_header(msg["X-Original-To"])
+        )
+        if delivered:
+            recipient_parts.append(delivered)
+    recipient = ", ".join(recipient_parts)
     date_str = msg["Date"]
 
     try:
@@ -186,6 +202,7 @@ def _parse_email(raw_bytes: bytes) -> Optional[ParsedEmail]:
         sender=sender,
         date=date,
         body_text=body,
+        recipient=recipient,
         attachments=attachments,
         headers=headers,
     )

@@ -4,6 +4,7 @@
 import smtplib
 import logging
 import tempfile
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -28,12 +29,32 @@ def _build_email_body(
     original_subject: str,
     original_body: str = "",
     brief_mode: bool = False,
+    original_sender: str = "",
+    original_recipient: str = "",
+    original_date: str | datetime = "",
 ) -> str:
     """构建邮件正文（支持多分析结果）
 
     analyses: LLM 分析结果列表，每组对应一份独立文书
+    original_date: 原邮件接收日期（datetime 或已格式化字符串，可选）
     """
     urgency_map = {"high": "🔴 紧急", "medium": "🟡 一般", "low": "🟢 普通"}
+
+    # 原邮件元信息（发件人/收件人/日期/主题），缺失字段自动省略
+    origin_meta = []
+    if original_sender:
+        origin_meta.append(f"原发件人：{original_sender}")
+    if original_recipient:
+        origin_meta.append(f"原收件人：{original_recipient}")
+    if original_date:
+        if isinstance(original_date, datetime):
+            if original_date.tzinfo is not None:
+                # aware datetime：转换为本地时区，避免跨时区邮件显示原时区时间
+                original_date = original_date.astimezone()
+            original_date = original_date.strftime("%Y-%m-%d %H:%M")
+        origin_meta.append(f"原收件日期：{original_date}")
+    origin_meta.append(f"原邮件主题：{original_subject}")
+    origin_block = "\n".join(origin_meta)
 
     # 原邮件正文（截断过长内容）
     body_display = original_body or "（无正文）"
@@ -79,13 +100,12 @@ def _build_email_body(
         return f"""您好 {to_name}，
 
 {brief_summary}
-{chr(10).join(sections)}━━━━━━━━━━━━━━━━━━━━
-
+{chr(10).join(sections)}
 📎 AI 初步审核解读详见附件《AI分析报告.docx》—— 请下载查阅完整解读内容。
-
-原邮件主题：{original_subject}
-
 ━━━━━━━━━━━━━━━━━━━━
+
+{origin_block}
+
 📧 原邮件正文：
 {body_display}
 ━━━━━━━━━━━━━━━━━━━━
@@ -111,9 +131,8 @@ def _build_email_body(
 
 ━━━━━━━━━━━━━━━━━━━━
 
-原邮件主题：{original_subject}
+{origin_block}
 
-━━━━━━━━━━━━━━━━━━━━
 📧 原邮件正文：
 {body_display}
 ━━━━━━━━━━━━━━━━━━━━
@@ -292,6 +311,9 @@ def forward_email(
     to_name: str,
     original_subject: str,
     original_body: str = "",
+    original_sender: str = "",
+    original_recipient: str = "",
+    original_date: str | datetime = "",
     analyses_results: list[dict] = None,
     analysis_result: dict = None,
     attachment_paths: list[str] = None,
@@ -312,6 +334,9 @@ def forward_email(
         to_name: 收件人姓名
         original_subject: 原邮件主题
         original_body: 原邮件正文
+        original_sender: 原邮件发件人（可选，用于在转发正文中注明）
+        original_recipient: 原邮件收件人（可选，用于在转发正文中注明）
+        original_date: 原邮件接收日期（可选，用于在转发正文中注明）
         analyses_results: LLM 分析结果列表 (推荐，支持多文书)
         analysis_result: 单条 LLM 分析结果 (兼容旧调用)
         attachment_paths: 附件路径列表
@@ -359,7 +384,9 @@ def forward_email(
     if analysis_output_mode == "attachment":
         docx_path = _generate_analysis_docx(analyses, original_subject)
         body = _build_email_body(
-            to_name, analyses, original_subject, original_body, brief_mode=True
+            to_name, analyses, original_subject, original_body, brief_mode=True,
+            original_sender=original_sender, original_recipient=original_recipient,
+            original_date=original_date,
         )
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
@@ -371,7 +398,9 @@ def forward_email(
                 msg.attach(part)
     else:
         body = _build_email_body(
-            to_name, analyses, original_subject, original_body, brief_mode=False
+            to_name, analyses, original_subject, original_body, brief_mode=False,
+            original_sender=original_sender, original_recipient=original_recipient,
+            original_date=original_date,
         )
         msg.attach(MIMEText(body, "plain", "utf-8"))
 

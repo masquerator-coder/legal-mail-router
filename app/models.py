@@ -110,6 +110,7 @@ class EmailLog(Base):
     message_id = Column(String(500), unique=True, comment="邮件Message-ID(去重用)")
     subject = Column(String(500), comment="邮件主题")
     sender = Column(String(300), comment="发件人")
+    recipient = Column(String(300), comment="收件人(To+Cc)")
     received_at = Column(DateTime, comment="接收时间")
     body_preview = Column(Text, comment="正文摘要")
     body_text = Column(Text, comment="邮件完整正文")
