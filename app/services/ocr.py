@@ -289,7 +289,9 @@ def _classify_model_type(
       2. 端到端确认看见图（多轮全对且互异）→ multimodal
       3. 探测连不通                       → 信任模型元数据（有视觉声明则 multimodal，否则 unknown）
       4. 元数据确认多模态、但探测没看见    → multimodal（oMLX 常静默丢弃图片）
-      5. 其余（探测没看见且无视觉信号）    → unknown（证据不足，一律不谎报）
+      5. 图片被静默丢弃（有图=无图基线）   → unknown（铁证，引导手动指定）
+      6. 辨色明确答错（wrong）且无视觉信号 → text（后端接受图片但模型看不见内容）
+      7. 其余（unreadable/mixed 且无视觉信号）→ unknown（证据不足，不谎报）
 
     关键点：第 4 条修复了「纯端到端探测在 oMLX 上对所有模型都失效」的回归——
     oMLX 对图片静默忽略，导致真多模态模型的辨色探测也答非所问，必须回退到模型
@@ -297,10 +299,11 @@ def _classify_model_type(
     覆盖 OCR/文档解析类命名（DeepSeek-OCR-2、MinerU2.5 等），使这类模型能
     通过第 4 条正确识别。
 
-    第 5 条：oMLX 这类后端对图片**静默丢弃**且 /v1/models 不暴露视觉能力时，
-    真多模态与纯文本模型在行为上完全一样，自动检测区分不了；此时若谎报 text
-    会误导用户。正确做法是返回 unknown（消费端与 text 一样走 OCR 路径，安全），
-    引导用户手动指定。绝不乐观推断。
+    第 5~7 条：oMLX 这类后端对图片**静默丢弃**且 /v1/models 不暴露视觉能力时，
+    真多模态与纯文本模型在行为上几乎一样，自动检测区分困难。若模型明确答错
+    颜色（wrong），说明后端接受了图片但模型看不见 → 判 text；若只是答非所问
+    （unreadable，可能是 OCR/文档类模型的正常行为），则判 unknown 走 OCR 兜底
+    路径，引导用户手动指定。绝不乐观推断。
     """
     outcomes = [p["outcome"] for p in probes]
     answers = [p["answered"] for p in probes]
@@ -348,17 +351,24 @@ def _classify_model_type(
                 "图片可能未真正进入上下文。"
             )
         return "multimodal", detail
-    # ── 走到这里：探测既没确认看见图、后端也没声明视觉能力 → 证据不足 ──
-    # 绝不谎报纯文本，返回 unknown（消费端同样走 OCR 路径），并给出明确指引。
+    # ── 走到这里：探测既没确认看见图、后端也没声明视觉能力 ──
+    # 图片被静默丢弃的铁证优先：有图=无图基线 → unknown（引导手动指定）
     if image_dropped:
         return "unknown", (
             f"无法确认视觉能力：有图请求的 prompt_tokens 与无图基线一致（均为 {baseline_tokens}），"
             f"图片未真正进入模型上下文；且模型条目/名称均未声明视觉能力。后端很可能静默丢弃图片——"
             f"如需启用原生视觉，请在编辑表单手动指定类型，并确认后端已启用视觉通路。"
         )
-    wrong = [f"{p['asked']}→{p['answered'] or '无法识别'}" for p in probes if p["outcome"] != "correct"]
+    # 辨色明确答错（wrong）：后端接受了图片但模型看不见内容 → 确证纯文本
+    wrong = [f"{p['asked']}→{p['answered'] or '无法识别'}" for p in probes if p["outcome"] == "wrong"]
+    if wrong:
+        return "text", (
+            f"辨色探测答错（{'、'.join(wrong)}），后端接受图片但模型看不见内容，判定为纯文本。"
+        )
+    # 其余（全 unreadable 或 mixed correct/unreadable 且无视觉信号）：证据不足
+    unanswered = [f"{p['asked']}→{p['answered'] or '无法识别'}" for p in probes if p["outcome"] != "correct"]
     return "unknown", (
-        f"无法确认视觉能力：辨色探测未通过（{'、'.join(wrong)}），且模型条目/名称均未声明视觉能力。"
+        f"无法确认视觉能力：辨色探测未通过（{'、'.join(unanswered)}），且模型条目/名称均未声明视觉能力。"
         f"请通过编辑表单手动指定类型。"
     )
 

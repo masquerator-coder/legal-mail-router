@@ -172,20 +172,30 @@ class TestClassifyModelType:
         assert mt == "unknown"
         assert "手动指定" in detail
 
-    def test_wrong_no_hint_is_unknown(self):
-        """真实答错颜色且无视觉信号 → unknown（证据不足不谎报纯文本）"""
+    def test_wrong_no_hint_is_text(self):
+        """真实答错颜色且无视觉信号 → text（后端接受图片但模型看不见）"""
         probes = [
             _probe("wrong", answered="blue"),
             _probe("wrong", answered="yellow"),
         ]
-        mt, _ = _classify_model_type(False, False, probes, 2, ["red", "green"])
-        assert mt == "unknown"
+        mt, detail = _classify_model_type(False, False, probes, 2, ["red", "green"])
+        assert mt == "text"
+        assert "答错" in detail
 
-    def test_mixed_correct_wrong_no_hint_is_unknown(self):
-        """部分答对（瞎猜）无视觉信号 → unknown"""
+    def test_mixed_correct_wrong_no_hint_is_text(self):
+        """部分答对但含明确答错（瞎猜）→ text（有 wrong 即确证看不见）"""
         probes = [
             _probe("correct", answered="red"),
             _probe("wrong", answered="blue"),
+        ]
+        mt, _ = _classify_model_type(False, False, probes, 2, ["red", "green"])
+        assert mt == "text"
+
+    def test_mixed_correct_unreadable_no_hint_is_unknown(self):
+        """无 wrong、但有 unreadable → unknown（证据不足，不谎报）"""
+        probes = [
+            _probe("correct", answered="red"),
+            _probe("unreadable"),
         ]
         mt, _ = _classify_model_type(False, False, probes, 2, ["red", "green"])
         assert mt == "unknown"
@@ -252,11 +262,11 @@ class TestBaselineTokens:
         assert mt == "multimodal"
         assert "图片可能未真正进入上下文" in detail
 
-    def test_baseline_none_uses_old_path(self):
-        """基线探测不可用时走旧路径（unknown 而非 text）"""
+    def test_baseline_none_wrong_is_text(self):
+        """基线探测不可用且辨色答错 → text（wrong 本身即确证看不见）"""
         probes = [
             _probe("wrong", answered="blue"),
             _probe("wrong", answered="yellow"),
         ]
         mt, _ = _classify_model_type(False, False, probes, 2, ["red", "green"])
-        assert mt == "unknown"
+        assert mt == "text"
