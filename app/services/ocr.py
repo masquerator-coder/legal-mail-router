@@ -241,6 +241,63 @@ async def _probe_vision_once(
     return result
 
 
+def _classify_model_type(
+    entry_vision: bool,
+    name_hint: bool,
+    probes: list,
+    rounds: int,
+    colors: list,
+) -> tuple[str, str]:
+    """综合「模型自身元数据 + 端到端辨色探测」给出判定（纯函数，便于单测）。
+
+    判定优先级：
+      1. 后端明确拒绝图片                  → text（确证纯文本）
+      2. 端到端确认看见图（多轮全对且互异）→ multimodal
+      3. 探测连不通                       → 信任模型元数据（有视觉声明则 multimodal，否则 unknown）
+      4. 元数据确认多模态、但探测没看见    → multimodal（oMLX 常静默丢弃图片）
+      5. 其余（探测没看见且无视觉信号）    → text
+
+    关键点：第 4 条修复了「纯端到端探测在 oMLX 上对所有模型都失效」的回归——
+    oMLX 对图片静默忽略，导致真多模态模型的辨色探测也答非所问，必须回退到模型
+    自身条目声明的视觉能力，否则会把真多模态误杀成纯文本。
+    """
+    outcomes = [p["outcome"] for p in probes]
+    answers = [p["answered"] for p in probes]
+    token_counts = [p["prompt_tokens"] for p in probes if p["prompt_tokens"] is not None]
+
+    saw_image = all(o == "correct" for o in outcomes) and len(set(answers)) == len(answers)
+    rejected = any(o == "rejected" for o in outcomes)
+    all_error = all(o == "error" for o in outcomes)
+
+    if rejected:
+        return "text", "后端明确拒绝图片输入，确认为纯文本模型。"
+    if saw_image:
+        return "multimodal", (
+            f"{rounds} 轮随机辨色全部答对且答案互异（{'、'.join(colors)}），确认可读取图片内容。"
+        )
+    if all_error:
+        if entry_vision or name_hint:
+            tail = (probes[-1]["raw"] or "无响应")[:80]
+            return "multimodal", (
+                f"视觉探测未能完成（{tail}），但模型条目/名称声明支持视觉，按多模态处理；"
+                "建议运维确认后端是否已启用视觉通路。"
+            )
+        return "unknown", f"视觉探测未能完成（{probes[-1]['raw'][:120]}），无法判定类型。"
+    if entry_vision:
+        detail = (
+            "模型条目声明支持视觉，按多模态处理；端到端辨色未确认（后端可能未启用视觉或静默忽略图片），"
+            "已向请求塞入图片，实际能否识别请以运行效果为准。"
+        )
+        if len(token_counts) > 1 and len(set(token_counts)) == 1:
+            detail += f" 佐证：各轮 prompt_tokens 恒为 {token_counts[0]}，图片可能未真正进入上下文。"
+        return "multimodal", detail
+    wrong = [f"{p['asked']}→{p['answered'] or '无法识别'}" for p in probes if p["outcome"] != "correct"]
+    detail = f"辨色探测未通过（{'、'.join(wrong)}），后端接受图片但模型看不见内容，判定为纯文本。"
+    if len(token_counts) > 1 and len(set(token_counts)) == 1:
+        detail += f" 佐证：各轮 prompt_tokens 恒为 {token_counts[0]}，图片未进入上下文。"
+    return "text", detail
+
+
 async def detect_model_type_detailed(
     api_url: str,
     api_key: str,
@@ -302,31 +359,7 @@ async def detect_model_type_detailed(
             f"辨色探测 {p['asked']} → {p['answered'] or '无法识别'}（{p['outcome']}{pt}）"
         )
 
-    outcomes = [p["outcome"] for p in probes]
-    answers = [p["answered"] for p in probes]
-    token_counts = [p["prompt_tokens"] for p in probes if p["prompt_tokens"] is not None]
-
-    if any(o == "rejected" for o in outcomes):
-        model_type = "text"
-        detail = "后端明确拒绝图片输入，确认为纯文本模型。"
-    elif all(o == "error" for o in outcomes):
-        model_type = "unknown"
-        detail = f"无法完成视觉探测（{probes[-1]['raw'][:120]}），未改判类型。"
-        if name_hint or entry_hint:
-            detail += " 但名称/元数据提示可能支持视觉，可在编辑中手动指定。"
-    elif all(o == "correct" for o in outcomes):
-        if len(set(answers)) == len(answers):
-            model_type = "multimodal"
-            detail = f"{rounds} 轮随机辨色全部答对且答案互异（{'、'.join(colors)}），确认可读取图片内容。"
-        else:
-            model_type = "text"
-            detail = "多轮回答雷同，疑似固定输出而非真实识图，判定为纯文本。"
-    else:
-        model_type = "text"
-        wrong = [f"{p['asked']}→{p['answered'] or '无法识别'}" for p in probes if p["outcome"] != "correct"]
-        detail = f"辨色探测未通过（{'、'.join(wrong)}），后端接受图片但模型看不见内容，判定为纯文本。"
-        if len(token_counts) > 1 and len(set(token_counts)) == 1:
-            detail += f" 佐证：各轮 prompt_tokens 恒为 {token_counts[0]}，图片未进入上下文。"
+    model_type, detail = _classify_model_type(entry_hint, name_hint, probes, rounds, colors)
 
     logger.info(f"模型 {model_name} 类型检测 → {model_type}｜{detail}")
     return {"model_type": model_type, "detail": detail, "evidence": evidence}
