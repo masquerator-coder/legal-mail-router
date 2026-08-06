@@ -170,27 +170,93 @@ class TestClassifyModelType:
         probes = [_probe("unreadable"), _probe("unreadable")]
         mt, detail = _classify_model_type(False, False, probes, 2, ["red", "green"])
         assert mt == "unknown"
-        assert "OCR" in detail
+        assert "手动指定" in detail
 
-    def test_wrong_no_hint_is_text(self):
-        """真实答错颜色且无视觉信号 → text（确证看不见）"""
+    def test_wrong_no_hint_is_unknown(self):
+        """真实答错颜色且无视觉信号 → unknown（证据不足不谎报纯文本）"""
         probes = [
             _probe("wrong", answered="blue"),
             _probe("wrong", answered="yellow"),
         ]
         mt, _ = _classify_model_type(False, False, probes, 2, ["red", "green"])
-        assert mt == "text"
+        assert mt == "unknown"
 
-    def test_mixed_correct_wrong_no_hint_is_text(self):
-        """部分答对（瞎猜）无视觉信号 → text"""
+    def test_mixed_correct_wrong_no_hint_is_unknown(self):
+        """部分答对（瞎猜）无视觉信号 → unknown"""
         probes = [
             _probe("correct", answered="red"),
             _probe("wrong", answered="blue"),
         ]
         mt, _ = _classify_model_type(False, False, probes, 2, ["red", "green"])
-        assert mt == "text"
+        assert mt == "unknown"
 
     def test_name_hint_saves_all_error(self):
         probes = [_probe("error")]
         mt, _ = _classify_model_type(False, True, probes, 1, ["red"])
         assert mt == "multimodal"
+
+
+class TestBaselineTokens:
+    """无图基线 token 对比（远程并入的硬证据）"""
+
+    def test_saw_image_but_token_equals_baseline_is_unknown(self):
+        """全对但 token 与无图基线一致 → 盲猜，降级 unknown"""
+        probes = [
+            _probe("correct", answered="red", prompt_tokens=100),
+            _probe("correct", answered="green", prompt_tokens=100),
+        ]
+        mt, detail = _classify_model_type(False, False, probes, 2, ["red", "green"],
+                                          baseline_tokens=100)
+        assert mt == "unknown"
+        assert "盲猜" in detail
+
+    def test_saw_image_token_above_baseline_is_multimodal(self):
+        """全对且 token 高于基线 → 图片进入上下文，确证多模态"""
+        probes = [
+            _probe("correct", answered="red", prompt_tokens=428),
+            _probe("correct", answered="green", prompt_tokens=428),
+        ]
+        mt, _ = _classify_model_type(False, False, probes, 2, ["red", "green"],
+                                     baseline_tokens=100)
+        assert mt == "multimodal"
+
+    def test_unreadable_token_equals_baseline_is_unknown(self):
+        """探测没看见且 token 与基线一致 → 后端静默丢弃图片的铁证"""
+        probes = [
+            _probe("unreadable", prompt_tokens=100),
+            _probe("unreadable", prompt_tokens=100),
+        ]
+        mt, detail = _classify_model_type(False, False, probes, 2, ["red", "green"],
+                                          baseline_tokens=100)
+        assert mt == "unknown"
+        assert "静默丢弃" in detail
+
+    def test_unreadable_token_above_baseline_still_unknown(self):
+        """token 高于基线但探测没确认 → 仍 unknown（图片可能进了但辨色不适配）"""
+        probes = [
+            _probe("unreadable", prompt_tokens=428),
+            _probe("unreadable", prompt_tokens=428),
+        ]
+        mt, _ = _classify_model_type(False, False, probes, 2, ["red", "green"],
+                                     baseline_tokens=100)
+        assert mt == "unknown"
+
+    def test_entry_vision_with_token_equals_baseline(self):
+        """元数据声明视觉但 token 与基线一致 → multimodal + 佐证说明"""
+        probes = [
+            _probe("unreadable", prompt_tokens=100),
+            _probe("unreadable", prompt_tokens=100),
+        ]
+        mt, detail = _classify_model_type(True, False, probes, 2, ["red", "green"],
+                                          baseline_tokens=100)
+        assert mt == "multimodal"
+        assert "图片可能未真正进入上下文" in detail
+
+    def test_baseline_none_uses_old_path(self):
+        """基线探测不可用时走旧路径（unknown 而非 text）"""
+        probes = [
+            _probe("wrong", answered="blue"),
+            _probe("wrong", answered="yellow"),
+        ]
+        mt, _ = _classify_model_type(False, False, probes, 2, ["red", "green"])
+        assert mt == "unknown"
