@@ -241,12 +241,40 @@ async def _probe_vision_once(
     return result
 
 
+async def _probe_baseline_tokens(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    headers: dict,
+    model_name: str,
+) -> int | None:
+    """发一个**不含图片**的同类请求，记录 prompt_tokens 基线。
+
+    用途：把有图请求的 prompt_tokens 与无图基线对比。两者一致即说明
+    图片根本没进入模型上下文——这是"后端静默丢弃图片"的铁证，比"各轮
+    token 数相同"可靠（同一张图两轮 token 数本来就该相同）。
+    """
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "say ok"}],
+        "max_tokens": 5,
+        "temperature": 0,
+    }
+    try:
+        resp = await client.post(endpoint, headers=headers, json=payload)
+        if resp.status_code == 200:
+            return (resp.json().get("usage") or {}).get("prompt_tokens")
+    except Exception:
+        pass
+    return None
+
+
 def _classify_model_type(
     entry_vision: bool,
     name_hint: bool,
     probes: list,
     rounds: int,
     colors: list,
+    baseline_tokens: int | None = None,
 ) -> tuple[str, str]:
     """综合「模型自身元数据 + 端到端辨色探测」给出判定（纯函数，便于单测）。
 
@@ -255,11 +283,12 @@ def _classify_model_type(
       2. 端到端确认看见图（多轮全对且互异）→ multimodal
       3. 探测连不通                       → 信任模型元数据（有视觉声明则 multimodal，否则 unknown）
       4. 元数据确认多模态、但探测没看见    → multimodal（oMLX 常静默丢弃图片）
-      5. 其余（探测没看见且无视觉信号）    → text
+      5. 其余（探测没看见且无视觉信号）    → unknown（证据不足，一律不谎报）
 
-    关键点：第 4 条修复了「纯端到端探测在 oMLX 上对所有模型都失效」的回归——
-    oMLX 对图片静默忽略，导致真多模态模型的辨色探测也答非所问，必须回退到模型
-    自身条目声明的视觉能力，否则会把真多模态误杀成纯文本。
+    关键点：第 5 条是上一轮回归修复的盲区。oMLX 这类后端对图片**静默丢弃**，
+    且 /v1/models 不暴露视觉能力，于是真多模态与纯文本模型在行为上完全一样——
+    自动检测根本区分不了。此时若谎报 text，会误导用户；正确做法是返回 unknown
+    （消费端与 text 一样走 OCR 路径，安全），并引导用户手动指定。绝不乐观推断。
     """
     outcomes = [p["outcome"] for p in probes]
     answers = [p["answered"] for p in probes]
@@ -268,10 +297,23 @@ def _classify_model_type(
     saw_image = all(o == "correct" for o in outcomes) and len(set(answers)) == len(answers)
     rejected = any(o == "rejected" for o in outcomes)
     all_error = all(o == "error" for o in outcomes)
+    # 图片是否真正进入上下文：有图请求与无图基线 token 数一致 → 后端静默丢弃
+    image_dropped = (
+        baseline_tokens is not None
+        and len(token_counts) > 0
+        and all(t == baseline_tokens for t in token_counts)
+    )
 
     if rejected:
         return "text", "后端明确拒绝图片输入，确认为纯文本模型。"
     if saw_image:
+        # 双保险：若"全对"但 token 数与无图基线一致，说明图片没进上下文，
+        # 答案为盲猜概率性命中（约 1/16），不能判 multimodal。
+        if image_dropped:
+            return "unknown", (
+                f"{rounds} 轮辨色虽全对，但有图请求 prompt_tokens 与无图基线一致（均为 {baseline_tokens}），"
+                f"图片未真正进入上下文，答案为盲猜概率性命中，判定为未知；如需启用原生视觉请在编辑表单手动指定。"
+            )
         return "multimodal", (
             f"{rounds} 轮随机辨色全部答对且答案互异（{'、'.join(colors)}），确认可读取图片内容。"
         )
@@ -288,14 +330,25 @@ def _classify_model_type(
             "模型条目声明支持视觉，按多模态处理；端到端辨色未确认（后端可能未启用视觉或静默忽略图片），"
             "已向请求塞入图片，实际能否识别请以运行效果为准。"
         )
-        if len(token_counts) > 1 and len(set(token_counts)) == 1:
-            detail += f" 佐证：各轮 prompt_tokens 恒为 {token_counts[0]}，图片可能未真正进入上下文。"
+        if image_dropped:
+            detail += (
+                f" 佐证：有图请求 prompt_tokens 与无图基线一致（均为 {baseline_tokens}），"
+                "图片可能未真正进入上下文。"
+            )
         return "multimodal", detail
+    # ── 走到这里：探测既没确认看见图、后端也没声明视觉能力 → 证据不足 ──
+    # 绝不谎报纯文本，返回 unknown（消费端同样走 OCR 路径），并给出明确指引。
+    if image_dropped:
+        return "unknown", (
+            f"无法确认视觉能力：有图请求的 prompt_tokens 与无图基线一致（均为 {baseline_tokens}），"
+            f"图片未真正进入模型上下文；且模型条目/名称均未声明视觉能力。后端很可能静默丢弃图片——"
+            f"如需启用原生视觉，请在编辑表单手动指定类型，并确认后端已启用视觉通路。"
+        )
     wrong = [f"{p['asked']}→{p['answered'] or '无法识别'}" for p in probes if p["outcome"] != "correct"]
-    detail = f"辨色探测未通过（{'、'.join(wrong)}），后端接受图片但模型看不见内容，判定为纯文本。"
-    if len(token_counts) > 1 and len(set(token_counts)) == 1:
-        detail += f" 佐证：各轮 prompt_tokens 恒为 {token_counts[0]}，图片未进入上下文。"
-    return "text", detail
+    return "unknown", (
+        f"无法确认视觉能力：辨色探测未通过（{'、'.join(wrong)}），且模型条目/名称均未声明视觉能力。"
+        f"请通过编辑表单手动指定类型。"
+    )
 
 
 async def detect_model_type_detailed(
@@ -359,7 +412,19 @@ async def detect_model_type_detailed(
             f"辨色探测 {p['asked']} → {p['answered'] or '无法识别'}（{p['outcome']}{pt}）"
         )
 
-    model_type, detail = _classify_model_type(entry_hint, name_hint, probes, rounds, colors)
+    # ── 无图基线探测：仅在结论不确定时发，用于判断图片是否被后端静默丢弃 ──
+    outcomes = [p["outcome"] for p in probes]
+    baseline_tokens = None
+    if not (any(o == "rejected" for o in outcomes) or all(o == "correct" for o in outcomes) or all(o == "error" for o in outcomes)):
+        try:
+            async with httpx.AsyncClient(timeout=40.0) as client:
+                baseline_tokens = await _probe_baseline_tokens(client, endpoint, headers, model_name)
+        except Exception:
+            baseline_tokens = None
+    if baseline_tokens is not None:
+        evidence.append(f"基线探测（无图）：prompt_tokens={baseline_tokens}")
+
+    model_type, detail = _classify_model_type(entry_hint, name_hint, probes, rounds, colors, baseline_tokens)
 
     logger.info(f"模型 {model_name} 类型检测 → {model_type}｜{detail}")
     return {"model_type": model_type, "detail": detail, "evidence": evidence}
