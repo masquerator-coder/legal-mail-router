@@ -1,6 +1,10 @@
 """OCR 识别模块 — 支持 PaddleOCR / OpenAI Vision / MinerU / 自定义"""
 import base64
 import logging
+import random
+import re
+import struct
+import zlib
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -36,76 +40,302 @@ async def ocr_image(
 
 
 
-async def detect_model_type(api_url: str, api_key: str, model_name: str) -> str:
-    """
-    检测模型类型: 'multimodal' | 'text' | 'unknown'
+# ============================================================
+# 模型类型检测
+# ============================================================
+#
+# 设计原则：判定的不是"这个模型权重理论上是否多模态"，而是
+# "这个部署端到端能不能真的看见图片"。
+#
+# 误判为 multimodal 的后果最严重：图片会被塞进请求、被后端静默
+# 丢弃，模型看不见却照常输出结论（无声的错误）。因此证据不足时
+# 一律返回 unknown（走 OCR 路径），绝不乐观推断。
+#
+# 名称/元数据关键词只作为**参考信息**写入 detail 供人工判断，
+# 不参与判定 —— 这样根除了"平台上装了别的 VL 模型就把整台机器
+# 上所有配置都判成多模态"的缺陷。
 
-    策略:
-    1. 查 /v1/models 看模型名是否包含 vision/vl/multimodal 关键词
-    2. 尝试发送一个极小的 vision 请求看是否报错
-    """
-    # 1. 关键词快速判断
-    vl_keywords = ["vision", "vl", "multimodal", "gemini", "claude", "gpt-4o", "gpt-4v", "pixtral", "llava", "qwen-vl", "qwenvl", "cogvlm", "glm-4v", "yi-vision", "deepseek-vl"]
-    model_lower = model_name.lower()
-    for kw in vl_keywords:
-        if kw in model_lower:
-            logger.info(f"模型 {model_name} 关键词匹配: {kw} → multimodal")
-            return "multimodal"
+VISION_PROBE_ROUNDS = 2  # 辨色探测轮数；每多一轮，瞎猜蒙混概率降 1/4
 
-    # 2. 尝试查询 /v1/models
+_VL_RE = re.compile(
+    r"(?<![a-z0-9])("
+    r"vl|vlm|vision|multimodal|omni|"
+    r"gpt-4o|gpt-4v|glm-4v|yi-vision|"
+    r"pixtral|llava|cogvlm|internvl|minicpm-v|"
+    r"qwen-?vl|deepseek-vl|claude-3|gemini"
+    r")(?![a-z0-9])"
+)
+
+# 纯色探测图：RGB + 可接受的答案别名（中英文）
+_PROBE_COLORS = {
+    "red": ((220, 20, 20), ("red", "红")),
+    "green": ((20, 170, 60), ("green", "绿")),
+    "blue": ((20, 60, 220), ("blue", "蓝")),
+    "yellow": ((240, 210, 20), ("yellow", "黄")),
+}
+
+_PROBE_PROMPT = (
+    "这是一张纯色图片。它是什么颜色？"
+    "只回答一个英文单词：red、green、blue 或 yellow。"
+)
+
+# 后端明确拒绝图片输入时的典型报错关键词
+_REJECT_HINTS = (
+    "image", "vision", "multimodal", "multi-modal", "image_url",
+    "does not support", "not support", "unsupported", "只支持文本", "不支持图",
+)
+
+
+def _api_base(api_url: str) -> str:
+    """归一化为 API base（去尾斜杠、剥掉 /chat/completions）"""
+    u = (api_url or "").strip().rstrip("/")
+    if u.endswith("/chat/completions"):
+        u = u[: -len("/chat/completions")]
+    return u
+
+
+def _chat_endpoint(api_url: str) -> str:
+    """补全为 /chat/completions 端点。
+
+    历史 bug：探测请求直接 POST 到配置里的 api_url，而库里存的多是
+    base 形式（.../v1），导致探测恒定拿到 404/405 并被判成 text。
+    """
+    return _api_base(api_url) + "/chat/completions"
+
+
+def _models_endpoint(api_url: str) -> str:
+    return _api_base(api_url) + "/models"
+
+
+def _solid_png(rgb: tuple, size: int = 224) -> bytes:
+    """生成纯色 PNG（纯标准库，无需 Pillow）"""
+    row = b"\x00" + bytes(rgb) * size
+    raw = row * size
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return (
+            struct.pack(">I", len(data))
+            + body
+            + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + _chunk(b"IDAT", zlib.compress(raw, 9))
+        + _chunk(b"IEND", b"")
+    )
+
+
+def _parse_color_answer(text: str) -> str | None:
+    """从回答中解析颜色。命中多个不同颜色视为无效（模型在列举/瞎猜）"""
+    low = (text or "").lower()
+    hits = []
+    for name, (_rgb, aliases) in _PROBE_COLORS.items():
+        for a in aliases:
+            idx = low.find(a)
+            if idx >= 0:
+                hits.append((idx, name))
+                break
+    if not hits:
+        return None
+    if len({n for _i, n in hits}) > 1:
+        return None
+    return hits[0][1]
+
+
+def _find_model_entry(models: list, model_name: str) -> dict | None:
+    """在 /v1/models 结果中精确定位**当前配置的**那个模型条目"""
+    target = (model_name or "").strip().lower()
+    if not target:
+        return None
+    for m in models:
+        if str(m.get("id", "")).strip().lower() == target:
+            return m
+    # 兼容 org/model 前缀差异（如 deepseek-ai/xxx 与 xxx）
+    tail = target.rsplit("/", 1)[-1]
+    for m in models:
+        if str(m.get("id", "")).strip().lower().rsplit("/", 1)[-1] == tail:
+            return m
+    return None
+
+
+def _entry_vision_hint(entry: dict) -> bool:
+    """检查模型条目自身声明的视觉能力（仅作参考信息）"""
+    if _VL_RE.search(str(entry.get("id", "")).lower()):
+        return True
+    for key in ("capabilities", "modalities", "input_modalities", "architectures", "type"):
+        val = entry.get(key)
+        if val is None:
+            continue
+        blob = str(val).lower()
+        if "image" in blob or "vision" in blob or "multimodal" in blob:
+            return True
+    return False
+
+
+async def _probe_vision_once(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    headers: dict,
+    model_name: str,
+    color_key: str,
+) -> dict:
+    """单轮辨色探测。
+
+    outcome: 'correct' | 'wrong' | 'unreadable' | 'rejected' | 'error'
+    """
+    rgb, _aliases = _PROBE_COLORS[color_key]
+    b64 = base64.b64encode(_solid_png(rgb)).decode()
+    payload = {
+        "model": model_name,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _PROBE_PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ],
+        }],
+        "max_tokens": 64,
+        "temperature": 0,
+    }
+    result = {"asked": color_key, "answered": None, "raw": "", "prompt_tokens": None}
+
     try:
-        if not api_url.endswith("/chat/completions"):
-            base_url = api_url.rstrip("/")
+        resp = await client.post(endpoint, headers=headers, json=payload)
+    except Exception as e:
+        result.update(outcome="error", raw=f"{type(e).__name__}: {e}")
+        return result
+
+    if resp.status_code != 200:
+        body = resp.text[:300]
+        result["raw"] = f"HTTP {resp.status_code}: {body}"
+        low = body.lower()
+        if 400 <= resp.status_code < 500 and any(h in low for h in _REJECT_HINTS):
+            result["outcome"] = "rejected"  # 后端明确拒绝图片 → 确认纯文本
         else:
-            base_url = api_url.rsplit("/chat/completions", 1)[0]
+            result["outcome"] = "error"     # 鉴权/路径/服务端错误 → 无法判定
+        return result
 
-        models_url = base_url + "/models"
-        headers = {"Authorization": f"Bearer {api_key}"}
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(models_url, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                models = [m.get("id", "") for m in data.get("data", [])]
-                for m_id in models:
-                    for kw in vl_keywords:
-                        if kw in m_id.lower():
-                            logger.info(f"模型 {model_name} /v1/models 匹配: {kw} → multimodal")
-                            return "multimodal"
-    except Exception as e:
-        logger.debug(f"/v1/models 查询失败: {e}")
-
-    # 3. 尝试发送极小的 vision 请求
     try:
-        # 1x1 透明 PNG base64
-        tiny_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-        test_payload = {
-            "model": model_name,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "say OK"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{tiny_png}"}}
-                ]
-            }],
-            "max_tokens": 5,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(api_url, headers=headers, json=test_payload)
-            if resp.status_code == 200:
-                logger.info(f"模型 {model_name} 支持 vision → multimodal")
-                return "multimodal"
-            else:
-                logger.info(f"模型 {model_name} 不支持 vision (HTTP {resp.status_code}) → text")
-                return "text"
+        data = resp.json()
+        msg = data["choices"][0]["message"]
+        content = (msg.get("content") or "").strip()
+        if not content:
+            content = (msg.get("reasoning_content") or "").strip()
+        result["prompt_tokens"] = (data.get("usage") or {}).get("prompt_tokens")
     except Exception as e:
-        logger.info(f"模型 {model_name} vision 检测失败: {e} → text")
-        return "text"
+        result.update(outcome="error", raw=f"响应解析失败: {type(e).__name__}: {e}")
+        return result
 
-    return "text"
+    result["raw"] = content[:200]
+    answered = _parse_color_answer(content)
+    result["answered"] = answered
+    if answered is None:
+        result["outcome"] = "unreadable"
+    elif answered == color_key:
+        result["outcome"] = "correct"
+    else:
+        result["outcome"] = "wrong"
+    return result
+
+
+async def detect_model_type_detailed(
+    api_url: str,
+    api_key: str,
+    model_name: str,
+    rounds: int = VISION_PROBE_ROUNDS,
+) -> dict:
+    """检测模型类型，返回 {'model_type', 'detail', 'evidence'}
+
+    model_type: 'multimodal' | 'text' | 'unknown'
+      multimodal — 多轮随机辨色全部答对且答案互异（确认真能看见图）
+      text       — 答错/雷同/无法辨认，或后端明确拒绝图片输入
+      unknown    — 网络不可达、鉴权失败、服务端错误等，无法判定
+    """
+    evidence = []
+
+    # ── 参考信息 1：模型名称关键词（词边界匹配，避免 vllm/openvla 误命中）──
+    name_hint = bool(_VL_RE.search((model_name or "").lower()))
+    evidence.append(f"名称关键词：{'命中' if name_hint else '未命中'}")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # ── 参考信息 2：只查**本模型**在 /v1/models 里的条目，不扫全平台 ──
+    entry_hint = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(_models_endpoint(api_url), headers=headers)
+            if resp.status_code == 200:
+                models = (resp.json() or {}).get("data", []) or []
+                entry = _find_model_entry(models, model_name)
+                if entry is None:
+                    evidence.append(f"模型列表：共 {len(models)} 个模型，未找到同名条目")
+                else:
+                    entry_hint = _entry_vision_hint(entry)
+                    evidence.append(
+                        f"模型条目：已定位，视觉能力声明{'存在' if entry_hint else '缺失'}"
+                    )
+            else:
+                evidence.append(f"模型列表：查询失败 HTTP {resp.status_code}")
+    except Exception as e:
+        evidence.append(f"模型列表：查询异常 {type(e).__name__}")
+
+    # ── 判定依据：多轮随机辨色，验证"图片内容真的被读到" ──
+    endpoint = _chat_endpoint(api_url)
+    rounds = max(1, min(rounds, len(_PROBE_COLORS)))
+    colors = random.sample(list(_PROBE_COLORS.keys()), rounds)
+    probes = []
+    async with httpx.AsyncClient(timeout=40.0) as client:
+        for c in colors:
+            probes.append(await _probe_vision_once(client, endpoint, headers, model_name, c))
+            if probes[-1]["outcome"] in ("rejected", "error"):
+                break  # 明确拒绝或无法连通，无需再试
+
+    for p in probes:
+        pt = f"，prompt_tokens={p['prompt_tokens']}" if p["prompt_tokens"] is not None else ""
+        evidence.append(
+            f"辨色探测 {p['asked']} → {p['answered'] or '无法识别'}（{p['outcome']}{pt}）"
+        )
+
+    outcomes = [p["outcome"] for p in probes]
+    answers = [p["answered"] for p in probes]
+    token_counts = [p["prompt_tokens"] for p in probes if p["prompt_tokens"] is not None]
+
+    if any(o == "rejected" for o in outcomes):
+        model_type = "text"
+        detail = "后端明确拒绝图片输入，确认为纯文本模型。"
+    elif all(o == "error" for o in outcomes):
+        model_type = "unknown"
+        detail = f"无法完成视觉探测（{probes[-1]['raw'][:120]}），未改判类型。"
+        if name_hint or entry_hint:
+            detail += " 但名称/元数据提示可能支持视觉，可在编辑中手动指定。"
+    elif all(o == "correct" for o in outcomes):
+        if len(set(answers)) == len(answers):
+            model_type = "multimodal"
+            detail = f"{rounds} 轮随机辨色全部答对且答案互异（{'、'.join(colors)}），确认可读取图片内容。"
+        else:
+            model_type = "text"
+            detail = "多轮回答雷同，疑似固定输出而非真实识图，判定为纯文本。"
+    else:
+        model_type = "text"
+        wrong = [f"{p['asked']}→{p['answered'] or '无法识别'}" for p in probes if p["outcome"] != "correct"]
+        detail = f"辨色探测未通过（{'、'.join(wrong)}），后端接受图片但模型看不见内容，判定为纯文本。"
+        if len(token_counts) > 1 and len(set(token_counts)) == 1:
+            detail += f" 佐证：各轮 prompt_tokens 恒为 {token_counts[0]}，图片未进入上下文。"
+
+    logger.info(f"模型 {model_name} 类型检测 → {model_type}｜{detail}")
+    return {"model_type": model_type, "detail": detail, "evidence": evidence}
+
+
+async def detect_model_type(api_url: str, api_key: str, model_name: str) -> str:
+    """向后兼容封装：只返回类型字符串"""
+    result = await detect_model_type_detailed(api_url, api_key, model_name)
+    return result["model_type"]
 
 
 # ============================================================
@@ -141,9 +371,7 @@ async def _ocr_openai_vision(image_bytes: bytes, ocr_cfg: dict, filename: str) -
     mime = f"image/{ext}" if ext in ("png", "jpg", "jpeg", "gif", "webp") else "image/png"
 
     # 自动补全 /chat/completions
-    api_url = ocr_cfg["api_url"].rstrip("/")
-    if not api_url.endswith("/chat/completions"):
-        api_url += "/chat/completions"
+    api_url = _chat_endpoint(ocr_cfg["api_url"])
 
     payload = {
         "model": ocr_cfg["model_name"],
@@ -260,9 +488,7 @@ async def ocr_pdf(pdf_bytes: bytes, ocr_cfg: dict, filename: str = "document.pdf
     elif provider == "openai-vision":
         # 作为 data:application/pdf 塞 image_url（预期失败）
         b64 = base64.b64encode(pdf_bytes).decode()
-        base_url = api_url.rstrip("/")
-        if not base_url.endswith("/chat/completions"):
-            base_url += "/chat/completions"
+        base_url = _chat_endpoint(api_url)
         payload = {
             "model": ocr_cfg.get("model_name", "gpt-4o"),
             "messages": [{

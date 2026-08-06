@@ -46,8 +46,12 @@
                         {% elif cfg.model_type == 'text' %}📝 纯文本
                         {% else %}❓ 未知{% endif %}
                     </span>
+                    <span id="model-type-lock-{{ cfg.id }}" title="已人工指定，自动检测不会覆盖"
+                          style="margin-left:4px; font-size:11px; color:var(--text-muted);
+                          {% if not cfg.model_type_locked %}display:none;{% endif %}">🔒 人工指定</span>
                     <button class="btn btn-xs btn-outline" style="margin-left:8px; padding:2px 8px; font-size:11px;" 
                             id="detect-btn-{{ cfg.id }}" onclick="detectModelType({{ cfg.id }})">🔍 检测</button>
+                    <div id="detect-detail-{{ cfg.id }}" style="margin-top:6px; font-size:12px; color:var(--text-muted); line-height:1.5; display:none;"></div>
                 </td>
             </tr>
             <tr>
@@ -78,6 +82,15 @@
                 <div class="form-group"><label>API 地址</label><input class="form-control" name="api_url" value="{{ cfg.api_url }}" required></div>
                 <div class="form-group"><label>API Key (留空不修改)</label><input class="form-control" type="password" name="api_key"></div>
                 <div class="form-group"><label>模型名称</label><input class="form-control" name="model_name" value="{{ cfg.model_name }}" required></div>
+                <div class="form-group">
+                    <label>模型类型</label>
+                    <select class="form-control" name="model_type_choice">
+                        <option value="auto" {% if not cfg.model_type_locked %}selected{% endif %}>自动检测（由「🔍 检测」按钮判定）</option>
+                        <option value="text" {% if cfg.model_type_locked and cfg.model_type == 'text' %}selected{% endif %}>📝 纯文本（人工指定）</option>
+                        <option value="multimodal" {% if cfg.model_type_locked and cfg.model_type == 'multimodal' %}selected{% endif %}>🌐 多模态（人工指定）</option>
+                    </select>
+                    <small style="color:var(--text-muted);">自动检测通过「多轮随机辨色」验证模型是否真能读到图片内容，而非仅看模型名称或接口是否返回 200。若后端会静默忽略图片（如 oMLX 加载纯文本模型），请人工指定为纯文本，避免图片被丢弃却仍产出结论。人工指定后自动检测只报告、不覆盖。</small>
+                </div>
                 <div class="form-row">
                     <div class="form-group"><label>max_tokens</label>
                         <div style="display:flex; gap:6px; align-items:center;">
@@ -135,6 +148,15 @@
                 <div class="form-group"><label>API 地址 * (OpenAI 兼容)</label><input class="form-control" name="api_url" placeholder="https://api.deepseek.com/v1" required></div>
                 <div class="form-group"><label>API Key *</label><input class="form-control" type="password" name="api_key" required></div>
                 <div class="form-group"><label>模型名称 *</label><input class="form-control" name="model_name" placeholder="deepseek-chat" required></div>
+                <div class="form-group">
+                    <label>模型类型</label>
+                    <select class="form-control" name="model_type_choice">
+                        <option value="auto" selected>自动检测（添加后点「🔍 检测」判定）</option>
+                        <option value="text">📝 纯文本（人工指定）</option>
+                        <option value="multimodal">🌐 多模态（人工指定）</option>
+                    </select>
+                    <small style="color:var(--text-muted);">决定分析时是否把附件图片直接发给模型。不确定就留「自动检测」。</small>
+                </div>
                 <div class="form-row">
                     <div class="form-group"><label>max_tokens</label><input class="form-control" type="number" name="max_tokens" value="2000"></div>
                     <div class="form-group"><label>temperature</label><input class="form-control" type="number" step="0.1" name="temperature" value="0.3"></div>
@@ -180,23 +202,45 @@ async function resetToDefault(textareaId) {
 async function detectModelType(id) {
     var btn = document.getElementById('detect-btn-' + id);
     var label = document.getElementById('model-type-label-' + id);
-    btn.textContent = '⏳ 检测中...';
+    var detailBox = document.getElementById('detect-detail-' + id);
+    btn.textContent = '⏳ 探测中...';
     btn.disabled = true;
+    if (detailBox) {
+        detailBox.style.display = 'block';
+        detailBox.textContent = '正在发送多轮随机纯色图，验证模型能否真的读到图片内容…';
+    }
     try {
         var resp = await fetch('/llm-config/detect-model/' + id, { method: 'POST' });
         var data = await resp.json();
         if (data.success) {
             label.textContent = (data.model_type === 'multimodal' ? '🌐 多模态' : data.model_type === 'text' ? '📝 纯文本' : '❓ 未知');
             label.style.background = data.model_type === 'multimodal' ? '#10b981' : data.model_type === 'text' ? '#6366f1' : '#94a3b8';
-            showToast('检测完成: ' + data.label, 'success');
+            if (detailBox) {
+                var html = '<div>' + escapeHtml(data.detail || '') + '</div>';
+                if (data.evidence && data.evidence.length) {
+                    html += '<ul style="margin:4px 0 0 18px; padding:0;">'
+                          + data.evidence.map(function(x){ return '<li>' + escapeHtml(x) + '</li>'; }).join('')
+                          + '</ul>';
+                }
+                detailBox.innerHTML = html;
+            }
+            showToast('检测完成: ' + data.label + (data.locked ? '（已人工锁定，未覆盖）' : ''), 'success');
         } else {
+            if (detailBox) detailBox.textContent = data.message || '检测失败';
             showToast(data.message, 'error');
         }
     } catch(e) {
+        if (detailBox) detailBox.textContent = '请求失败: ' + e;
         showToast('请求失败: ' + e, 'error');
     }
     btn.textContent = '🔍 检测';
     btn.disabled = false;
+}
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function(c) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
 }
 
 async function detectMaxTokens(id) {

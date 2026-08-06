@@ -36,6 +36,7 @@ async def add_llm_config(
     max_tokens: int = Form(2000),
     temperature: float = Form(0.3),
     is_active: str = Form("false"),
+    model_type_choice: str = Form("auto"),
     form_csrf: str = Form("", alias="_csrf_token"),
 ):
     check_csrf(request, form_csrf)
@@ -43,6 +44,8 @@ async def add_llm_config(
     # 如果设为激活，先取消其他配置的激活状态
     if _is_active:
         db.query(LLMConfig).filter_by(is_active=True).update({"is_active": False})
+
+    _locked = model_type_choice in ("text", "multimodal")
 
     config = LLMConfig(
         name=name,
@@ -53,6 +56,8 @@ async def add_llm_config(
         max_tokens=max_tokens,
         temperature=temperature,
         is_active=_is_active,
+        model_type=model_type_choice if _locked else "unknown",
+        model_type_locked=_locked,
     )
     db.add(config)
     db.commit()
@@ -73,6 +78,7 @@ async def edit_llm_config(
     max_tokens: int = Form(2000),
     temperature: float = Form(0.3),
     is_active: str = Form("false"),
+    model_type_choice: str = Form("auto"),
     form_csrf: str = Form("", alias="_csrf_token"),
 ):
     check_csrf(request, form_csrf)
@@ -93,6 +99,14 @@ async def edit_llm_config(
     config.max_tokens = max_tokens
     config.temperature = temperature
     config.is_active = _is_active
+
+    # 模型类型：auto = 交给自动检测；text/multimodal = 人工钉死，检测不再覆盖
+    if model_type_choice in ("text", "multimodal"):
+        config.model_type = model_type_choice
+        config.model_type_locked = True
+    else:
+        config.model_type_locked = False
+
     db.commit()
     flash(request, f"LLM 配置「{config.name}」已更新", "success")
     return RedirectResponse(url="/llm-config", status_code=303)
@@ -131,22 +145,52 @@ async def activate_llm_config(
     return RedirectResponse(url="/llm-config", status_code=303)
 
 
+MODEL_TYPE_LABELS = {"multimodal": "多模态(支持图片)", "text": "纯文本", "unknown": "未知"}
+
+
 @router.post("/detect-model/{config_id}")
 async def detect_model(request: Request, config_id: int, form_csrf: str = Form("", alias="_csrf_token"), db: Session = Depends(get_db)):
-    """检测模型类型并更新配置"""
+    """检测模型类型并更新配置
+
+    检测依据是"端到端能否真的读到图片内容"（多轮随机辨色），
+    而非模型名称或 HTTP 状态码。人工锁定的配置只报告不写库。
+    """
     check_csrf(request, form_csrf)
-    from app.services.ocr import detect_model_type
+    from app.services.ocr import detect_model_type_detailed
     config = db.query(LLMConfig).filter_by(id=config_id).first()
     if not config:
         return {"success": False, "message": "配置不存在"}
 
     try:
         api_key = decrypt(config.api_key_encrypted)
-        model_type = await detect_model_type(config.api_url, api_key, config.model_name)
+        result = await detect_model_type_detailed(config.api_url, api_key, config.model_name)
+        model_type = result["model_type"]
+        detail = result["detail"]
+
+        if config.model_type_locked:
+            # 人工已钉死：只报告差异，不覆盖
+            locked = config.model_type
+            if locked != model_type:
+                detail = (
+                    f"检测结果为「{MODEL_TYPE_LABELS.get(model_type, model_type)}」，"
+                    f"但当前已人工锁定为「{MODEL_TYPE_LABELS.get(locked, locked)}」，未覆盖。"
+                    f"（{detail}）"
+                )
+            else:
+                detail = f"检测结果与人工锁定一致。（{detail}）"
+            return {
+                "success": True, "model_type": locked, "locked": True,
+                "label": MODEL_TYPE_LABELS.get(locked, locked),
+                "detail": detail, "evidence": result["evidence"],
+            }
+
         config.model_type = model_type
         db.commit()
-        labels = {"multimodal": "多模态(支持图片)", "text": "纯文本", "unknown": "未知"}
-        return {"success": True, "model_type": model_type, "label": labels.get(model_type, model_type)}
+        return {
+            "success": True, "model_type": model_type, "locked": False,
+            "label": MODEL_TYPE_LABELS.get(model_type, model_type),
+            "detail": detail, "evidence": result["evidence"],
+        }
     except Exception as e:
         return {"success": False, "message": f"检测失败: {str(e)[:200]}"}
 

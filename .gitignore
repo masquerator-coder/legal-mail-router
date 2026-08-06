@@ -21,6 +21,7 @@ Thumbs.db
 data/
 *.db
 .reasonix/
+.workbuddy/
 
 # Config with secrets (encryption key)
 data/.encryption_key

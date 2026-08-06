@@ -156,6 +156,17 @@ def _migrate_ocr_config_capabilities(conn):
     conn.commit()
 
 
+def _migrate_llm_config_model_type_locked(conn):
+    """自动迁移：为 llm_config 表补齐 model_type_locked 列（人工指定模型类型）"""
+    cols = {row[1] for row in conn.execute(text("PRAGMA table_info(llm_config)"))}
+    if "model_type_locked" not in cols:
+        logger.info("迁移: llm_config 添加 model_type_locked 列")
+        conn.execute(text(
+            "ALTER TABLE llm_config ADD COLUMN model_type_locked BOOLEAN DEFAULT 0"
+        ))
+        conn.commit()
+
+
 def get_db():
     """FastAPI 依赖：获取数据库会话"""
     db = SessionLocal()
@@ -186,6 +197,11 @@ def init_db():
         if current_version < 2:
             _migrate_email_log_recipient(conn)
             _set_schema_version(conn, 2)
+
+        # ── 版本 3: llm_config 人工锁定模型类型 ──
+        if current_version < 3:
+            _migrate_llm_config_model_type_locked(conn)
+            _set_schema_version(conn, 3)
 
         # 添加查询性能索引和 UNIQUE 约束（SQLite 用 IF NOT EXISTS 安全幂等）
         sqls = [

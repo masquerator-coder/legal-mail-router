@@ -45,6 +45,7 @@ class LLMConfig(Base):
     temperature = Column(Float, default=0.3)
     is_active = Column(Boolean, default=True, comment="是否激活")
     model_type = Column(String(20), default="unknown", comment="模型类型: text/multimodal/unknown")
+    model_type_locked = Column(Boolean, default=False, comment="模型类型由人工指定，自动检测不覆盖")
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 

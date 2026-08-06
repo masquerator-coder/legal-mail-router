@@ -66,6 +66,7 @@ async def export_backup(db: Session = Depends(get_db)):
             "temperature": cfg.temperature,
             "is_active": cfg.is_active,
             "model_type": cfg.model_type,
+            "model_type_locked": bool(cfg.model_type_locked),
         })
 
     # OCR 配置
@@ -224,6 +225,7 @@ async def import_backup(
                 existing.temperature = item.get("temperature", 0.3)
                 existing.is_active = item.get("is_active", True)
                 existing.model_type = item.get("model_type", "unknown")
+                existing.model_type_locked = bool(item.get("model_type_locked", False))
             else:
                 cfg = LLMConfig(
                     name=llm_name,
@@ -235,6 +237,7 @@ async def import_backup(
                     temperature=item.get("temperature", 0.3),
                     is_active=item.get("is_active", True),
                     model_type=item.get("model_type", "unknown"),
+                    model_type_locked=bool(item.get("model_type_locked", False)),
                 )
                 db.add(cfg)
             stats["llm"] += 1
