@@ -62,7 +62,10 @@ _VL_RE = re.compile(
     r"vl|vlm|vision|multimodal|omni|"
     r"gpt-4o|gpt-4v|glm-4v|yi-vision|"
     r"pixtral|llava|cogvlm|internvl|minicpm-v|"
-    r"qwen-?vl|deepseek-vl|claude-3|gemini"
+    r"qwen-?vl|deepseek-vl|claude-3|gemini|"
+    # OCR/文档解析类模型（oMLX 平台上常见命名，本身即多模态读图模型）
+    r"ocr|mineru(?:\d[\w.]*)?|markitdown|docling|paddleocr|textin|gpt-?ocr|"
+    r"qwen-?ocr|ds-?ocr|deepseek-?ocr|unlimited-?ocr"
     r")(?![a-z0-9])"
 )
 
@@ -212,7 +215,10 @@ async def _probe_vision_once(
         body = resp.text[:300]
         result["raw"] = f"HTTP {resp.status_code}: {body}"
         low = body.lower()
-        if 400 <= resp.status_code < 500 and any(h in low for h in _REJECT_HINTS):
+        # 只有 400/422（客户端请求参数校验）且含拒图关键词才确证「拒绝图片」；
+        # 409/404/5xx 等属于服务端状态错误（如模型加载失败），不算拒绝图片，
+        # 归为 error，避免把「加载失败的模型」误钉死为纯文本。
+        if resp.status_code in (400, 422) and any(h in low for h in _REJECT_HINTS):
             result["outcome"] = "rejected"  # 后端明确拒绝图片 → 确认纯文本
         else:
             result["outcome"] = "error"     # 鉴权/路径/服务端错误 → 无法判定
@@ -255,11 +261,17 @@ def _classify_model_type(
       2. 端到端确认看见图（多轮全对且互异）→ multimodal
       3. 探测连不通                       → 信任模型元数据（有视觉声明则 multimodal，否则 unknown）
       4. 元数据确认多模态、但探测没看见    → multimodal（oMLX 常静默丢弃图片）
-      5. 其余（探测没看见且无视觉信号）    → text
+      5. 探测全部无法辨认（unreadable）且无视觉信号 → unknown（证据不足，交给人工/OCR 兜底）
+      6. 其余（探测答错且无视觉信号）      → text
 
     关键点：第 4 条修复了「纯端到端探测在 oMLX 上对所有模型都失效」的回归——
     oMLX 对图片静默忽略，导致真多模态模型的辨色探测也答非所问，必须回退到模型
     自身条目声明的视觉能力，否则会把真多模态误杀成纯文本。
+
+    第 5 条：OCR/文档解析类模型（DeepSeek-OCR-2、MinerU2.5 等）即使真能读图，
+    也常按训练目标输出「图中有何内容」的描述而非颜色单词，导致辨色解析不到
+    答案（unreadable）。此时若无任何视觉信号佐证，宁可 unknown 走 OCR 路径，
+    也不武断判 text 丢掉图片通道。
     """
     outcomes = [p["outcome"] for p in probes]
     answers = [p["answered"] for p in probes]
@@ -268,6 +280,7 @@ def _classify_model_type(
     saw_image = all(o == "correct" for o in outcomes) and len(set(answers)) == len(answers)
     rejected = any(o == "rejected" for o in outcomes)
     all_error = all(o == "error" for o in outcomes)
+    all_unreadable = outcomes and all(o == "unreadable" for o in outcomes)
 
     if rejected:
         return "text", "后端明确拒绝图片输入，确认为纯文本模型。"
@@ -289,12 +302,18 @@ def _classify_model_type(
             "已向请求塞入图片，实际能否识别请以运行效果为准。"
         )
         if len(token_counts) > 1 and len(set(token_counts)) == 1:
-            detail += f" 佐证：各轮 prompt_tokens 恒为 {token_counts[0]}，图片可能未真正进入上下文。"
+            detail += f" 说明：各轮 prompt_tokens 恒为 {token_counts[0]}（同尺寸图片 token 数本就相同，仅供参考，不代表图片未进入上下文）。"
         return "multimodal", detail
+    if all_unreadable:
+        return "unknown", (
+            "辨色探测全部无法读取颜色答案（模型接受了图片但答非所问），"
+            "这可能是 OCR/文档类模型的正常行为而非「看不见图」；"
+            "在无视觉信号佐证时判定为 unknown，走 OCR 兜底路径，建议人工指定或检查后端视觉通路。"
+        )
     wrong = [f"{p['asked']}→{p['answered'] or '无法识别'}" for p in probes if p["outcome"] != "correct"]
     detail = f"辨色探测未通过（{'、'.join(wrong)}），后端接受图片但模型看不见内容，判定为纯文本。"
     if len(token_counts) > 1 and len(set(token_counts)) == 1:
-        detail += f" 佐证：各轮 prompt_tokens 恒为 {token_counts[0]}，图片未进入上下文。"
+        detail += f" 说明：各轮 prompt_tokens 恒为 {token_counts[0]}（同尺寸图片 token 数本就相同，仅供参考）。"
     return "text", detail
 
 
