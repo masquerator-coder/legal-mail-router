@@ -605,7 +605,21 @@ async function loadUpdateStatus() {
         var data = await resp.json();
         var el = document.getElementById('update-version');
         var info = data.version || '--';
-        if (data.is_git_repo && data.current_commit) {
+        if (data.container) {
+            info += ' （Docker 部署）';
+            // Docker 镜像内无 .git，禁用在线检查/更新
+            var checkBtn = document.getElementById('check-update-btn');
+            var applyBtn = document.getElementById('apply-update-btn');
+            if (checkBtn) { checkBtn.disabled = true; checkBtn.title = 'Docker 部署请使用 docker compose 更新'; }
+            if (applyBtn) { applyBtn.disabled = true; applyBtn.style.opacity = '0.5'; }
+            var result = document.getElementById('update-result');
+            if (result) {
+                var span = document.createElement('span');
+                span.style.color = '#d69e2e';
+                span.textContent = 'ℹ️ Docker 容器部署不支持在线自动更新，请使用 docker compose build && docker compose up -d 更新';
+                result.appendChild(span);
+            }
+        } else if (data.is_git_repo && data.current_commit) {
             info += ' | #' + data.current_commit;
             if (data.current_branch) info += ' (' + data.current_branch + ')';
         } else if (!data.is_git_repo) {
@@ -638,7 +652,10 @@ async function checkUpdate() {
         });
         var data = await resp.json();
         var span = document.createElement('span');
-        if (data.success) {
+        if (data.container) {
+            span.style.color = '#d69e2e';
+            span.textContent = 'ℹ️ ' + data.message;
+        } else if (data.success) {
             if (data.update_available) {
                 span.style.color = '#38a169';
                 span.textContent = '✅ ' + data.message;

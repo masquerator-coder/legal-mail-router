@@ -68,6 +68,11 @@ def _is_git_repo() -> bool:
     return rc == 0
 
 
+def _is_container_env() -> bool:
+    """检测是否运行在 Docker 容器内（镜像内无 .git，不支持 git 在线更新）"""
+    return os.path.exists("/.dockerenv") or bool(os.environ.get("DOCKER_CONTAINER"))
+
+
 def get_current_commit() -> str:
     """获取当前 HEAD 的短 commit hash"""
     rc, out, _ = _git("rev-parse", "--short", "HEAD")
@@ -157,6 +162,7 @@ async def update_status(request: Request, db: Session = Depends(get_db)):
     return {
         "version": VERSION,
         "is_git_repo": is_git,
+        "container": _is_container_env(),
         "current_commit": commit,
         "current_branch": branch,
         "remote": remote_status,
@@ -171,6 +177,14 @@ async def check_update(request: Request, db: Session = Depends(get_db),
                        form_csrf: str = Form("", alias="_csrf_token")):
     """检查远程更新"""
     check_csrf(request, form_csrf)
+
+    if _is_container_env():
+        return {
+            "success": True,
+            "update_available": False,
+            "container": True,
+            "message": "Docker 容器部署不支持在线自动更新，请使用 docker compose build && docker compose up -d 更新",
+        }
 
     if not _is_git_repo():
         return {"success": False, "message": "当前目录不是 git 仓库"}
@@ -203,6 +217,12 @@ async def check_update(request: Request, db: Session = Depends(get_db),
 async def apply_update(request: Request, form_csrf: str = Form("", alias="_csrf_token")):
     """拉取远程更新并重启服务"""
     check_csrf(request, form_csrf)
+
+    if _is_container_env():
+        return JSONResponse(
+            {"success": False, "message": "Docker 容器部署不支持在线自动更新，请使用 docker compose build && docker compose up -d 更新"},
+            status_code=400,
+        )
 
     if not _is_git_repo():
         return JSONResponse(
@@ -251,6 +271,10 @@ def check_and_apply_auto_update(db: Session) -> dict | None:
     """由 scheduler 定时调用：检查自动更新配置并执行"""
     enabled = _get_setting(db, "auto_update_enabled") == "true"
     if not enabled:
+        return None
+
+    # Docker 容器内无 .git，不支持 git 在线更新
+    if _is_container_env():
         return None
 
     if not _is_git_repo():
