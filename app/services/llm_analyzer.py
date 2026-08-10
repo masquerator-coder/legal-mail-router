@@ -17,10 +17,10 @@ logger = logging.getLogger(__name__)
 _PROMPT_FILE = None  # 缓存文件路径
 
 # ── 文书类型清单（文件驱动） ──
-# 从项目根目录的 文书类型.md 读取；文件缺失时回退内置默认清单
+# 从项目根目录的 文书类型.conf 读取；文件缺失时回退内置默认清单
 _DOC_TYPES_FILE = None  # 缓存文件路径
 
-# 内置默认文书类型（仅当 文书类型.md 缺失或为空时使用）
+# 内置默认文书类型（仅当 文书类型.conf 缺失或为空时使用）
 _DEFAULT_DOC_TYPES = [
     "合同协议", "起诉状", "判决书", "裁定书", "传票",
     "律师函", "证据材料", "通知书", "其他法律文书", "非法律文书",
@@ -31,14 +31,14 @@ _FALLBACK_DOC_TYPES = ("其他法律文书", "非法律文书")
 
 
 def _get_doc_types() -> list:
-    """获取文书类型清单：从 文书类型.md 读取（每行一个类型），缺失时回退内置默认。
+    """获取文书类型清单：从 文书类型.conf 读取（每行一个类型），缺失时回退内置默认。
 
     系统兜底类型（其他法律文书/非法律文书）无论配置文件是否包含都会自动补齐。
     """
     global _DOC_TYPES_FILE
     if _DOC_TYPES_FILE is None:
         from app.config import BASE_DIR
-        _DOC_TYPES_FILE = BASE_DIR / "文书类型.md"
+        _DOC_TYPES_FILE = BASE_DIR / "文书类型.conf"
 
     doc_types = []
     try:
@@ -50,10 +50,10 @@ def _get_doc_types() -> list:
                     if name not in doc_types:
                         doc_types.append(name)
     except Exception as e:
-        logger.error(f"读取 文书类型.md 失败: [{type(e).__name__}] {e}")
+        logger.error(f"读取 文书类型.conf 失败: [{type(e).__name__}] {e}")
 
     if not doc_types:
-        logger.error("文书类型.md 不存在或为空，使用内置默认文书类型清单")
+        logger.error("文书类型.conf 不存在或为空，使用内置默认文书类型清单")
         doc_types = list(_DEFAULT_DOC_TYPES)
     else:
         # 自动补齐系统兜底类型
@@ -380,7 +380,7 @@ def build_classify_prompt(subject: str, sender: str, body: str,
                           custom_prompt: str = "") -> str:
     """构建文书类型识别 prompt（第一阶段）。
 
-    候选类型来自 文书类型.md 配置清单；仅要求 LLM 返回类型与置信度。
+    候选类型来自 文书类型.conf 配置清单；仅要求 LLM 返回类型与置信度。
     custom_prompt 为空时使用默认分类模板，支持 {subject}/{sender}/{body}/{doc_types}/{today} 占位符。
     """
     if not today_str:
