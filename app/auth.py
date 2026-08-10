@@ -24,22 +24,26 @@ AUTH_PREFIX_WHITELIST = {"/static/"}
 
 
 def _get_client_ip(request: Request) -> str:
-    """获取真实客户端 IP，兼容反向代理场景
+    """获取客户端 IP。
 
-    优先级：X-Forwarded-For > X-Real-IP > request.client.host
+    默认只信任直连 socket 地址；仅当部署在反向代理后并显式设置
+    环境变量 TRUSTED_PROXY=1 时才信任 X-Forwarded-For / X-Real-IP。
+    否则攻击者可伪造转发头绕过登录限流。
     """
-    # X-Forwarded-For: client_ip, proxy1, proxy2, ...
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        # 取最左端的真实客户端 IP
-        first_ip = forwarded.split(",")[0].strip()
-        if first_ip:
-            return first_ip
+    trusted_proxy = os.environ.get("TRUSTED_PROXY", "").lower() in ("true", "1", "yes")
+    if trusted_proxy:
+        # X-Forwarded-For: client_ip, proxy1, proxy2, ...
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            # 取最左端的真实客户端 IP
+            first_ip = forwarded.split(",")[0].strip()
+            if first_ip:
+                return first_ip
 
-    # X-Real-IP: Nginx 等代理设置的直通头部
-    real_ip = request.headers.get("X-Real-IP", "")
-    if real_ip:
-        return real_ip.strip()
+        # X-Real-IP: Nginx 等代理设置的直通头部
+        real_ip = request.headers.get("X-Real-IP", "")
+        if real_ip:
+            return real_ip.strip()
 
     # 直连场景
     return request.client.host if request.client else "unknown"
@@ -90,19 +94,21 @@ def hash_password(password: str, salt: bytes = None) -> str:
 
 def verify_password(password: str, stored: str) -> bool:
     """验证密码（自动适配新旧迭代次数）"""
+    import hmac
     try:
         salt_hex, key_hex = stored.split(":", 1)
         salt = bytes.fromhex(salt_hex)
+        key_bytes = bytes.fromhex(key_hex)
         expected = hashlib.pbkdf2_hmac(
             "sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS
         )
-        if expected.hex() == key_hex:
+        if hmac.compare_digest(expected, key_bytes):
             return True
         # 兼容旧版本 100K 迭代
         expected_old = hashlib.pbkdf2_hmac(
             "sha256", password.encode("utf-8"), salt, 100_000
         )
-        return expected_old.hex() == key_hex
+        return hmac.compare_digest(expected_old, key_bytes)
     except Exception:
         return False
 
@@ -123,23 +129,24 @@ def init_admin_password(db: Session):
     """初始化默认管理员密码（如不存在）"""
     existing = db.query(DefaultConfig).filter_by(key="admin_password").first()
     if not existing:
-        import random
+        import secrets
         import string
-        # 生成随机密码
+        # 生成随机密码（secrets 为密码学安全随机源）
         chars = string.ascii_letters + string.digits
-        default_pw = ''.join(random.choice(chars) for _ in range(12))
+        default_pw = ''.join(secrets.choice(chars) for _ in range(12))
         hashed = hash_password(default_pw)
         db.add(DefaultConfig(key="admin_password", value=hashed))
         # 同时生成一个 token 作为初始 API token（备用）
-        token = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(32))
+        token = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
         db.add(DefaultConfig(key="admin_token", value=token))
         db.commit()
         logger.warning("============================================")
         logger.warning("  初始管理员密码已生成，请登录后立即修改！")
         logger.warning("============================================")
-        # 同时输出到 stdout，让非日志用户也能看到
+        # 首次初始化必须向部署者交付初始密码；仅此一次打印。
+        # Docker 部署下会进入 docker logs，属预期的初始化输出，登录后应立即改密。
         print("\n" + "=" * 50, flush=True)
-        print(f"  ⚖️  文书分拣系统 首次启动", flush=True)
+        print(f"  ⚖️  邮件智能分析转发系统 首次启动", flush=True)
         print(f"  管理员用户名: admin", flush=True)
         print(f"  初始密码:     {default_pw}", flush=True)
         print(f"  ⚠️  请登录后立即修改密码！", flush=True)

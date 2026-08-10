@@ -338,7 +338,9 @@ class Mail163Fetcher:
 
     def mark_seen(self, msg_id: str):
         """标记为已读"""
-        self._cmd(f"A MARK{msg_id} STORE {msg_id} +FLAGS (\\Seen)".encode(), f"AMARK{msg_id}")
+        # IMAP 命令格式: <tag> STORE <msg_id> +FLAGS (\Seen)
+        # tag 必须是首个无空格 token（原实现 "A MARK{id}..." 导致命令字非法、永远等不到响应）
+        self._cmd(f"AMARK{msg_id} STORE {msg_id} +FLAGS (\\Seen)".encode(), f"AMARK{msg_id}")
 
     def logout(self):
         if self._sock:
@@ -945,6 +947,8 @@ def save_attachments(parsed_email: ParsedEmail, log_id: int, account_name: str =
     safe_account = account_name.strip()
     # 替换 Windows 非法文件名字符
     safe_account = re.sub(r'[\\/:*?"<>|]', '_', safe_account)
+    # 清理路径穿越组件（防目录逃逸到 data/ 之外）
+    safe_account = safe_account.replace("..", "_")
     # 移除首尾空格和点号（Windows 不兼容）
     safe_account = safe_account.strip('. ')
     # 处理 Windows 保留名（CON, PRN, AUX, NUL, COM1-9, LPT1-9）
@@ -966,8 +970,8 @@ def save_attachments(parsed_email: ParsedEmail, log_id: int, account_name: str =
     date_dir.mkdir(parents=True, exist_ok=True)
 
     for att in parsed_email.attachments:
-        # 安全文件名
-        safe_name = re.sub(r'[\\/:*?"<>|]', '_', att.filename)
+        # 安全文件名（清洗路径穿越组件，防目录逃逸）
+        safe_name = re.sub(r'[\\/:*?"<>|]', '_', att.filename).replace("..", "_").strip('. ')
         file_path = date_dir / safe_name
 
         # 重名处理

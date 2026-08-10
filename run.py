@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-文书分拣系统 — 启动与管理脚本
+邮件智能分析转发系统 — 启动与管理脚本
 
 用法:
   python run.py                    # 前台启动（默认）
@@ -194,7 +194,7 @@ def cmd_start(args):
 
         PID_FILE.write_text(str(proc.pid))
         print(f"\n╔══════════════════════════════════════════╗")
-        print(f"║  ⚖️  文书分拣系统 v1.0.0            ║")
+        print(f"║  ⚖️  邮件智能分析转发系统 v2.0.0            ║")
         print(f"╠══════════════════════════════════════════╣")
         print(f"║  PID:      {proc.pid:<6}                    ║")
         print(f"║  Web UI:   http://localhost:{port}            ║")
@@ -212,11 +212,11 @@ def cmd_start(args):
 
         print(f"""
 ╔══════════════════════════════════════════╗
-║  ⚖️  文书分拣系统 v1.0.0            ║
+║  ⚖️  邮件智能分析转发系统 v2.0.0            ║
 ║  Legal Mail Router                       ║
 ╠══════════════════════════════════════════╣
 ║  Web UI:    http://localhost:{port:<5}       ║
-║  API 文档:  http://localhost:{port}/docs   ║
+║  API 文档:  已禁用（docs/redoc/openapi 关闭）   ║
 ║  按 Ctrl+C 停止                           ║
 ╚══════════════════════════════════════════╝
 """)
@@ -294,7 +294,7 @@ def cmd_status(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="文书分拣系统 — 启动与管理",
+        description="邮件智能分析转发系统 — 启动与管理",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:

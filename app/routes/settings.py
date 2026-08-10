@@ -17,9 +17,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/settings", tags=["系统设置"])
 
+
+def _is_valid_port(value: str) -> bool:
+    """端口必须为 1-65535 的纯数字（防止拼接进 shell 命令执行）"""
+    import re as _re
+    if not _re.fullmatch(r"\d{1,5}", value):
+        return False
+    try:
+        return 1 <= int(value) <= 65535
+    except ValueError:
+        return False
+
 # 可配置的参数键及其默认值
 SETTING_DEFAULTS = {
-    "system_name": "文书分发系统",
+    "system_name": "邮件智能分析转发系统",
     "system_port": "8020",
     "default_check_interval": "30",
     "monitor_days": "7",
@@ -50,9 +61,7 @@ SETTING_DEFAULTS = {
     "auto_update_branch": "main",            # 跟踪分支
     "auto_update_interval_hours": "6",       # 检查间隔（小时）
     # ── 多附件分组分析 ──
-    "attachment_grouping": "false",           # 启用多附件分组分析
-    "classify_use_main_llm": "true",          # 预分类使用主LLM(true)/指定LLM(false)
-    "classify_llm_config_id": "",             # 预分类专用LLM配置ID
+    "attachment_grouping": "false",           # 启用多附件分组分析（分组模型在 LLM 配置页分配）
     # ── 全局发件人黑名单 ──
     "global_sender_blacklist": "",            # 全局排除地址（逗号分隔，所有邮箱共用）
 }
@@ -111,7 +120,7 @@ async def settings_page(request: Request, db: Session = Depends(get_db)):
 async def save_settings(
     request: Request,
     db: Session = Depends(get_db),
-    system_name: str = Form("文书分发系统"),
+    system_name: str = Form("邮件智能分析转发系统"),
     system_port: str = Form("8020"),
     default_check_interval: int = Form(30),
     monitor_days: int = Form(7),
@@ -139,19 +148,28 @@ async def save_settings(
     token_estimation_method: str = Form("approximate"),
     # ── 多附件分组分析 ──
     attachment_grouping: str = Form("false"),
-    classify_use_main_llm: str = Form("true"),
-    classify_llm_config_id: str = Form(""),
     # ── 自动更新 ──
     auto_update_enabled: str = Form("false"),
     auto_update_branch: str = Form("main"),
     auto_update_interval_hours: str = Form("6"),
     form_csrf: str = Form("", alias="_csrf_token"),
 ):
-    """保存所有系统设置"""
+    """保存所有系统设置（支持 AJAX 自动保存与表单提交两种方式）"""
     check_csrf(request, form_csrf)
+    is_ajax = request.headers.get("X-Requested-With") == "fetch" or "application/json" in (request.headers.get("Accept") or "")
+    system_port = system_port.strip()
+    if not _is_valid_port(system_port):
+        if is_ajax:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                {"success": False, "message": f"端口格式无效: {system_port!r}，必须是 1-65535 的纯数字"},
+                status_code=400,
+            )
+        flash(request, f"端口格式无效: {system_port!r}，必须是 1-65535 的纯数字", "error")
+        return RedirectResponse(url="/settings", status_code=303)
     # 保存各项设置
     _save_setting(db, "system_name", system_name.strip())
-    _save_setting(db, "system_port", system_port.strip())
+    _save_setting(db, "system_port", system_port)
     _save_setting(db, "default_check_interval", str(default_check_interval))
     _save_setting(db, "monitor_days", str(monitor_days))
     _save_setting(db, "log_retention_days", str(log_retention_days))
@@ -178,8 +196,6 @@ async def save_settings(
     _save_setting(db, "token_estimation_method", token_estimation_method.strip())
     # ── 多附件分组分析 ──
     _save_setting(db, "attachment_grouping", "true" if attachment_grouping.lower() in ("true", "on", "1") else "false")
-    _save_setting(db, "classify_use_main_llm", "true" if classify_use_main_llm.lower() in ("true", "on", "1") else "false")
-    _save_setting(db, "classify_llm_config_id", classify_llm_config_id.strip())
     # ── 自动更新 ──
     _save_setting(db, "auto_update_enabled", "true" if auto_update_enabled.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "auto_update_branch", auto_update_branch.strip() or "main")
@@ -189,7 +205,7 @@ async def save_settings(
     # 更新全局缓存
     set_system_name(system_name.strip())
     set_system_port(system_port.strip())
-    # Jinja2 全局变量需要显式更新（字符串是不可变对象）
+    # 同步模板全局（字符串为不可变值，需在设置保存后重新赋值）
     request.app.state.templates.env.globals["system_name"] = system_name.strip()
 
     # ⚠️ 不再覆盖已有账户的独立检查间隔
@@ -201,22 +217,23 @@ async def save_settings(
         import os as _os
         is_docker = _os.path.exists("/.dockerenv") or _os.environ.get("DOCKER_CONTAINER", "")
         if is_docker:
-            docker_port = _os.environ.get("PORT", "8020")
-            flash(
-                request,
+            msg = (
                 f"设置已保存。⚠️ Docker 环境下端口由 docker-compose.yml 控制（当前容器端口: {docker_port}）。"
-                f"修改端口需同步更新 docker-compose.yml 的 ports 映射和 PORT 环境变量后重建容器。",
-                "warning",
+                f"修改端口需同步更新 docker-compose.yml 的 ports 映射和 PORT 环境变量后重建容器。"
             )
         else:
-            flash(
-                request,
-                f"设置已保存。⚠️ 端口已改为 {system_port}，需要手动重启服务才能生效",
-                "warning",
-            )
+            msg = f"设置已保存。⚠️ 端口已改为 {system_port}，需要手动重启服务才能生效"
     else:
-        flash(request, "系统设置已保存", "success")
+        msg = "系统设置已保存"
 
+    if is_ajax:
+        return {
+            "success": True,
+            "message": msg,
+            "port_changed": port_changed,
+        }
+
+    flash(request, msg, "warning" if port_changed else "success")
     return RedirectResponse(url="/settings", status_code=303)
 
 
@@ -252,21 +269,24 @@ async def restart_service(request: Request, form_csrf: str = Form("", alias="_cs
 
     def do_restart():
         time.sleep(1.0)  # 等待 HTTP 响应发送完成
-        # 生成延迟启动的辅助进程：先等当前进程退出释放端口，再启动 uvicorn
+        # 防御: 数据库 system_port 若为脏数据则回退默认端口
+        # （用新变量名，避免对内层函数闭包变量赋值触发 UnboundLocalError）
+        safe_port = port if _is_valid_port(port) else "8020"
+        # 参数列表形式启动 uvicorn（不使用 shell 拼接，杜绝命令注入）
+        base_cmd = [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", safe_port]
+        time.sleep(2.0)  # 再等 2 秒，确保当前 uvicorn 退出释放端口
         if sys.platform == "win32":
-            # Windows: 使用 ping 延迟 + 启动
-            cmd = f'ping 127.0.0.1 -n 3 > nul && {sys.executable} -m uvicorn app.main:app --host 0.0.0.0 --port {port}'
+            # Windows: 脱离当前进程组启动，避免 os._exit 连带杀死子进程
             subprocess.Popen(
-                ["cmd.exe", "/c", cmd],
+                base_cmd,
                 close_fds=True,
                 creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
                 cwd=str(Path(__file__).resolve().parent.parent.parent),
             )
         else:
-            # Linux/Mac: 使用 sleep + exec 方式
-            startup = f'sleep 2; exec {sys.executable} -m uvicorn app.main:app --host 0.0.0.0 --port {port}'
+            # Linux/Mac: 新会话启动，脱离当前进程组
             subprocess.Popen(
-                ["/bin/sh", "-c", startup],
+                base_cmd,
                 close_fds=True,
                 start_new_session=True,
                 cwd=str(Path(__file__).resolve().parent.parent.parent),
@@ -316,10 +336,12 @@ async def detect_context_window_endpoint(request: Request, db: Session = Depends
     from app.models import LLMConfig
     from app.config import decrypt
     from app.services.llm_analyzer import detect_context_window
+    from app.services.scheduler import _get_role_llm_cfg
 
-    llm = db.query(LLMConfig).filter_by(is_active=True).first()
+    # 探测文书解读模型（第二阶段）的上下文窗口
+    llm = _get_role_llm_cfg(db, "analyzer")
     if not llm:
-        return {"success": False, "message": "未找到激活的 LLM 配置"}
+        return {"success": False, "message": "未找到文书解读模型配置，请在 LLM 配置页分配角色"}
 
     try:
         api_key = decrypt(llm.api_key_encrypted) if llm.api_key_encrypted else ""

@@ -200,9 +200,24 @@ def _load_context(account_id: int) -> dict | None:
             _update_progress(running=False, step="error", step_label="账户不存在或已禁用")
             return None
 
-        llm_cfg = db.query(LLMConfig).filter_by(is_active=True).first()
+        llm_cfg = _get_role_llm_cfg(db, "analyzer")
         if not llm_cfg:
-            logger.warning("没有激活的 LLM 配置，将仅靠关键词匹配路由规则")
+            logger.warning("没有激活的 LLM 分析配置，将仅靠关键词匹配路由规则")
+
+        # 类型识别模型（第一阶段）；未配置时回退使用文书解读模型
+        classifier_row = _get_role_llm_cfg(db, "classifier")
+        classifier_cfg = None
+        if classifier_row:
+            c_prompt = classifier_row.analysis_prompt or ""
+            # 若类型识别回退到与文书解读同一模型，第一阶段使用默认分类模板（避免误用分析模板）
+            if llm_cfg and classifier_row.id == llm_cfg.id:
+                c_prompt = ""
+            classifier_cfg = {
+                "api_url": classifier_row.api_url,
+                "api_key_encrypted": classifier_row.api_key_encrypted,
+                "model_name": classifier_row.model_name,
+                "analysis_prompt": c_prompt,
+            }
 
         ocr_cfg_row = db.query(OCRConfig).filter_by(is_active=True).first()
         _ocr_cfg = None
@@ -223,6 +238,7 @@ def _load_context(account_id: int) -> dict | None:
         return {
             "account": account,
             "llm_cfg": llm_cfg,
+            "classifier_cfg": classifier_cfg,
             "ocr_cfg": _ocr_cfg,
             "monitor_days": int(_read_setting("monitor_days", "7")),
             "llm_retry_interval": int(_read_setting("llm_retry_interval", "10")),
@@ -235,8 +251,6 @@ def _load_context(account_id: int) -> dict | None:
             "llm_timeout": int(_read_setting("llm_timeout", "180")),
             # ── 多附件分组分析 ──
             "attachment_grouping": _read_setting("attachment_grouping", "false") == "true",
-            "classify_use_main_llm": _read_setting("classify_use_main_llm", "true") == "true",
-            "classify_llm_config_id": _read_setting("classify_llm_config_id", ""),
             # ── 全局发件人黑名单 ──
             "global_sender_blacklist": _read_setting("global_sender_blacklist", ""),
         }
@@ -244,15 +258,64 @@ def _load_context(account_id: int) -> dict | None:
         db.close()
 
 
+# 模型角色 → DefaultConfig 键（角色在 LLM 配置页分配）
+_LLM_ROLE_KEYS = {
+    "group": "llm_role_group",           # 分组模型（多文书分组）
+    "classifier": "llm_role_classifier",  # 类型识别模型（第一阶段）
+    "analyzer": "llm_role_analyzer",      # 文书解读审核模型（第二阶段）
+}
+
+
+def _get_role_llm_cfg(db, role: str = "analyzer"):
+    """按角色获取 LLM 配置。
+
+    role: group=分组 / classifier=类型识别 / analyzer=文书解读审核。
+    角色在 LLM 配置页分配（DefaultConfig 存模型 ID）。未配置时自动回退：
+      classifier → analyzer；group → analyzer；analyzer → 第一个激活配置。
+    兼容旧 config_role 字段：角色未配置时按旧字段推断（classifier/analyzer）。
+    """
+    from app.models import LLMConfig, DefaultConfig
+
+    key = _LLM_ROLE_KEYS.get(role)
+    if key:
+        row = db.query(DefaultConfig).filter_by(key=key).first()
+        model_id = (row.value or "").strip() if row else ""
+        if model_id.isdigit():
+            model = db.query(LLMConfig).filter_by(id=int(model_id)).first()
+            if model:
+                return model
+
+    # 未配置/无效 → 兼容旧 config_role 或回退
+    if role == "classifier":
+        legacy = db.query(LLMConfig).filter(
+            LLMConfig.is_active == True,  # noqa: E712
+            LLMConfig.config_role == "classifier",
+        ).order_by(LLMConfig.id).first()
+        if legacy:
+            return legacy
+        return _get_role_llm_cfg(db, "analyzer")
+    if role == "group":
+        return _get_role_llm_cfg(db, "analyzer")
+    # analyzer：兼容旧数据（此前手动激活过的配置优先），否则回退第一个模型
+    legacy = db.query(LLMConfig).filter(
+        LLMConfig.is_active == True,  # noqa: E712
+    ).order_by(LLMConfig.id).first()
+    if legacy:
+        return legacy
+    return db.query(LLMConfig).order_by(LLMConfig.id).first()
+
+
 def _get_classify_llm_config(ctx: dict, db):
-    """获取预分类用的 LLM 配置，返回 LLMConfig 对象或 None"""
-    if ctx.get("classify_use_main_llm", True):
-        return ctx.get("llm_cfg")
-    config_id = ctx.get("classify_llm_config_id", "").strip()
-    if config_id and config_id.isdigit():
-        from app.models import LLMConfig
-        return db.query(LLMConfig).filter_by(id=int(config_id)).first()
-    return None
+    """获取分组分析用的 LLM 配置（角色：分组模型），返回 LLMConfig 对象或 None"""
+    from app.models import LLMConfig, DefaultConfig
+    # 分组角色：DefaultConfig llm_role_group；未配置回退文书解读模型
+    row = db.query(DefaultConfig).filter_by(key="llm_role_group").first()
+    model_id = (row.value or "").strip() if row else ""
+    if model_id.isdigit():
+        model = db.query(LLMConfig).filter_by(id=int(model_id)).first()
+        if model:
+            return model
+    return _get_role_llm_cfg(db, "analyzer")
 
 
 def _classify_attachments(eml, per_att_results: dict, ctx: dict, db) -> list[list[int]]:
@@ -288,22 +351,13 @@ def _classify_attachments(eml, per_att_results: dict, ctx: dict, db) -> list[lis
         entries.append(f"{idx}. {att.filename}\n   内容预览: {preview}")
     
     file_list = "\n".join(entries)
-    classify_prompt = f"""你是法律文档分类助手。以下是邮件附件列表及内容预览，请判断这些附件：
-A) 属于同一份法律文书的组成部分（如合同正文+附件表格+签章页）→ 归为一组
-B) 包含多份独立的不同文书 → 各自成组
-
-邮件主题：{eml.subject[:200]}
-
-附件列表：
-{file_list}
-
-请返回 JSON（只返回 JSON，不要多余文字）：
-{{"groups": [[indices...], ...]}}
-
-示例1（采购合同+报价单+保密协议）: {{"groups": [[0, 1], [2]]}}
-示例2（起诉状+证据清单+证据材料+证据1）: {{"groups": [[0, 1, 2, 3]]}}
-示例3（只有1个附件）: {{"groups": [[0]]}}
-"""
+    # 使用分组模板（自定义模板来自分组模型的 analysis_prompt，未配置时用内置默认）
+    from app.services.llm_analyzer import build_group_prompt
+    classify_prompt = build_group_prompt(
+        subject=eml.subject[:200],
+        file_list=file_list,
+        custom_prompt=(classify_llm.analysis_prompt or "").strip(),
+    )
     try:
         from app.services.email_fetcher import _run_async_safe
         from app.services.llm_analyzer import analyze_email
@@ -423,7 +477,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     llm_cfg = ctx["llm_cfg"]
 
     # 跳过已被转发的副本（检查 X-Forwarded-By 自定义邮件头）
-    if eml.headers.get("x-forwarded-by") == "文书分拣系统":
+    if eml.headers.get("x-forwarded-by") == "邮件智能分析转发系统":
         logger.info(f"跳过转发副本: {eml.subject}")
         return
 
@@ -559,6 +613,15 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     all_llm_failed = False
     revision_paths = []
     review_paths = []
+
+    def _cleanup_temp_docx():
+        """清理本次生成的临时 docx（修改版文书/审核意见），原始下载附件保留"""
+        for _tmp_path in list(revision_paths) + list(review_paths):
+            try:
+                os.remove(_tmp_path)
+            except OSError as _e:
+                logger.warning(f"清理临时文书失败: {_tmp_path} — {_e}")
+
     # 防附件文件名重复计数器
     _seen_revision_names = {}  # base_name → count
 
@@ -579,7 +642,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
         group_label = f"第{g_idx + 1}组" if is_grouping else "文书"
         logger.info(f"分析 {group_label}: 附件索引 {indices}")
 
-        # LLM 分析
+        # ── 两阶段分析：先类型识别，再按类型分析 ──
         g_analysis, g_failed = _run_llm_analysis(
             llm_cfg=llm_cfg,
             eml=eml,
@@ -594,6 +657,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
             context_window=context_window,
             usage_ratio=usage_ratio,
             token_method=token_method,
+            classifier_cfg=ctx.get("classifier_cfg"),
         )
         all_analyses.append(g_analysis)
         if g_failed:
@@ -736,6 +800,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
         log=log,
     )
     if not forward_targets:
+        _cleanup_temp_docx()  # 已生成的临时 docx 需清理（否则此提前返回路径会泄漏）
         return  # skipped or failed, already committed
 
     # ── 执行 SMTP 转发（循环发送到所有目标） ──
@@ -743,7 +808,10 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     from app.config import ATTACHMENTS_DIR, resolve_attachment_path
     full_attachment_paths = []
     for att in attachment_records:
-        full_attachment_paths.append(str(resolve_attachment_path(att["file_path"])))
+        try:
+            full_attachment_paths.append(str(resolve_attachment_path(att["file_path"])))
+        except ValueError:
+            logger.warning(f"附件路径越界，跳过转发: {att.get('file_path')}")
     output_mode_cfg = db.query(DefaultConfig).filter_by(key="analysis_output_mode").first()
     analysis_output_mode = output_mode_cfg.value if output_mode_cfg and output_mode_cfg.value else "attachment"
 
@@ -783,6 +851,9 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
         log.status = "failed"
         log.error_message = last_error
 
+    # 清理临时生成的 docx（修改版文书/审核意见），原始下载附件保留
+    _cleanup_temp_docx()
+
 
 
 
@@ -793,10 +864,11 @@ def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: li
                       timeout: int = 180,
                       context_window: int = 0,
                       usage_ratio: float = 0.50,
-                      token_method: str = "approximate") -> tuple[dict | None, bool]:
+                      token_method: str = "approximate",
+                      classifier_cfg: dict = None) -> tuple[dict | None, bool]:
     """执行 LLM 分析（含重试），返回 (analysis, llm_failed)"""
     from app.services.email_fetcher import _run_async_safe
-    from app.services.llm_analyzer import analyze_email
+    from app.services.llm_analyzer import analyze_email_two_stage
 
     if not llm_cfg:
         fallback = {
@@ -824,7 +896,7 @@ def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: li
 
         try:
             analysis = _run_async_safe(
-                analyze_email(
+                analyze_email_two_stage(
                     api_url=llm_cfg.api_url,
                     api_key_encrypted=llm_cfg.api_key_encrypted,
                     model_name=llm_cfg.model_name,
@@ -843,6 +915,7 @@ def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: li
                     context_window=context_window,
                     usage_ratio=usage_ratio,
                     token_method=token_method,
+                    classifier_cfg=classifier_cfg,
                 )
             )
 
@@ -917,6 +990,7 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
     # ── 法律文书 → 查路由规则 ──
     targets = []
     seen = set()
+    matched_rule_with_smtp = None  # 首个配置了独立 SMTP 的命中规则
     all_rules = db.query(RoutingRule).filter_by(enabled=True).order_by(RoutingRule.id).all()
     for rule in all_rules:
         ids_str = (rule.account_ids or "").strip()
@@ -933,9 +1007,13 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
                 if str(account.id) in ids:
                     targets.append(email)
                     seen.add(email)
+                    if rule.smtp_host and matched_rule_with_smtp is None:
+                        matched_rule_with_smtp = rule
             else:
                 targets.append(email)
                 seen.add(email)
+                if rule.smtp_host and matched_rule_with_smtp is None:
+                    matched_rule_with_smtp = rule
 
     if not targets:
         default_email = db.query(DefaultConfig).filter_by(key="default_forward_email").first()
@@ -948,65 +1026,28 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
         return []
 
     log.target_email = ",".join(targets)
-    smtp = _infer_smtp_from_account(account) or get_default_smtp_config(db)
+
+    # SMTP 选择优先级：规则级配置 → 系统默认 → 从 IMAP 账户推断
+    # （账户推断用 IMAP 授权码当 SMTP 密码，仅在无任何显式配置时兜底）
+    smtp = None
+    if matched_rule_with_smtp:
+        smtp = {
+            "host": matched_rule_with_smtp.smtp_host,
+            "port": matched_rule_with_smtp.smtp_port or 587,
+            "username": matched_rule_with_smtp.smtp_username or account.username,
+            "password_encrypted": matched_rule_with_smtp.smtp_password_encrypted or account.password_encrypted,
+        }
+        logger.info(f"规则级 SMTP: {smtp['host']}:{smtp['port']} (规则 #{matched_rule_with_smtp.id})")
+    if not smtp:
+        smtp = get_default_smtp_config(db)
+    if not smtp:
+        smtp = _infer_smtp_from_account(account)
     if not smtp:
         log.status = "failed"
         log.error_message = "未配置 SMTP 服务器"
         return []
 
     return [{"email": t, "smtp_cfg": smtp} for t in targets]
-
-
-def _load_doc_template(db, doc_type: str, account_id: int | None = None) -> str | None:
-    """
-    加载指定文书类型的默认模板。
-
-    匹配策略：账户专属(exact) → 账户专属(fuzzy) → 全局(exact) → 全局(fuzzy)
-    返回模板全文或 None。
-    """
-    from app.models import DocTemplate
-
-    if not doc_type:
-        return None
-
-    # ── 第一层：账户专属精确匹配 ──
-    if account_id:
-        tmpl = db.query(DocTemplate).filter_by(
-            account_id=account_id, doc_type=doc_type, is_default=True
-        ).first()
-        if tmpl:
-            logger.debug(f"加载模板(账户): {tmpl.name} ({doc_type})")
-            return tmpl.content
-
-        # 账户专属模糊匹配
-        tmpl = db.query(DocTemplate).filter(
-            DocTemplate.account_id == account_id,
-            DocTemplate.doc_type.like(f"%{doc_type}%"),
-            DocTemplate.is_default.is_(True),
-        ).first()
-        if tmpl:
-            logger.debug(f"加载模板(账户模糊): {tmpl.name} ({tmpl.doc_type} ≈ {doc_type})")
-            return tmpl.content
-
-    # ── 第二层：全局精确匹配 ──
-    tmpl = db.query(DocTemplate).filter_by(
-        account_id=None, doc_type=doc_type, is_default=True
-    ).first()
-    if tmpl:
-        logger.debug(f"加载模板(全局): {tmpl.name} ({doc_type})")
-        return tmpl.content
-
-    # 全局模糊匹配
-    tmpl = db.query(DocTemplate).filter(
-        DocTemplate.account_id.is_(None),
-        DocTemplate.doc_type.like(f"%{doc_type}%"),
-        DocTemplate.is_default.is_(True),
-    ).first()
-    if tmpl:
-        logger.debug(f"加载模板(全局模糊): {tmpl.name} ({tmpl.doc_type} ≈ {doc_type})")
-        return tmpl.content
-
-    return None
 
 
 def _infer_smtp_from_account(account) -> Optional[dict]:
@@ -1101,7 +1142,11 @@ def cleanup_old_attachments():
             attachment_paths_to_delete = []
             for att in log_entry.attachments:
                 if att.file_path:
-                    full_path = resolve_attachment_path(att.file_path)
+                    try:
+                        full_path = resolve_attachment_path(att.file_path)
+                    except ValueError:
+                        logger.warning(f"附件路径越界，跳过清理: {att.file_path}")
+                        continue
                     attachment_paths_to_delete.append(full_path)
 
             # 先删除数据库记录（包含附件记录 + 日志）
@@ -1110,6 +1155,7 @@ def cleanup_old_attachments():
             deleted_logs += 1
 
             # 数据库提交后再删物理文件，防止失败回滚后文件丢失
+            db.commit()
             for full_path in attachment_paths_to_delete:
                 if full_path.exists():
                     try:
@@ -1117,8 +1163,6 @@ def cleanup_old_attachments():
                         deleted_files += 1
                     except OSError as e:
                         logger.warning(f"删除附件文件失败: {full_path} — {e}")
-
-        db.commit()
 
         # 清理空的子目录（双层: account_name/YYYY-MM-DD）
         for account_dir in ATTACHMENTS_DIR.iterdir():
@@ -1298,8 +1342,8 @@ def send_daily_report():
                 "interval": acc.check_interval,
             })
 
-        # LLM 状态
-        llm_cfg = db.query(LLMConfig).filter_by(is_active=True).first()
+        # LLM 状态（主分析 LLM）
+        llm_cfg = _get_role_llm_cfg(db, "analyzer")
         llm_status = f"{llm_cfg.model_name} ({llm_cfg.name})" if llm_cfg else "未启用"
         llm_type = llm_cfg.model_type if llm_cfg else "N/A"
 
@@ -1313,7 +1357,7 @@ def send_daily_report():
 
         # 系统名称
         sys_name_cfg = db.query(DefaultConfig).filter_by(key="system_name").first()
-        sys_name = sys_name_cfg.value if sys_name_cfg else "文书分发系统"
+        sys_name = sys_name_cfg.value if sys_name_cfg else "邮件智能分析转发系统"
 
         now_str = datetime.now().strftime("%Y年%m月%d日 %H:%M")
 
@@ -1388,7 +1432,7 @@ def send_daily_report():
         msg["From"] = from_email
         msg["To"] = to_email
         msg["Subject"] = report_subject
-        msg["X-Forwarded-By"] = "文书分发系统"
+        msg["X-Forwarded-By"] = "邮件智能分析转发系统"
 
         server = None
         try:

@@ -5,8 +5,8 @@ from datetime import datetime
 from fastapi import APIRouter, Request, Depends, Form
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from app.database import get_db
-from app.models import EmailAccount, LLMConfig, EmailLog, DefaultConfig
+from app.database import get_db, db_retry_commit
+from app.models import EmailAccount, EmailLog, DefaultConfig
 from app.csrf import check_csrf
 router = APIRouter(prefix="/dashboard", tags=["仪表盘"])
 
@@ -32,7 +32,9 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
     ).scalar()
 
     accounts = db.query(EmailAccount).all()
-    active_llm = db.query(LLMConfig).filter_by(is_active=True).first()
+    # 激活由「模型角色分配」决定：显示文书解读模型（第二阶段）
+    from app.services.scheduler import _get_role_llm_cfg
+    active_llm = _get_role_llm_cfg(db, "analyzer")
     recent_logs = db.query(EmailLog).order_by(EmailLog.created_at.desc()).limit(10).all()
 
     from app.services.scheduler import scheduler
@@ -102,7 +104,7 @@ async def save_settings(
         cfg.value = str(default_interval)
     else:
         db.add(DefaultConfig(key="default_check_interval", value=str(default_interval)))
-    db.commit()
+    db_retry_commit(db)
 
     # ⚠️ 不再覆盖已有账户的独立检查间隔
     # 系统默认间隔仅影响新建账户的初始值

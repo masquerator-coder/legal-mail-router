@@ -1,14 +1,17 @@
 FROM python:3.12-slim-bookworm
 
 LABEL maintainer="legal-mail-router"
-LABEL description="文书分拣系统 - AI 驱动的法律邮件自动分拣与转发"
+LABEL description="邮件智能分析转发系统 - AI 驱动的法律邮件自动分拣与转发"
 
 WORKDIR /app
 
+# 镜像源可通过 --build-arg 覆盖（默认国内清华源，外网部署可换官方源）
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
 # 安装系统依赖（PyMuPDF 需要）+ antiword 用于 .doc 文本提取
-# 使用国内 Debian 镜像加速（首次部署可用，后续可注释掉）
-RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
-    sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list 2>/dev/null; \
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null; \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         tzdata \
@@ -20,19 +23,23 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.li
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# 安装 Python 依赖（使用国内 PyPI 镜像加速）
+# 安装 Python 依赖（镜像源可用 --build-arg PIP_INDEX_URL 覆盖）
 COPY pyproject.toml .
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -e . && \
-    pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple uvicorn
+RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} -e . && \
+    pip install --no-cache-dir -i ${PIP_INDEX_URL} uvicorn
 
 # 复制应用代码（config/ 已合并到 app/services/ 中）
 COPY app/ ./app/
 COPY templates/ ./templates/
 COPY static/ ./static/
-COPY LLM提示词.md ./
+COPY LLM提示词模板.md ./
+COPY 文书类型.md ./
+COPY 分析提示词/ ./分析提示词/
 
-# 创建数据目录
-RUN mkdir -p /app/data/attachments
+# 创建数据目录并以非 root 用户运行（降低容器被攻破后的影响面）
+RUN mkdir -p /app/data/attachments && \
+    useradd -r -m -u 10001 appuser && \
+    chown -R appuser:appuser /app/data /app
 
 # 默认端口（可通过 docker run -e PORT=9000 或 docker-compose 覆盖）
 ENV PORT=8020
@@ -47,4 +54,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # 启动（使用 entrypoint 脚本支持 PORT 环境变量）
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
+USER appuser
 ENTRYPOINT ["/docker-entrypoint.sh"]

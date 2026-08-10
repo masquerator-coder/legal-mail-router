@@ -2,25 +2,68 @@
 {% block content %}
 <div class="page-header">
     <h2>🤖 LLM 配置</h2>
-    <p>配置大模型 API 用于两阶段文书分析：先识别类型，再详细解读审核</p>
+    <p>管理大模型 API 配置，并分配各模型承担的角色（分组 / 类型识别 / 文书解读审核）</p>
 </div>
 
 <div style="margin-bottom:20px;">
     <button class="btn btn-primary" onclick="openModal('add-llm-modal')">➕ 添加配置</button>
 </div>
 
+<div class="card" style="margin-bottom:20px;">
+    <div class="card-header"><h3>🎯 模型角色分配</h3></div>
+    <div class="card-body">
+        <form method="post" action="/llm-config/roles">
+            {{ csrf_token_input(request)|safe }}
+            <p style="color:var(--text-muted); font-size:13px; margin-top:0;">被分配为某角色的模型即为该类的激活模型（每类仅一个）。卡片左侧色条与徽章颜色区分角色：🔍 橙=类型识别、📋 蓝=文书解读、🗂 紫=分组。</p>
+            <div class="form-row">
+                <div class="form-group" style="flex:1;">
+                    <label>🔍 类型识别模型（第一阶段）</label>
+                    <select class="form-control" name="classifier_model">
+                        <option value="">自动（回退到文书解读模型）</option>
+                        {% for c in configs %}
+                        <option value="{{ c.id }}" {% if roles.classifier == c.id|string %}selected{% endif %}>{{ c.name }} ({{ c.model_name }})</option>
+                        {% endfor %}
+                    </select>
+                    <small style="color:var(--text-muted);">判断邮件/附件属于哪类文书。未指定时自动复用文书解读模型。</small>
+                </div>
+                <div class="form-group" style="flex:1;">
+                    <label>📋 文书解读审核模型（第二阶段）</label>
+                    <select class="form-control" name="analyzer_model">
+                        <option value="">自动（回退到第一个模型）</option>
+                        {% for c in configs %}
+                        <option value="{{ c.id }}" {% if roles.analyzer == c.id|string %}selected{% endif %}>{{ c.name }} ({{ c.model_name }})</option>
+                        {% endfor %}
+                    </select>
+                    <small style="color:var(--text-muted);">按文书类型嵌入分析流程提示词，进行详细解读审核。</small>
+                </div>
+                <div class="form-group" style="flex:1;">
+                    <label>🗂 分组模型（多文书分组）</label>
+                    <select class="form-control" name="group_model">
+                        <option value="">自动（复用文书解读模型）</option>
+                        {% for c in configs %}
+                        <option value="{{ c.id }}" {% if roles.group == c.id|string %}selected{% endif %}>{{ c.name }} ({{ c.model_name }})</option>
+                        {% endfor %}
+                    </select>
+                    <small style="color:var(--text-muted);">判断一封邮件的多个附件是否属于同一份文书。</small>
+                </div>
+            </div>
+            <div style="margin-top:12px; text-align:right;">
+                <button type="submit" class="btn btn-primary">💾 保存角色分配</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 {% if configs %}
 {% for cfg in configs %}
-<div class="card">
+<div class="card" style="{% if roles.classifier == cfg.id|string %}border-left:5px solid #f59e0b;{% elif roles.analyzer == cfg.id|string %}border-left:5px solid #3182ce;{% elif roles.group == cfg.id|string %}border-left:5px solid #8b5cf6;{% endif %}">
     <div class="card-header">
-        <h3>{{ cfg.name }} {% if cfg.is_active %}<span class="badge badge-success" style="margin-left:8px;">激活</span>{% endif %}</h3>
+        <h3>{{ cfg.name }}
+            {% if roles.classifier == cfg.id|string %}<span class="badge" style="background:#f59e0b;color:#fff;margin-left:8px;">🔍 类型识别</span>{% endif %}
+            {% if roles.analyzer == cfg.id|string %}<span class="badge" style="background:#3182ce;color:#fff;margin-left:8px;">📋 文书解读</span>{% endif %}
+            {% if roles.group == cfg.id|string %}<span class="badge" style="background:#8b5cf6;color:#fff;margin-left:8px;">🗂 分组</span>{% endif %}
+        </h3>
         <div>
-            {% if not cfg.is_active %}
-            <form method="post" action="/llm-config/activate/{{ cfg.id }}" style="display:inline;">
-                {{ csrf_token_input(request)|safe }}
-                <button type="submit" class="btn btn-success btn-sm">✅ 激活</button>
-            </form>
-            {% endif %}
             <button class="btn btn-outline btn-sm" id="llm-test-btn-{{ cfg.id }}" onclick="testLLMConnection({{ cfg.id }})">🔗 测试连接</button>
             <button class="btn btn-outline btn-sm" onclick="openModal('edit-llm-modal-{{ cfg.id }}')">✏️ 编辑</button>
             <form method="post" action="/llm-config/delete/{{ cfg.id }}" style="display:inline;" onsubmit="return confirm('确定删除？')">
@@ -101,17 +144,14 @@
                     <div class="form-group"><label>temperature</label><input class="form-control" type="number" step="0.1" name="temperature" value="{{ cfg.temperature }}"></div>
                 </div>
                 <div class="form-group">
-                    <label>📋 提示词模板（两阶段：先识别文书类型，再详细解读审核）</label>
+                    <label>📋 提示词模板</label>
                     <div style="margin-bottom:6px;">
-                        <button type="button" class="btn btn-outline btn-xs" onclick="resetToDefault('prompt-edit-{{ cfg.id }}')">🔄 恢复默认模板</button>
+                        <button type="button" class="btn btn-outline btn-xs" onclick="fillDefaultPrompt('prompt-edit-{{ cfg.id }}', 'group')">🗂 填充分组模板</button>
+                        <button type="button" class="btn btn-outline btn-xs" onclick="fillDefaultPrompt('prompt-edit-{{ cfg.id }}', 'classifier')">🔍 填充类型识别模板</button>
+                        <button type="button" class="btn btn-outline btn-xs" onclick="fillDefaultPrompt('prompt-edit-{{ cfg.id }}', 'analyzer')">📋 填充文书解读模板</button>
                     </div>
                     <textarea class="form-control" name="analysis_prompt" id="prompt-edit-{{ cfg.id }}" rows="10" style="font-family:monospace; font-size:12px;">{{ cfg.analysis_prompt }}</textarea>
-                    <small style="color:var(--text-muted);">可用变量：{"{subject}"}, {"{sender}"}, {"{body}"}, {"{doc_types}"}（从路由规则自动填充）。留空则使用系统默认的两阶段模板。</small>
-                </div>
-                <div class="form-check">
-                    <input type="hidden" name="is_active" value="false">
-                    <input type="checkbox" name="is_active" value="true" {% if cfg.is_active %}checked{% endif %}>
-                    <span>设为激活</span>
+                    <small style="color:var(--text-muted);">分组模板变量：{"{subject}"}, {"{file_list}"}；类型识别模板变量：{"{subject}"}, {"{sender}"}, {"{body}"}, {"{doc_types}"}；文书解读模板变量：{"{subject}"}, {"{sender}"}, {"{body}"}, {"{today}"}, {"{analysis_instructions}"}。按该模型承担的角色填充对应模板；同一模型需承担多个角色时，请添加多个配置分别填充。留空使用系统默认模板。该模型的激活状态由「模型角色分配」决定。</small>
                 </div>
                 <div style="margin-top:20px; text-align:right;">
                     <button type="button" class="btn btn-outline" onclick="closeModal('edit-llm-modal-{{ cfg.id }}')">取消</button>
@@ -162,17 +202,14 @@
                     <div class="form-group"><label>temperature</label><input class="form-control" type="number" step="0.1" name="temperature" value="0.3"></div>
                 </div>
                 <div class="form-group">
-                    <label>📋 提示词模板（两阶段：先识别文书类型，再详细解读审核）</label>
+                    <label>📋 提示词模板</label>
                     <div style="margin-bottom:6px;">
-                        <button type="button" class="btn btn-outline btn-xs" onclick="resetToDefault('prompt-add')">🔄 填充默认模板</button>
+                        <button type="button" class="btn btn-outline btn-xs" onclick="fillDefaultPrompt('prompt-add', 'group')">🗂 填充分组模板</button>
+                        <button type="button" class="btn btn-outline btn-xs" onclick="fillDefaultPrompt('prompt-add', 'classifier')">🔍 填充类型识别模板</button>
+                        <button type="button" class="btn btn-outline btn-xs" onclick="fillDefaultPrompt('prompt-add', 'analyzer')">📋 填充文书解读模板</button>
                     </div>
-                    <textarea class="form-control" name="analysis_prompt" id="prompt-add" rows="10" style="font-family:monospace; font-size:12px;" placeholder="留空使用系统默认的两阶段提示词模板"></textarea>
-                    <small style="color:var(--text-muted);">可用变量：{"{subject}"}, {"{sender}"}, {"{body}"}, {"{doc_types}"}（从路由规则自动填充）。留空则使用系统默认模板。</small>
-                </div>
-                <div class="form-check">
-                    <input type="hidden" name="is_active" value="false">
-                    <input type="checkbox" name="is_active" value="true" checked>
-                    <span>设为激活</span>
+                    <textarea class="form-control" name="analysis_prompt" id="prompt-add" rows="10" style="font-family:monospace; font-size:12px;" placeholder="留空使用系统默认模板"></textarea>
+                    <small style="color:var(--text-muted);">分组模板变量：{"{subject}"}, {"{file_list}"}；类型识别模板变量：{"{subject}"}, {"{sender}"}, {"{body}"}, {"{doc_types}"}；文书解读模板变量：{"{subject}"}, {"{sender}"}, {"{body}"}, {"{today}"}, {"{analysis_instructions}"}。按该模型承担的角色填充对应模板；同一模型需承担多个角色时，请添加多个配置分别填充。留空使用系统默认模板。该模型的激活状态由「模型角色分配」决定。</small>
                 </div>
                 <div style="margin-top:20px; text-align:right;">
                     <button type="button" class="btn btn-outline" onclick="closeModal('add-llm-modal')">取消</button>
@@ -186,11 +223,11 @@
 
 {% block scripts %}
 <script>
-async function resetToDefault(textareaId) {
+async function fillDefaultPrompt(textareaId, role) {
     var ta = document.getElementById(textareaId);
     if (!ta) return;
     try {
-        var resp = await fetch('/llm-config/default-prompt');
+        var resp = await fetch('/llm-config/default-prompt?role=' + encodeURIComponent(role || 'analyzer'));
         var data = await resp.json();
         ta.value = data.prompt || '';
     } catch(e) {

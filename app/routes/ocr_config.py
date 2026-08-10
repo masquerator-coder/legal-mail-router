@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Request, Depends, Form
 from fastapi.responses import RedirectResponse, JSONResponse
 from sqlalchemy.orm import Session
-from app.database import get_db
+from app.database import get_db, db_retry_commit
 from app.models import OCRConfig
 from app.config import encrypt, decrypt
 from app.services.scheduler import scheduler
@@ -58,7 +58,7 @@ async def add_ocr_config(
         pdf_capable=_pdf_capable,
     )
     db.add(cfg)
-    db.commit()
+    db_retry_commit(db)
     flash(request, f"OCR 配置「{name}」已添加", "success")
     return RedirectResponse(url="/ocr-config", status_code=303)
 
@@ -99,7 +99,7 @@ async def update_ocr_config(
         cfg.pdf_capable = False
     # auto: 保留已有值不动
 
-    db.commit()
+    db_retry_commit(db)
     flash(request, f"OCR 配置「{cfg.name}」已更新", "success")
     return RedirectResponse(url="/ocr-config", status_code=303)
 
@@ -118,7 +118,7 @@ async def delete_ocr_config(
         flash(request, "配置不存在", "error")
         return RedirectResponse(url="/ocr-config", status_code=303)
     db.delete(cfg)
-    db.commit()
+    db_retry_commit(db)
     flash(request, f"OCR 配置「{cfg.name}」已删除", "success")
     return RedirectResponse(url="/ocr-config", status_code=303)
 

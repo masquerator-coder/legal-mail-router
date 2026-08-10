@@ -19,17 +19,28 @@ ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def resolve_attachment_path(file_path: str) -> Path:
-    """解析附件完整路径，兼容绝对路径和传统相对路径两种存储格式"""
+    """解析附件完整路径，兼容绝对路径和传统相对路径两种存储格式
+
+    沙箱约束：仅允许 data/ 目录树或系统临时目录内的文件
+    （系统生成的临时 docx 位于 TEMP，需放行）；越界抛 ValueError，
+    防止数据库 file_path 被污染后任意读取/删除服务器文件。
+    """
+    import tempfile
+    _TEMP_DIR = Path(tempfile.gettempdir()).resolve()
     p = Path(file_path)
-    if p.is_absolute():
-        return p
-    return ATTACHMENTS_DIR.parent / p
+    resolved = p.resolve() if p.is_absolute() else (ATTACHMENTS_DIR.parent / p).resolve()
+    base = DATA_DIR.resolve()
+    in_data = resolved == base or base in resolved.parents
+    in_temp = resolved == _TEMP_DIR or _TEMP_DIR in resolved.parents
+    if not (in_data or in_temp):
+        raise ValueError(f"附件路径越界: {file_path}")
+    return resolved
 
 
 # ========== 全局系统设置缓存 ==========
 
-VERSION = "v1.0"
-SYSTEM_NAME = "文书分发系统"
+VERSION = "v2.0.0"
+SYSTEM_NAME = "邮件智能分析转发系统"
 SYSTEM_PORT = "8020"
 
 
@@ -57,7 +68,12 @@ def load_system_settings():
 def set_system_name(name: str):
     """更新系统名称缓存"""
     global SYSTEM_NAME
-    SYSTEM_NAME = name or "文书分发系统"
+    SYSTEM_NAME = name or "邮件智能分析转发系统"
+
+
+def get_system_name() -> str:
+    """动态读取当前系统名称（供模板/署名使用，避免导入时拷贝旧值）"""
+    return SYSTEM_NAME
 
 
 def set_system_port(port: str):

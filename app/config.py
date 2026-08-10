@@ -15,9 +15,9 @@ from app.settings import (  # noqa: F401
     BASE_DIR, DATA_DIR, DB_PATH, ATTACHMENTS_DIR,
     resolve_attachment_path,
     VERSION, SYSTEM_NAME, SYSTEM_PORT,
-    load_system_settings, set_system_name, set_system_port,
+    load_system_settings, set_system_name, set_system_port, get_system_name,
 )
 
 # 注：KEY_FILE 由 crypto 管理（位于 DATA_DIR / ".encryption_key"）
-# 此处从 settings 重新导出以保持兼容性
-KEY_FILE = BASE_DIR / "data" / ".encryption_key"
+# 此处从 crypto 重新导出以保持兼容性（单一来源，避免两处定义漂移）
+from app.crypto import _KEY_FILE as KEY_FILE  # noqa: E402,F401

@@ -12,6 +12,7 @@ from fastapi.templating import Jinja2Templates
 from app.database import init_db
 from app.services.scheduler import start_scheduler, shutdown_scheduler, scheduler, schedule_cleanup_job, schedule_daily_report_job
 from app.config import BASE_DIR, load_system_settings, SYSTEM_NAME
+from app import settings as _app_settings  # 动态读取 SYSTEM_NAME（模块全局缓存）
 
 # 日志配置
 logging.basicConfig(
@@ -22,8 +23,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── 持久化 Session 密钥 ──
+# DATA_DIR 由 app.settings 创建，此处复用路径
 DATA_DIR = BASE_DIR / "data"
-os.makedirs(DATA_DIR, exist_ok=True)
 SESSION_KEY_FILE = DATA_DIR / ".session_secret"
 
 
@@ -50,13 +51,15 @@ _session_key = _load_or_create_session_key()
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时
-    logger.info("⚖️  文书分拣系统 启动中...")
+    logger.info("⚖️  邮件智能分析转发系统 启动中...")
     init_db()
     logger.info("数据库初始化完成")
 
     # 加载系统设置缓存
     load_system_settings()
-    logger.info(f"系统名称: {SYSTEM_NAME}")
+    logger.info(f"系统名称: {_app_settings.SYSTEM_NAME}")
+    # 同步模板全局（字符串为不可变值，需在设置加载/保存后重新赋值）
+    env.globals["system_name"] = _app_settings.SYSTEM_NAME
 
     # 加载已有邮箱账户的调度任务
     from app.database import SessionLocal
@@ -92,11 +95,15 @@ async def lifespan(app: FastAPI):
 
 
 # 创建 FastAPI 应用
+# 禁用 /docs /redoc /openapi.json：避免暴露完整 API 结构（需登录访问场景下的信息泄露面）
 app = FastAPI(
-    title="文书分拣系统",
+    title="邮件智能分析转发系统",
     description="自动监控邮箱、AI分析文书类型、智能转发到对应律师",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 # CSRF 保护中间件
@@ -124,8 +131,12 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 # 模板引擎 (Python 3.14 兼容: 创建无缓存的 Environment)
 templates_dir = BASE_DIR / "templates"
-from jinja2 import Environment, FileSystemLoader  # noqa: E402
-env = Environment(loader=FileSystemLoader(str(templates_dir)), cache_size=0)
+from jinja2 import Environment, FileSystemLoader, select_autoescape  # noqa: E402
+env = Environment(
+    loader=FileSystemLoader(str(templates_dir)),
+    cache_size=0,
+    autoescape=select_autoescape(["html", "htm", "xml"]),
+)
 templates = Jinja2Templates(env=env)
 app.state.templates = templates
 
@@ -136,8 +147,9 @@ env.globals["get_flash_messages"] = get_flash_messages
 from app.csrf import csrf_token_input, csrf_token_value  # noqa: E402
 env.globals["csrf_token_input"] = csrf_token_input
 env.globals["csrf_token_value"] = csrf_token_value
-# 系统名称全局变量（供模板使用）
-env.globals["system_name"] = SYSTEM_NAME
+# 系统名称全局变量（供模板使用）— 字符串为不可变值，
+# 启动时(load_system_settings 后)与设置保存时由 routes/settings.py 显式同步
+env.globals["system_name"] = _app_settings.SYSTEM_NAME
 
 # 发件人解析过滤器：将 "Name <email>" 或纯邮箱解析为 【名称】【邮箱】
 def format_sender(sender_raw: str) -> dict:
@@ -177,7 +189,6 @@ from app.routes import (  # noqa: E402
     ocr_router,
     settings_router,
     backup_router,
-    doc_templates_router,
     auto_update_router,
 )
 
@@ -189,7 +200,6 @@ app.include_router(logs_router)
 app.include_router(ocr_router)
 app.include_router(settings_router)
 app.include_router(backup_router)
-app.include_router(doc_templates_router)
 app.include_router(auto_update_router)
 
 # 注册认证路由
@@ -221,5 +231,8 @@ async def favicon():
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8020, reload=False)
+    # 直接运行时读取环境变量 PORT（与 Docker/run.py 保持一致），默认 8020
+    uvicorn.run("app.main:app", host=os.environ.get("HOST", "0.0.0.0"),
+                port=int(os.environ.get("PORT", "8020")), reload=False)

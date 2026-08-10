@@ -32,7 +32,13 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
 
 
 def db_retry_commit(db, max_retries: int = MAX_DB_RETRIES) -> None:
-    """带重试的 commit，处理 SQLite 并发写入冲突"""
+    """带重试的 commit，处理 SQLite 并发写入冲突
+
+    注意：commit 失败后 rollback 会丢弃会话中未提交的变更；
+    若重试时变更已随 rollback 丢失，必须抛出异常而不是静默报告成功，
+    否则调用方会以为数据已持久化。
+    """
+    had_pending = bool(db.new or db.dirty or db.deleted)
     for attempt in range(max_retries):
         try:
             db.commit()
@@ -49,6 +55,13 @@ def db_retry_commit(db, max_retries: int = MAX_DB_RETRIES) -> None:
                     db.rollback()
                 except Exception:
                     pass
+                # rollback 已丢弃未提交变更：此时重试提交的是空事务，
+                # 若之前确有 pending 变更，必须报错让调用方整体重做
+                if had_pending and not (db.new or db.dirty or db.deleted):
+                    raise RuntimeError(
+                        "数据库锁冲突，本次未提交的变更已随 rollback 丢失"
+                        f"（首次错误: {e}），请重试整个操作"
+                    ) from e
                 time.sleep(min(DB_RETRY_DELAY * (2 ** attempt), 8) + 0.1)
             else:
                 raise
@@ -66,19 +79,6 @@ def _get_schema_version(conn) -> int:
 
 def _set_schema_version(conn, version: int):
     conn.execute(text(f"PRAGMA user_version = {version}"))
-
-
-def _migrate_doc_templates(conn):
-    """自动迁移：为 doc_templates 表补齐新增的 account_id 列"""
-    # 检查列是否存在
-    cols = {row[1] for row in conn.execute(text("PRAGMA table_info(doc_templates)"))}
-    if "account_id" not in cols:
-        logger.info("迁移: doc_templates 添加 account_id 列")
-        conn.execute(text(
-            "ALTER TABLE doc_templates ADD COLUMN account_id INTEGER "
-            "REFERENCES email_accounts(id) ON DELETE CASCADE"
-        ))
-        conn.commit()
 
 
 def _migrate_routing_rules_account_ids(conn):
@@ -167,6 +167,17 @@ def _migrate_llm_config_model_type_locked(conn):
         conn.commit()
 
 
+def _migrate_llm_config_role(conn):
+    """自动迁移：为 llm_config 表补齐 config_role 列（analyzer=文书分析 / classifier=文书类型识别）"""
+    cols = {row[1] for row in conn.execute(text("PRAGMA table_info(llm_config)"))}
+    if "config_role" not in cols:
+        logger.info("迁移: llm_config 添加 config_role 列")
+        conn.execute(text(
+            "ALTER TABLE llm_config ADD COLUMN config_role VARCHAR(20) DEFAULT 'analyzer'"
+        ))
+        conn.commit()
+
+
 def get_db():
     """FastAPI 依赖：获取数据库会话"""
     db = SessionLocal()
@@ -185,7 +196,6 @@ def init_db():
 
         # ── 版本 1: 基础列迁移 ──
         if current_version < 1:
-            _migrate_doc_templates(conn)
             _migrate_routing_rules_account_ids(conn)
             _migrate_email_log_doc_types(conn)
             _migrate_email_log_revision_instructions(conn)
@@ -203,6 +213,16 @@ def init_db():
             _migrate_llm_config_model_type_locked(conn)
             _set_schema_version(conn, 3)
 
+        # ── 版本 4: 移除已废弃的 doc_templates 表（DocTemplate 功能已清理） ──
+        if current_version < 4:
+            conn.execute(text("DROP TABLE IF EXISTS doc_templates"))
+            _set_schema_version(conn, 4)
+
+        # ── 版本 5: llm_config 用途字段（两阶段分析: 文书分析/类型识别） ──
+        if current_version < 5:
+            _migrate_llm_config_role(conn)
+            _set_schema_version(conn, 5)
+
         # 添加查询性能索引和 UNIQUE 约束（SQLite 用 IF NOT EXISTS 安全幂等）
         sqls = [
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_email_logs_message_id ON email_logs(message_id)",
@@ -211,11 +231,6 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_email_logs_account_id ON email_logs(account_id)",
             "CREATE INDEX IF NOT EXISTS idx_attachments_log_id ON attachments(log_id)",
             "CREATE INDEX IF NOT EXISTS idx_routing_rules_enabled_priority ON routing_rules(enabled, priority)",
-            "CREATE INDEX IF NOT EXISTS idx_doc_templates_account_id ON doc_templates(account_id)",
-            "CREATE INDEX IF NOT EXISTS idx_doc_templates_doc_type ON doc_templates(doc_type)",
-            "CREATE INDEX IF NOT EXISTS idx_doc_templates_is_default ON doc_templates(is_default)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_templates_global_unique ON doc_templates(doc_type) WHERE account_id IS NULL",
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_templates_account_type_unique ON doc_templates(account_id, doc_type) WHERE account_id IS NOT NULL",
         ]
         for sql in sqls:
             conn.execute(text(sql))

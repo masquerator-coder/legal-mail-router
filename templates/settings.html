@@ -6,8 +6,9 @@
 </div>
 
 <div>
-    <form method="POST" action="/settings/save">
+    <form method="POST" action="/settings/save" id="settings-form">
     {{ csrf_token_input(request)|safe }}
+    <input type="hidden" id="autosave-flag" name="autosave" value="false">
 
     <!-- 系统名称 -->
     <div class="card">
@@ -169,6 +170,17 @@
                         AI 分析和修改版文书生成的最大等待时间。网络慢或文档大时可适当调大（建议 180-300）
                     </div>
                 </div>
+
+                <div class="form-group">
+                    <label for="email_body_max_chars">邮件正文上限（字符）</label>
+                    <input type="number" id="email_body_max_chars" name="email_body_max_chars"
+                           value="{{ settings.email_body_max_chars }}"
+                           class="form-control" style="width:120px;"
+                           min="0" max="100000" step="100">
+                    <div class="form-hint">
+                        送入 LLM 分析的邮件正文最大字符数。0=不限制（独立于知识库，即使未启用知识库检索也生效）
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -190,42 +202,7 @@
                 <div class="form-hint">
                     启用后，系统会先由 LLM 判断哪些附件属于同一份独立文书，再逐组进行法律分析。
                     适用于一封邮件包含多份不同合同/文书的场景。会增加少量 LLM 调用用于分组判断。
-                </div>
-            </div>
-
-            <div class="form-group" id="grouping_llm_config" style="margin-top:16px;">
-                <label>预分类 LLM 模型</label>
-                <div style="margin-top:6px;">
-                    <div class="radio-group">
-                        <label style="display:block;margin-bottom:8px;font-weight:normal;">
-                            <input type="radio" name="classify_use_main_llm" value="true"
-                                   {% if settings.classify_use_main_llm == 'true' %}checked{% endif %}
-                                   onchange="toggleClassifyLlmSelect(false)"
-                                   style="margin-right:6px;">
-                            使用主 LLM（当前激活的 LLM 配置）
-                        </label>
-                        <label style="display:block;font-weight:normal;">
-                            <input type="radio" name="classify_use_main_llm" value="false"
-                                   {% if settings.classify_use_main_llm == 'false' %}checked{% endif %}
-                                   onchange="toggleClassifyLlmSelect(true)"
-                                   style="margin-right:6px;">
-                            指定 LLM 配置:
-                            <select name="classify_llm_config_id" id="classify_llm_config_id"
-                                    class="form-control" style="width:300px;display:inline-block;margin-left:8px;">
-                                <option value="">-- 请选择 --</option>
-                                {% for cfg in llm_configs %}
-                                <option value="{{ cfg.id }}"
-                                        {% if settings.classify_llm_config_id == cfg.id|string %}selected{% endif %}>
-                                    {{ cfg.name }} ({{ cfg.model_name }})
-                                </option>
-                                {% endfor %}
-                            </select>
-                        </label>
-                    </div>
-                </div>
-                <div class="form-hint" style="margin-top:8px;">
-                    建议为预分类配置轻量模型（如 Qwen2.5-0.5B）以降低成本。
-                    模型配置统一在「LLM 配置」页管理。仅当附件超过 1 个时才会调用预分类。
+                    分组模型在「LLM 配置」页的角色分配中指定。
                 </div>
             </div>
         </div>
@@ -371,14 +348,6 @@
                                min="0" max="100000" step="100">
                         <div class="form-hint">注入提示词的法律法规参考文本最大字符数。0=不限制</div>
                     </div>
-                    <div class="form-group">
-                        <label for="email_body_max_chars">邮件正文上限（字符）</label>
-                        <input type="number" id="email_body_max_chars" name="email_body_max_chars"
-                               value="{{ settings.email_body_max_chars }}"
-                               class="form-control" style="width:120px;"
-                               min="0" max="100000" step="100">
-                        <div class="form-hint">送入 LLM 分析的邮件正文最大字符数。0=不限制</div>
-                    </div>
                 </div>
             </div>
         </div>
@@ -433,6 +402,11 @@
                 </div>
             </div>
         </div>
+    </div>
+
+    <!-- 自动保存状态指示 -->
+    <div id="autosave-bar" style="display:flex;gap:12px;align-items:center;margin-top:24px;">
+        <span id="autosave-status" style="font-size:14px;color:var(--text-muted);">✅ 设置修改后自动保存</span>
     </div>
 
     <!-- 服务与备份 + 自动更新 -->
@@ -505,12 +479,6 @@
                     </div>
                 </div>
             </div>
-        </div>
-
-        <!-- 操作按钮 -->
-        <div style="display:flex;gap:12px;align-items:center;margin-top:24px;">
-            <button type="submit" class="btn btn-primary">💾 保存设置</button>
-            <a href="/dashboard" class="btn btn-outline">取消</a>
         </div>
     </form>
 
@@ -904,16 +872,9 @@ function toggleGroupingFields(enabled) {
     if (group) group.style.display = enabled ? '' : 'none';
 }
 
-function toggleClassifyLlmSelect(showSelect) {
-    var select = document.getElementById('classify_llm_config_id');
-    if (select) select.style.display = showSelect ? 'inline-block' : 'none';
-}
-
 // 页面加载时初始化状态
 document.addEventListener('DOMContentLoaded', function() {
     toggleGroupingFields(document.querySelector('input[name="attachment_grouping"]')?.checked || false);
-    var useMainRadio = document.querySelector('input[name="classify_use_main_llm"][value="true"]');
-    toggleClassifyLlmSelect(useMainRadio ? !useMainRadio.checked : false);
 });
 
 
@@ -938,6 +899,93 @@ function restoreBackup() {
     document.body.appendChild(tempForm);
     tempForm.submit();
 }
+
+
+// ── 自动保存：修改设置后防抖自动提交（无保存/取消按钮） ──
+(function() {
+    var form = document.getElementById('settings-form');
+    if (!form) return;
+    var statusEl = document.getElementById('autosave-status');
+    var saveTimer = null;
+    var saving = false;
+
+    function setStatus(text, color) {
+        if (statusEl) {
+            statusEl.textContent = text;
+            statusEl.style.color = color || 'var(--text-muted)';
+        }
+    }
+
+    function markDirty() {
+        if (statusEl) setStatus('⏳ 有未保存的修改…', '#d97706');
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(doSave, 1500);
+    }
+
+    // number 输入框记住加载时的默认值（空值提交前恢复，避免校验失败）
+    form.querySelectorAll('input[type="number"]').forEach(function(inp) {
+        if (inp.dataset.def === undefined) inp.dataset.def = inp.value;
+    });
+
+    function doSave() {
+        if (saving) return;
+        saving = true;
+        setStatus('💾 保存中…');
+        // 空 number 恢复默认值
+        form.querySelectorAll('input[type="number"]').forEach(function(inp) {
+            if (inp.value === '') inp.value = inp.dataset.def || '';
+        });
+        var fd = new FormData(form);
+        fd.set('autosave', 'true');
+        // 用 X-CSRF-Token header 提交（中间件验证后不轮换 token，多次自动保存有效）
+        var csrfInput = form.querySelector('input[name="_csrf_token"]');
+        fetch('/settings/save', {
+            method: 'POST',
+            body: fd,
+            headers: {
+                'X-Requested-With': 'fetch',
+                'X-CSRF-Token': csrfInput ? csrfInput.value : '',
+            },
+            redirect: 'manual',
+        }).then(function(resp) {
+            return resp.json().catch(function() { return null; }).then(function(data) {
+                return {status: resp.status, data: data};
+            });
+        }).then(function(r) {
+            saving = false;
+            if (r.data && r.data.success) {
+                var now = new Date().toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'});
+                if (r.data.port_changed) {
+                    setStatus('⚠️ ' + r.data.message, '#d97706');
+                } else {
+                    setStatus('✅ 已自动保存 ' + now, '#2f855a');
+                }
+            } else {
+                var msg = (r.data && r.data.message) ? r.data.message : ('保存失败 (' + r.status + ')');
+                setStatus('❌ ' + msg, '#c53030');
+            }
+        }).catch(function(e) {
+            saving = false;
+            setStatus('❌ 保存失败: ' + (e.message || '网络错误'), '#c53030');
+        });
+    }
+
+    // change：复选框/下拉/失焦文本立即标记（防抖统一提交）
+    form.addEventListener('change', function(e) {
+        var t = e.target;
+        if (!t.name) return;
+        if (t.type === 'file' || t.type === 'submit' || t.type === 'button' || t.type === 'hidden') return;
+        markDirty();
+    });
+    // input：文本框/数字输入过程实时标记（防抖合并）
+    form.addEventListener('input', function(e) {
+        var t = e.target;
+        if (!t.name) return;
+        if (t.tagName === 'TEXTAREA' || t.type === 'text' || t.type === 'number' || t.type === 'email') {
+            markDirty();
+        }
+    });
+})();
 
 </script>
 {% endblock %}

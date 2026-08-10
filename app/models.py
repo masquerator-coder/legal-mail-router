@@ -46,6 +46,7 @@ class LLMConfig(Base):
     is_active = Column(Boolean, default=True, comment="是否激活")
     model_type = Column(String(20), default="unknown", comment="模型类型: text/multimodal/unknown")
     model_type_locked = Column(Boolean, default=False, comment="模型类型由人工指定，自动检测不覆盖")
+    config_role = Column(String(20), default="analyzer", comment="[废弃] 模型用途字段 — 已由 LLM 配置页的「模型角色分配」替代，仅保留兼容旧数据")
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -152,30 +153,3 @@ class Attachment(Base):
     created_at = Column(DateTime, default=datetime.now)
 
     email_log = relationship("EmailLog", back_populates="attachments")
-
-
-class DocTemplate(Base):
-    """文书模板 — 按文书类型 + 邮箱账户提供标准格式"""
-    __tablename__ = "doc_templates"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    account_id = Column(
-        Integer, ForeignKey("email_accounts.id", ondelete="CASCADE"),
-        nullable=True, default=None,
-        comment="关联邮箱账户(NULL=全局模板)"
-    )
-    name = Column(String(100), nullable=False, comment="模板名称")
-    doc_type = Column(String(50), nullable=False, comment="关联文书类型")
-    content = Column(Text, nullable=False, comment="模板全文")
-    description = Column(String(200), default="", comment="用途说明")
-    is_default = Column(Boolean, default=False, comment="是否该类型的默认模板")
-    created_at = Column(DateTime, default=datetime.now)
-    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-
-    account = relationship("EmailAccount", backref="doc_templates")
-
-    __table_args__ = (
-        Index("ix_doc_templates_account_id", "account_id"),
-        Index("ix_doc_templates_doc_type", "doc_type"),
-        Index("ix_doc_templates_is_default", "is_default"),
-    )

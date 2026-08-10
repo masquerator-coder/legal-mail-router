@@ -8,13 +8,29 @@ from fastapi import APIRouter, Request, Depends, Form, UploadFile, File
 from fastapi.responses import StreamingResponse, RedirectResponse
 from sqlalchemy.orm import Session
 from app.database import get_db, db_retry_commit
-from app.models import EmailAccount, LLMConfig, OCRConfig, RoutingRule, DefaultConfig, DocTemplate
+from app.models import EmailAccount, LLMConfig, OCRConfig, RoutingRule, DefaultConfig
 from app.flash import flash
 from app.csrf import check_csrf
 import io
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/backup", tags=["配置备份"])
+
+
+def _is_valid_fernet_token(value: str) -> bool:
+    """校验字符串是否为合法 Fernet token（纯格式校验，不依赖密钥）。
+
+    防止损坏/伪造的密文写入数据库；跨部署迁移时密文格式合法即可导入。
+    Fernet token 结构：1 字节版本(0x80) + 8 字节时间戳 + 16 字节 IV
+    + 密文 + 32 字节 HMAC，故 base64 解码后至少 57 字节且首字节为 0x80。
+    （不使用 extract_timestamp：cryptography>=42 会验证签名，需要真实密钥。）
+    """
+    import base64
+    try:
+        raw = base64.urlsafe_b64decode(value.encode() + b"=" * (-len(value) % 4))
+    except Exception:
+        return False
+    return len(raw) >= 57 and raw[0] == 0x80
 
 
 @router.get("")
@@ -27,14 +43,13 @@ async def backup_page(request: Request):
 async def export_backup(db: Session = Depends(get_db)):
     """导出所有配置为 JSON 文件（加密字段保持密文）"""
     data = {
-        "version": 2,
+        "version": 3,
         "exported_at": datetime.now().isoformat(),
-        "system_name": "文书分发系统",
+        "system_name": "邮件智能分析转发系统",
         "email_accounts": [],
         "llm_config": [],
         "ocr_config": [],
         "routing_rules": [],
-        "doc_templates": [],  # v2 新增：文书模板
         "system_settings": [],
     }
 
@@ -106,29 +121,22 @@ async def export_backup(db: Session = Depends(get_db)):
             "enabled": rule.enabled,
         })
 
-    # 文书模板
-    for tpl in db.query(DocTemplate).order_by(DocTemplate.id).all():
-        account_name = None
-        if tpl.account_id:
-            acc = db.query(EmailAccount).filter_by(id=tpl.account_id).first()
-            if acc:
-                account_name = acc.name
-        data["doc_templates"].append({
-            "account_name": account_name,  # null = 全局模板
-            "name": tpl.name,
-            "doc_type": tpl.doc_type,
-            "content": tpl.content,
-            "description": tpl.description,
-            "is_default": tpl.is_default,
-        })
-
-    # 系统设置（classify_llm_config_id 用名称代替脆弱的数字 ID）
+    # 系统设置（模型角色分配 llm_role_* 用名称代替脆弱的数字 ID）
+    # admin_password / admin_token 属敏感凭证，导出时打码
+    _REDACTED_KEYS = {"admin_password", "admin_token"}
+    _ROLE_KEYS = {"llm_role_group", "llm_role_classifier", "llm_role_analyzer"}
+    db_system_name = db.query(DefaultConfig).filter_by(key="system_name").first()
+    data["system_name"] = db_system_name.value if db_system_name and db_system_name.value else "邮件智能分析转发系统"
     for cfg in db.query(DefaultConfig).order_by(DefaultConfig.key).all():
         value = cfg.value
-        if cfg.key == "classify_llm_config_id" and value and value.isdigit():
+        if cfg.key in _ROLE_KEYS and value and value.isdigit():
             llm = db.query(LLMConfig).filter_by(id=int(value)).first()
             if llm:
                 value = f"__name__:{llm.name}"
+            else:
+                value = ""
+        if cfg.key in _REDACTED_KEYS and value:
+            value = "__redacted__"
         data["system_settings"].append({
             "key": cfg.key,
             "value": value,
@@ -169,7 +177,14 @@ async def import_backup(
         flash(request, "无效的备份文件：缺少 version 字段", "error")
         return RedirectResponse(url="/backup", status_code=303)
 
-    stats = {"accounts": 0, "llm": 0, "ocr": 0, "rules": 0, "templates": 0, "settings": 0}
+    stats = {"accounts": 0, "llm": 0, "ocr": 0, "rules": 0, "settings": 0}
+    skipped_rule_names = []  # 因账户映射失败被跳过的规则
+
+    def _check_encrypted(*values: str) -> None:
+        """校验备份中的密文字段格式，非法则抛出异常中止导入"""
+        for v in values:
+            if v and not _is_valid_fernet_token(v):
+                raise ValueError("备份文件中包含无效的加密字段（密文格式错误或已被篡改），导入已中止")
 
     try:
         # 先建立账户名→ID 映射（用于关联路由规则）
@@ -178,6 +193,7 @@ async def import_backup(
         # 导入邮箱账户 — 按 name 匹配，存在则更新，不存在则创建
         for item in data.get("email_accounts", []):
             name = item["name"]
+            _check_encrypted(item.get("password_encrypted", ""))
             existing = db.query(EmailAccount).filter_by(name=name).first()
             if existing:
                 existing.imap_host = item["imap_host"]
@@ -215,6 +231,7 @@ async def import_backup(
         # 导入 LLM 配置 — 按 name 匹配，存在则更新，不存在则创建
         for item in data.get("llm_config", []):
             llm_name = item.get("name", "默认配置")
+            _check_encrypted(item.get("api_key_encrypted", ""))
             existing = db.query(LLMConfig).filter_by(name=llm_name).first()
             if existing:
                 existing.api_url = item["api_url"]
@@ -245,6 +262,7 @@ async def import_backup(
         # 导入 OCR 配置 — 按 name 匹配，存在则更新，不存在则创建
         for item in data.get("ocr_config", []):
             ocr_name = item.get("name", "OCR配置")
+            _check_encrypted(item.get("api_key_encrypted", ""))
             existing = db.query(OCRConfig).filter_by(name=ocr_name).first()
             if existing:
                 existing.provider_type = item.get("provider_type", "paddleocr")
@@ -273,6 +291,7 @@ async def import_backup(
 
         # 导入路由规则 — 按 (doc_type, target_email) 匹配，存在则更新，不存在则创建
         for item in data.get("routing_rules", []):
+            _check_encrypted(item.get("smtp_password_encrypted", ""))
             # 从 account_names（列表）或 account_name（旧格式兼容）构建 account_ids
             account_ids_str = ""
             names = item.get("account_names") or []
@@ -280,7 +299,14 @@ async def import_backup(
             if old_name and not names:
                 names = [old_name]
             if names:
-                mapped_ids = [str(account_map[n]) for n in names if n in account_map]
+                # 账户映射失败时跳过该规则（而不是静默变为全局规则，防止匹配范围扩大）
+                missing = [n for n in names if n not in account_map]
+                if missing:
+                    skipped_rule_names.append(
+                        f"{item['doc_type']}→{item['target_email']}（账户不存在: {', '.join(missing)}）"
+                    )
+                    continue
+                mapped_ids = [str(account_map[n]) for n in names]
                 account_ids_str = ",".join(mapped_ids)
 
             doc_type = item["doc_type"]
@@ -316,43 +342,8 @@ async def import_backup(
                 db.add(rule)
             stats["rules"] += 1
 
-        # 导入文书模板 — 按 (account_name, name) 匹配，存在则更新，不存在则创建
-        for item in data.get("doc_templates", []):
-            account_id = None
-            account_name = item.get("account_name")
-            if account_name and account_name in account_map:
-                account_id = account_map[account_name]
-
-            # 匹配已有模板：同账户（或全局） + 同模板名称
-            existing = None
-            if account_id is not None:
-                existing = db.query(DocTemplate).filter_by(
-                    account_id=account_id, name=item["name"]
-                ).first()
-            else:
-                existing = db.query(DocTemplate).filter_by(
-                    account_id=None, name=item["name"]
-                ).first()
-
-            if existing:
-                existing.doc_type = item.get("doc_type", "")
-                existing.content = item.get("content", "")
-                existing.description = item.get("description", "")
-                existing.is_default = item.get("is_default", False)
-            else:
-                tpl = DocTemplate(
-                    account_id=account_id,
-                    name=item["name"],
-                    doc_type=item.get("doc_type", ""),
-                    content=item.get("content", ""),
-                    description=item.get("description", ""),
-                    is_default=item.get("is_default", False),
-                )
-                db.add(tpl)
-            stats["templates"] += 1
-
         # 导入系统设置 — 按 key 匹配，存在则更新，不存在则创建
-        # 处理 classify_llm_config_id：将 __name__:xxx 解析回当前数据库中的 ID
+        # 处理模型角色分配（llm_role_*）：将 __name__:xxx 解析回当前数据库中的 ID
         llm_name_to_id = {}
         for llm in db.query(LLMConfig).all():
             llm_name_to_id[llm.name] = llm.id
@@ -360,8 +351,11 @@ async def import_backup(
         for item in data.get("system_settings", []):
             key = item["key"]
             value = item.get("value", "")
-            # 解析 classify_llm_config_id 的名称引用
-            if key == "classify_llm_config_id" and value.startswith("__name__:"):
+            # 打码值不覆盖现有敏感配置
+            if value == "__redacted__":
+                continue
+            # 解析模型角色分配（llm_role_*）的名称引用
+            if key in ("llm_role_group", "llm_role_classifier", "llm_role_analyzer") and value.startswith("__name__:"):
                 llm_name = value[9:]
                 resolved_id = llm_name_to_id.get(llm_name, "")
                 value = str(resolved_id) if resolved_id else ""
@@ -379,10 +373,14 @@ async def import_backup(
             f"LLM {stats['llm']} 个",
             f"OCR {stats['ocr']} 个",
             f"规则 {stats['rules']} 条",
-            f"模板 {stats['templates']} 个",
             f"设置 {stats['settings']} 项",
         ]
-        flash(request, "配置恢复成功！" + "、".join(parts), "success")
+        msg = "配置恢复成功！" + "、".join(parts)
+        if skipped_rule_names:
+            msg += f"。已跳过 {len(skipped_rule_names)} 条账户缺失的规则: {'; '.join(skipped_rule_names[:5])}"
+            if len(skipped_rule_names) > 5:
+                msg += " …"
+        flash(request, msg, "success" if not skipped_rule_names else "warning")
 
     except Exception as e:
         db.rollback()

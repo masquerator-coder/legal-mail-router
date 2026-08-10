@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────
-# 文书分拣系统 — 服务管理脚本
+# 邮件智能分析转发系统 — 服务管理脚本
 #
 # 用法:
 #   ./start.sh             前台启动
@@ -107,7 +107,7 @@ cmd_start() {
     if _running; then
         echo ""
         echo "╔══════════════════════════════════════════╗"
-        echo "║  ⚖️  文书分拣系统 v1.0.0            ║"
+        echo "║  ⚖️  邮件智能分析转发系统 v2.0.0            ║"
         echo "╠══════════════════════════════════════════╣"
         echo "║  PID:      $pid                       ║"
         echo "║  Web UI:   http://localhost:$port            ║"
@@ -184,7 +184,7 @@ cmd_foreground() {
     port=$(_port_from_db)
     echo ""
     echo "╔══════════════════════════════════════════╗"
-    echo "║  ⚖️  文书分拣系统 v1.0.0            ║"
+    echo "║  ⚖️  邮件智能分析转发系统 v2.0.0            ║"
     echo "╠══════════════════════════════════════════╣"
     printf '║  Web UI:   http://localhost:%-5s       ║\n' "$port"
     printf '║  API 文档: http://localhost:%s/docs   ║\n' "$port"

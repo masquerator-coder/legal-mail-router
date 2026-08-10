@@ -10,7 +10,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from pathlib import Path
 from typing import Optional
-from app.config import decrypt, SYSTEM_NAME
+from app.config import decrypt
+from app.config import get_system_name  # noqa: F401  (SYSTEM_NAME 改用函数动态读取)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,11 @@ def _safe_pct(val) -> str:
         return f"{float(val or 0):.0%}"
     except (ValueError, TypeError):
         return "N/A"
+
+
+def _sanitize_header(value: str) -> str:
+    """邮件头字段禁止含 CR/LF（防邮件头注入）"""
+    return value.replace("\r", " ").replace("\n", " ")
 
 
 def _build_email_body(
@@ -113,7 +119,7 @@ def _build_email_body(
 此为自动转发，如需查看完整原始邮件请登录监控邮箱。
 
 ---
-|{SYSTEM_NAME}
+|{get_system_name()}
 """
 
     # 完整版正文
@@ -140,7 +146,7 @@ def _build_email_body(
 此为自动转发，如需查看完整原始邮件请登录监控邮箱。
 
 ---
-|{SYSTEM_NAME}
+|{get_system_name()}
 """
 
 
@@ -285,7 +291,7 @@ def _generate_analysis_docx(analyses: list[dict], original_subject: str) -> Opti
     doc.add_paragraph("")
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = p.add_run(f"—— {SYSTEM_NAME} 自动生成 ——")
+    run = p.add_run(f"—— {get_system_name()} 自动生成 ——")
     run.font.size = Pt(9)
     run.font.color.rgb = RGBColor(128, 128, 128)
 
@@ -358,27 +364,28 @@ def forward_email(
     msg["From"] = from_email
     msg["To"] = to_email
 
-    # 构建主题：去重后的文书类型
+    # 构建主题：去重后的文书类型（Subject 来自外部邮件/LLM，需清洗 CR/LF 防头注入）
     doc_types = []
     any_failed = False
     seen_dt = set()
+    clean_subject = _sanitize_header(original_subject or "")
     for a in analyses:
         if a:
             if a.get("llm_failed"):
                 any_failed = True
-            dt = a.get("doc_type", "")
+            dt = _sanitize_header(a.get("doc_type", ""))
             if dt and dt not in seen_dt:
                 doc_types.append(dt)
                 seen_dt.add(dt)
     if any_failed:
-        msg["Subject"] = f"【大模型分析失败】{original_subject}"
+        msg["Subject"] = f"【大模型分析失败】{clean_subject}"
     elif doc_types:
         doc_type_str = " / ".join(doc_types)
-        msg["Subject"] = f"【{doc_type_str}】{original_subject}"
+        msg["Subject"] = f"【{doc_type_str}】{clean_subject}"
     else:
-        msg["Subject"] = f"【法律文书】{original_subject}"
-    msg["X-Forwarded-By"] = "文书分拣系统"
-    msg["X-Forwarded-For"] = from_email
+        msg["Subject"] = f"【法律文书】{clean_subject}"
+    msg["X-Forwarded-By"] = "邮件智能分析转发系统"
+    msg["X-Forwarded-For"] = _sanitize_header(from_email)
 
     # ── 构建正文 ──
     if analysis_output_mode == "attachment":
@@ -396,6 +403,11 @@ def forward_email(
                 part = MIMEApplication(f.read(), Name="AI分析报告.docx")
                 part["Content-Disposition"] = 'attachment; filename="AI分析报告.docx"'
                 msg.attach(part)
+            # 临时报告已读入内存，立即清理，避免长期运行堆积
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning(f"清理临时 AI 分析报告失败: {docx_path} — {e}")
     else:
         body = _build_email_body(
             to_name, analyses, original_subject, original_body, brief_mode=False,
@@ -439,15 +451,21 @@ def forward_email(
 
     last_error = ""
     server = None
-    for attempt in range(1 + retry_count):
+    # 已知部分国内服务商(163/126 等)587 端口不支持 STARTTLS 会直接断开，
+    # 遇到 SMTPServerDisconnected 时自动回退到 465 SSL 再试一次（不消耗重试次数）
+    use_ssl_fallback = False
+    attempt = 0
+    while attempt < 1 + retry_count:
         if attempt > 0:
             logger.info(f"SMTP 重试 {attempt}/{retry_count}（等待 {retry_delay} 秒后）")
             time.sleep(retry_delay)
 
         server = None
         try:
-            if smtp_port == 465:
-                server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30)
+            if smtp_port == 465 or use_ssl_fallback:
+                import ssl as _ssl
+                server = smtplib.SMTP_SSL(smtp_host, 465 if use_ssl_fallback else smtp_port,
+                                          timeout=30, context=_ssl.create_default_context())
             else:
                 server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
                 server.starttls()
@@ -484,6 +502,13 @@ def forward_email(
             logger.error(f"转发邮件连接失败({attempt}/{retry_count}): {last_error}")
 
         except smtplib.SMTPServerDisconnected as e:
+            if smtp_port != 465 and not use_ssl_fallback:
+                # 587(STARTTLS) 被服务器断开 → 回退 465 SSL 立即重试
+                use_ssl_fallback = True
+                logger.warning(
+                    f"{smtp_host}:{smtp_port} STARTTLS 被服务器断开({e})，回退 465 SSL 重试"
+                )
+                continue  # 不消耗重试次数，不等待
             last_error = f"服务器断开：{smtp_host} 在转发过程中断开连接 (SMTP 报错: {e})"
             logger.error(f"转发邮件服务器断开({attempt}/{retry_count}): {last_error}")
 
@@ -509,6 +534,8 @@ def forward_email(
                     server.quit()
                 except Exception:
                     pass
+
+        attempt += 1
 
     # 所有重试都失败
     return False, last_error
@@ -661,7 +688,7 @@ def _generate_revision_docx(revision_text: str, doc_type: str,
     doc.add_paragraph("")
     footer = doc.add_paragraph()
     footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run_footer = footer.add_run(f"—— {SYSTEM_NAME} 自动生成 ——")
+    run_footer = footer.add_run(f"—— {get_system_name()} 自动生成 ——")
     run_footer.font.size = Pt(9)
     run_footer.font.color.rgb = RGBColor(128, 128, 128)
 

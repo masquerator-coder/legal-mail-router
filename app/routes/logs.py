@@ -11,7 +11,7 @@ from fastapi import APIRouter, Request, Depends, Query, Form
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from app.database import get_db
+from app.database import get_db, db_retry_commit
 from app.models import EmailLog, Attachment, EmailAccount, DefaultConfig
 from app.services.scheduler import scheduler
 from app.config import ATTACHMENTS_DIR, resolve_attachment_path
@@ -215,7 +215,11 @@ async def resend_email(
     attachment_paths = []
     for att in atts:
         if att.file_path:
-            fp = resolve_attachment_path(att.file_path)
+            try:
+                fp = resolve_attachment_path(att.file_path)
+            except ValueError:
+                logger.warning(f"附件路径越界，跳过: {att.file_path}")
+                continue
             if fp.exists():
                 attachment_paths.append(str(fp))
 
@@ -257,7 +261,7 @@ async def resend_email(
     # 更新状态
     log.error_message = last_error if not all_success else None
     log.status = "forwarded" if all_success else "failed"
-    db.commit()
+    db_retry_commit(db)
 
     return {
         "success": all_success,
@@ -291,7 +295,14 @@ async def delete_selected_logs(
 
     # 先查询要删除的附件文件路径
     attachments = db.query(Attachment).filter(Attachment.log_id.in_(ids)).all()
-    file_paths = [resolve_attachment_path(att.file_path) for att in attachments if att.file_path]
+    file_paths = []
+    for att in attachments:
+        if not att.file_path:
+            continue
+        try:
+            file_paths.append(resolve_attachment_path(att.file_path))
+        except ValueError:
+            logger.warning(f"附件路径越界，跳过删除: {att.file_path}")
 
     # 数据库删除 — 带重试
     max_retries = 4
@@ -362,6 +373,18 @@ async def clear_logs(request: Request, form_csrf: str = Form("", alias="_csrf_to
     return {"success": True, "message": f"已清除 {count} 条记录", "count": count}
 
 
+# CSV 公式注入防护：以 = + - @ 开头的单元格在 Excel 中会被当作公式执行，
+# 对来自外部邮件/LLM 的可控字段统一加 ' 前缀转义。
+_DANGEROUS_PREFIXES = ("=", "+", "-", "@")
+
+
+def _safe_cell(value: str) -> str:
+    # 去除前导空白后仍以危险字符开头（如 " =cmd"）也可能被 Excel 当公式执行
+    if value.lstrip().startswith(_DANGEROUS_PREFIXES):
+        return "'" + value
+    return value
+
+
 @router.get("/export-csv")
 async def export_csv(
     db: Session = Depends(get_db),
@@ -428,19 +451,19 @@ async def export_csv(
             sender_name = ""
 
         writer.writerow([
-            sender_name or sender_raw,
-            sender_email,
+            _safe_cell(sender_name or sender_raw),
+            _safe_cell(sender_email),
             log.received_at.strftime("%Y-%m-%d %H:%M:%S") if log.received_at else "",
-            log.subject or "",
-            log.doc_type or "",
-            status_map.get(log.status, log.status or ""),
-            log.target_email or "",
-            log.case_summary or "",
-            log.ai_interpretation or "",
-            log.involved_parties or "",
-            log.error_message or "",
-            log.body_text or log.body_preview or "",
-            attachment_names,
+            _safe_cell(log.subject or ""),
+            _safe_cell(log.doc_type or ""),
+            _safe_cell(status_map.get(log.status, log.status or "")),
+            _safe_cell(log.target_email or ""),
+            _safe_cell(log.case_summary or ""),
+            _safe_cell(log.ai_interpretation or ""),
+            _safe_cell(log.involved_parties or ""),
+            _safe_cell(log.error_message or ""),
+            _safe_cell(log.body_text or log.body_preview or ""),
+            _safe_cell(attachment_names),
         ])
 
     output.seek(0)
@@ -497,7 +520,11 @@ async def export_attachments(
                 continue
 
             # file_path 存储的是相对或绝对路径，resolve_attachment_path 统一处理
-            full_path = resolve_attachment_path(att.file_path)
+            try:
+                full_path = resolve_attachment_path(att.file_path)
+            except ValueError:
+                logger.warning(f"附件路径越界，跳过导出: {att.file_path}")
+                continue
             if not full_path.exists():
                 continue
 

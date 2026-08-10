@@ -4,13 +4,32 @@ LLM API 配置路由
 from fastapi import APIRouter, Request, Depends, Form
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
-from app.database import get_db
+from app.database import get_db, db_retry_commit
 from app.models import LLMConfig
 from app.config import encrypt, decrypt
 from app.flash import flash
 from app.csrf import check_csrf
 from app.services.scheduler import scheduler
 router = APIRouter(prefix="/llm-config", tags=["LLM配置"])
+
+# 模型角色 → DefaultConfig 键（角色分配集中在本页面）
+_LLM_ROLE_FIELDS = {
+    "group": "llm_role_group",           # 分组模型
+    "classifier": "llm_role_classifier",  # 类型识别模型
+    "analyzer": "llm_role_analyzer",      # 文书解读审核模型
+}
+
+
+def _get_role_values(db) -> dict:
+    """读取当前角色分配（role → 模型 ID 字符串，空=自动）"""
+    from app.models import DefaultConfig
+    rows = {
+        r.key: (r.value or "").strip()
+        for r in db.query(DefaultConfig)
+        .filter(DefaultConfig.key.in_(list(_LLM_ROLE_FIELDS.values())))
+        .all()
+    }
+    return {role: rows.get(key, "") for role, key in _LLM_ROLE_FIELDS.items()}
 
 
 @router.get("")
@@ -20,8 +39,42 @@ async def llm_config_page(request: Request, db: Session = Depends(get_db)):
         "request": request,
         "active_page": "llm_config",
         "configs": configs,
+        "roles": _get_role_values(db),
         "scheduler_running": scheduler.running,
     })
+
+
+@router.post("/roles")
+async def save_llm_roles(
+    request: Request,
+    db: Session = Depends(get_db),
+    group_model: str = Form(""),
+    classifier_model: str = Form(""),
+    analyzer_model: str = Form(""),
+    form_csrf: str = Form("", alias="_csrf_token"),
+):
+    """保存模型角色分配（分组/类型识别/文书解读）。空或无效 ID = 自动回退。"""
+    check_csrf(request, form_csrf)
+    from app.models import DefaultConfig
+
+    values = {
+        "group": group_model,
+        "classifier": classifier_model,
+        "analyzer": analyzer_model,
+    }
+    valid_ids = {c.id for c in db.query(LLMConfig.id).all()}
+    for role, value in values.items():
+        key = _LLM_ROLE_FIELDS[role]
+        value = value.strip()
+        final = value if value.isdigit() and int(value) in valid_ids else ""
+        row = db.query(DefaultConfig).filter_by(key=key).first()
+        if row:
+            row.value = final
+        else:
+            db.add(DefaultConfig(key=key, value=final))
+    db_retry_commit(db)
+    flash(request, "模型角色分配已保存", "success")
+    return RedirectResponse(url="/llm-config", status_code=303)
 
 
 @router.post("/add")
@@ -35,16 +88,10 @@ async def add_llm_config(
     analysis_prompt: str = Form(""),
     max_tokens: int = Form(2000),
     temperature: float = Form(0.3),
-    is_active: str = Form("false"),
     model_type_choice: str = Form("auto"),
     form_csrf: str = Form("", alias="_csrf_token"),
 ):
     check_csrf(request, form_csrf)
-    _is_active = is_active.lower() in ("true", "on", "1")
-    # 如果设为激活，先取消其他配置的激活状态
-    if _is_active:
-        db.query(LLMConfig).filter_by(is_active=True).update({"is_active": False})
-
     _locked = model_type_choice in ("text", "multimodal")
 
     config = LLMConfig(
@@ -55,12 +102,13 @@ async def add_llm_config(
         analysis_prompt=analysis_prompt,
         max_tokens=max_tokens,
         temperature=temperature,
-        is_active=_is_active,
+        # 激活状态由「模型角色分配」决定（被指定为某角色即激活），此处不提供激活选项
+        is_active=False,
         model_type=model_type_choice if _locked else "unknown",
         model_type_locked=_locked,
     )
     db.add(config)
-    db.commit()
+    db_retry_commit(db)
     flash(request, f"LLM 配置「{name}」已添加", "success")
     return RedirectResponse(url="/llm-config", status_code=303)
 
@@ -77,18 +125,13 @@ async def edit_llm_config(
     analysis_prompt: str = Form(""),
     max_tokens: int = Form(2000),
     temperature: float = Form(0.3),
-    is_active: str = Form("false"),
     model_type_choice: str = Form("auto"),
     form_csrf: str = Form("", alias="_csrf_token"),
 ):
     check_csrf(request, form_csrf)
-    _is_active = is_active.lower() in ("true", "on", "1")
     config = db.query(LLMConfig).filter_by(id=config_id).first()
     if not config:
         return RedirectResponse(url="/llm-config", status_code=303)
-
-    if _is_active:
-        db.query(LLMConfig).filter_by(is_active=True).update({"is_active": False})
 
     config.name = name
     config.api_url = api_url
@@ -98,7 +141,7 @@ async def edit_llm_config(
     config.analysis_prompt = analysis_prompt
     config.max_tokens = max_tokens
     config.temperature = temperature
-    config.is_active = _is_active
+    # 激活状态由「模型角色分配」决定，编辑时不再提供激活选项
 
     # 模型类型：auto = 交给自动检测；text/multimodal = 人工钉死，检测不再覆盖
     if model_type_choice in ("text", "multimodal"):
@@ -107,7 +150,7 @@ async def edit_llm_config(
     else:
         config.model_type_locked = False
 
-    db.commit()
+    db_retry_commit(db)
     flash(request, f"LLM 配置「{config.name}」已更新", "success")
     return RedirectResponse(url="/llm-config", status_code=303)
 
@@ -123,25 +166,14 @@ async def delete_llm_config(
     config = db.query(LLMConfig).filter_by(id=config_id).first()
     if config:
         db.delete(config)
-        db.commit()
+        # 清理角色分配中对被删除模型的引用（角色自动回退）
+        from app.models import DefaultConfig
+        for key in _LLM_ROLE_FIELDS.values():
+            row = db.query(DefaultConfig).filter_by(key=key).first()
+            if row and row.value == str(config.id):
+                row.value = ""
+        db_retry_commit(db)
         flash(request, f"LLM 配置「{config.name}」已删除", "success")
-    return RedirectResponse(url="/llm-config", status_code=303)
-
-
-@router.post("/activate/{config_id}")
-async def activate_llm_config(
-    config_id: int,
-    request: Request,
-    db: Session = Depends(get_db),
-    form_csrf: str = Form("", alias="_csrf_token"),
-):
-    check_csrf(request, form_csrf)
-    db.query(LLMConfig).filter_by(is_active=True).update({"is_active": False})
-    config = db.query(LLMConfig).filter_by(id=config_id).first()
-    if config:
-        config.is_active = True
-        db.commit()
-        flash(request, f"已激活 LLM 配置「{config.name}」", "success")
     return RedirectResponse(url="/llm-config", status_code=303)
 
 
@@ -185,7 +217,7 @@ async def detect_model(request: Request, config_id: int, form_csrf: str = Form("
             }
 
         config.model_type = model_type
-        db.commit()
+        db_retry_commit(db)
         return {
             "success": True, "model_type": model_type, "locked": False,
             "label": MODEL_TYPE_LABELS.get(model_type, model_type),
@@ -223,7 +255,7 @@ async def detect_max_tokens(request: Request, config_id: int, form_csrf: str = F
             recommended = 4096
 
         config.max_tokens = recommended
-        db.commit()
+        db_retry_commit(db)
         return {"success": True, "max_tokens": recommended, "context_window": context_window}
     except Exception as e:
         return {"success": False, "message": f"探测失败: {str(e)[:200]}"}
@@ -256,8 +288,18 @@ async def test_llm(request: Request, config_id: int, form_csrf: str = Form("", a
 
 
 @router.get("/default-prompt")
-async def get_default_prompt():
-    """返回当前系统默认提示词模板（用于前端“恢复默认模板”按钮）"""
+async def get_default_prompt(role: str = "analyzer"):
+    """返回指定角色的默认提示词模板（用于前端“填充默认模板”按钮）。
+
+    role=group 返回分组模板；role=classifier 返回类型识别模板；
+    其余（analyzer）返回文书解读审核模板。
+    """
+    if role == "group":
+        from app.services.llm_analyzer import _get_default_group_prompt
+        return {"prompt": _get_default_group_prompt()}
+    if role == "classifier":
+        from app.services.llm_analyzer import _get_default_classify_prompt
+        return {"prompt": _get_default_classify_prompt()}
     from app.services.llm_analyzer import _get_default_prompt
     prompt = _get_default_prompt()
     return {"prompt": prompt}

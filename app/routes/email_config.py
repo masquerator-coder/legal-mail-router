@@ -240,7 +240,9 @@ def _test_connection_only(host, port, username, password_encrypted, provider_typ
         if is_163:
             cmd(b'A2 ID ("name" "Thunderbird" "version" "128.0")', "A2")
 
-        lines = cmd(f'A3 LOGIN "{username}" "{password}"'.encode(), "A3")
+        from app.services.email_fetcher import _imap_astring
+        # RFC 3501 ASTRING 转义：密码含 " 或 \ 时也必须能登录测试
+        lines = cmd(f'A3 LOGIN {_imap_astring(username)} {_imap_astring(password)}'.encode(), "A3")
         if not any("A3 OK" in line for line in lines):
             return {"success": False, "message": "登录失败"}
 

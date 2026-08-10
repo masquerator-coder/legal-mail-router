@@ -3,6 +3,7 @@
 """
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -22,6 +23,24 @@ router = APIRouter(prefix="/admin", tags=["自动更新"])
 
 # Git 操作超时
 _GIT_TIMEOUT = 30
+
+# 分支名校验：仅允许安全字符，防止作为 git 参数被注入
+_SAFE_BRANCH_RE = re.compile(r"^[A-Za-z0-9_\-./]+$")
+
+
+def _validate_branch(branch: str) -> bool:
+    """分支名必须匹配安全字符集且不以 - 开头（防 git 参数注入）"""
+    return (
+        bool(branch)
+        and not branch.startswith("-")
+        and bool(_SAFE_BRANCH_RE.fullmatch(branch))
+    )
+
+
+def _is_trusted_remote(url: str) -> bool:
+    """仅信任 https 公开托管平台的 remote URL（拒绝本地路径/任意协议）"""
+    url = url.strip()
+    return url.startswith("https://") and url.lower() not in ("", "none")
 
 
 def _git(*args: str, timeout: int = _GIT_TIMEOUT) -> tuple[int, str, str]:
@@ -71,6 +90,10 @@ def get_remote_status(remote: str = "gitcode", branch: str = "main") -> dict:
         "error": "",
     }
 
+    if not _validate_branch(branch):
+        result["error"] = f"分支名非法: {branch!r}"
+        return result
+
     # 添加 remote（如果不存在）
     rc, _, _ = _git("remote", "get-url", remote)
     if rc != 0:
@@ -107,6 +130,8 @@ def get_remote_status(remote: str = "gitcode", branch: str = "main") -> dict:
 
 def git_pull(remote: str = "gitcode", branch: str = "main") -> dict:
     """执行 git pull，返回 {success, message, output}"""
+    if not _validate_branch(branch):
+        return {"success": False, "message": f"分支名非法: {branch!r}", "output": ""}
     rc, out, stderr = _git("pull", "--ff-only", remote, branch)
     if rc == 0:
         new_commit = get_current_commit()
@@ -231,7 +256,16 @@ def check_and_apply_auto_update(db: Session) -> dict | None:
     if not _is_git_repo():
         return None
 
+    # 校验 remote 必须是受信任的 https 地址（防止被配置成任意本地路径/协议）
+    rc, url, _ = _git("remote", "get-url", "gitcode")
+    if rc != 0 or not _is_trusted_remote(url):
+        logger.warning("自动更新已跳过：remote 'gitcode' 不受信任 (url=%r)", url)
+        return None
+
     branch = _get_setting(db, "auto_update_branch") or "main"
+    if not _validate_branch(branch):
+        logger.warning("自动更新已跳过：分支名非法 %r", branch)
+        return None
     remote = "gitcode"  # 默认 remote
 
     remote_status = get_remote_status(remote, branch)
