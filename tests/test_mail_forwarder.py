@@ -78,3 +78,54 @@ class TestBuildEmailBodyMeta:
         assert "原收件人：c@d.com" in body
         assert "原收件日期：2024-03-15 09:05" in body
         assert "原邮件主题：主题X" in body
+
+
+class TestParseRevisionMarkers:
+    """修订标记解析（含对 LLM 不规范输出的容错）"""
+
+    def test_normal_paired_markers(self):
+        from app.services.mail_forwarder import _parse_revision_markers as parse
+        segs = parse("原文。【新增】补充【/新增】继续。【删除】旧条款【/删除】")
+        assert segs == [("normal", "原文。"), ("add", "补充"),
+                        ("normal", "继续。"), ("delete", "旧条款")]
+
+    def test_unclosed_marker_extends_to_end(self):
+        """开标记未闭合：着色延续到文本末尾（隐式闭合）"""
+        from app.services.mail_forwarder import _parse_revision_markers as parse
+        segs = parse("【新增】1. 全部内容。\n2. 延续未闭合。")
+        assert segs == [("add", "1. 全部内容。\n2. 延续未闭合。")]
+
+    def test_prefix_style_markers_merge(self):
+        """行首前缀式【新增】（逐段无闭合）应合并为同一新增段"""
+        from app.services.mail_forwarder import _parse_revision_markers as parse
+        segs = parse("【新增】1. 第一条。\n【新增】2. 第二条。")
+        assert segs == [("add", "1. 第一条。\n2. 第二条。")]
+
+    def test_nested_same_type_tolerated(self):
+        """同类型嵌套 + 外层缺闭合：内层闭合后延续仍为新增"""
+        from app.services.mail_forwarder import _parse_revision_markers as parse
+        segs = parse("【新增】A【新增】10个工作日【/新增】支付至账户。")
+        assert segs == [("add", "A10个工作日支付至账户。")]
+
+    def test_mismatched_close_ignored(self):
+        """闭合标记与当前类型不匹配时忽略，维持当前着色"""
+        from app.services.mail_forwarder import _parse_revision_markers as parse
+        segs = parse("【修改】改动【/新增】后续")
+        assert segs == [("modify", "改动后续")]
+
+    def test_marker_text_not_in_output(self):
+        """标记文字本身不进入输出段"""
+        from app.services.mail_forwarder import _parse_revision_markers as parse
+        segs = parse("【新增】内容【/新增】")
+        assert segs == [("add", "内容")]
+        assert all("【" not in s for _, s in segs)
+
+    def test_business_placeholder_not_marker(self):
+        """原文中的【待确认】等业务占位符不是修订标记，原样保留"""
+        from app.services.mail_forwarder import _parse_revision_markers as parse
+        segs = parse("【新增】总费用【待确认】元。【/新增】")
+        assert segs == [("add", "总费用【待确认】元。")]
+
+    def test_no_markers_returns_normal(self):
+        from app.services.mail_forwarder import _parse_revision_markers as parse
+        assert parse("纯文本") == [("normal", "纯文本")]

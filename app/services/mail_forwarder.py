@@ -563,26 +563,51 @@ def get_default_smtp_config(db_session) -> Optional[dict]:
 # ── 修改版文书 docx 生成 ──
 
 def _parse_revision_markers(text: str) -> list[tuple[str, str]]:
-    """将含 COLLABORATION 标记的修订文本解析为 (tag, text) 序列。
+    """将含修订标记的文本解析为 (tag, text) 序列。
 
     tag: "normal" | "add" | "modify" | "delete"
+
+    使用栈式解析，对 LLM 输出的不规范标记做容错：
+    - 开标记未闭合：着色延续到下一个标记或文本末尾（隐式闭合）
+    - 同类型嵌套（如行首前缀式「【新增】…【新增】…」）：视作同一着色延续
+    - 闭合标记与当前类型不匹配：忽略该闭合，维持当前着色
+    - 标记文字本身不进入输出段（仅渲染颜色）
     """
     import re
-    pattern = r'【(新增|修改|删除)】(.*?)(?:【/\1】|/【\1】)'
-    segments = []
-    last_end = 0
+    tag_map = {"新增": "add", "修改": "modify", "删除": "delete"}
+    marker_re = re.compile(r"【(/?)(新增|修改|删除)】")
 
-    for m in re.finditer(pattern, text, re.DOTALL):
-        if m.start() > last_end:
-            segments.append(("normal", text[last_end:m.start()]))
-        tag_map = {"新增": "add", "修改": "modify", "删除": "delete"}
-        segments.append((tag_map[m.group(1)], m.group(2)))
-        last_end = m.end()
+    segments: list[tuple[str, str]] = []
+    stack: list[str] = []  # 未闭合的开标记类型栈
+    pos = 0
 
-    if last_end < len(text):
-        segments.append(("normal", text[last_end:]))
+    for m in marker_re.finditer(text):
+        is_close = m.group(1) == "/"
+        tag = tag_map[m.group(2)]
+        if m.start() > pos:
+            cur = stack[-1] if stack else "normal"
+            segments.append((cur, text[pos:m.start()]))
+        if is_close:
+            if stack and stack[-1] == tag:  # 仅弹出匹配的栈顶，不匹配则忽略
+                stack.pop()
+        else:
+            stack.append(tag)
+        pos = m.end()
 
-    return segments if segments else [("normal", text)]
+    if pos < len(text):
+        cur = stack[-1] if stack else "normal"
+        segments.append((cur, text[pos:]))
+
+    # 合并相邻同类型段，过滤空段
+    merged: list[tuple[str, str]] = []
+    for tag, seg in segments:
+        if not seg.strip():
+            continue
+        if merged and merged[-1][0] == tag:
+            merged[-1] = (tag, merged[-1][1] + seg)
+        else:
+            merged.append((tag, seg))
+    return merged if merged else [("normal", text)]
 
 
 def _generate_revision_docx(revision_text: str, doc_type: str,
