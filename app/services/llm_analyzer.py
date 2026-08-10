@@ -281,7 +281,7 @@ async def analyze_email(
     payload = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": f"你是一位资深法律文书分析专家。请先识别文书类型，再进行详细解读与审核。严格按JSON格式返回分析结果和修订文书，不要包含markdown代码块标记。禁止输出分析过程、思考步骤或推理说明，直接输出JSON。\n\n重要：当前真实日期是 {date.today().isoformat()}（这是今天的实际日期，你仅需据此计算时效和截止日等时间）"},
+            {"role": "system", "content": f"你是一位资深法律文书分析专家。文书类型已由系统识别阶段确定，请按提示词中嵌入的类型专属分析流程进行解读与审核，无需重新判断文书类型。严格按JSON格式返回分析结果和修订文书，不要包含markdown代码块标记。禁止输出分析过程、思考步骤或推理说明，直接输出JSON。\n\n重要：当前真实日期是 {date.today().isoformat()}（这是今天的实际日期，你仅需据此计算时效和截止日等时间）"},
             user_message,
         ],
         "max_tokens": max_tokens,
