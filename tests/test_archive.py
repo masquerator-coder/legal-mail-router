@@ -74,6 +74,48 @@ class TestIsArchive:
             zf.writestr("a.txt", "x")
         assert is_archive("weird-name-no-ext", buf.getvalue())
 
+    def test_docx_not_archive(self):
+        """docx 是 zip 容器，必须按文档处理而非压缩包（防止解压成内部 XML）"""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("[Content_Types].xml", "<xml/>")
+            zf.writestr("word/document.xml", "<w:document/>")
+        data = buf.getvalue()
+        assert is_archive("合同.docx", data) is False
+        assert is_archive("AI分析报告.docx", data) is False
+        # 无扩展名也能通过内容识别
+        assert is_archive("合同文件", data) is False
+
+    def test_xlsx_pptx_not_archive(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("[Content_Types].xml", "<xml/>")
+        data = buf.getvalue()
+        assert is_archive("表格.xlsx", data) is False
+        assert is_archive("演示.pptx", data) is False
+
+    def test_docx_expand_kept_untouched(self):
+        """docx 附件展开时应原样保留，不产生内部 XML 文件"""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("[Content_Types].xml", "<xml/>")
+            zf.writestr("word/document.xml", "<w:document/>")
+        att = AttachmentInfo(filename="合同.docx", content=buf.getvalue(), content_type="application/vnd")
+        expanded, stats = expand_archive_attachments([att])
+        assert stats["expanded"] is False
+        assert len(expanded) == 1
+        assert expanded[0].filename == "合同.docx"
+
+    def test_zip_inside_docx_still_expanded(self):
+        """真实压缩包仍正常展开（确保修复不误伤 zip 附件）"""
+        inner = io.BytesIO()
+        with zipfile.ZipFile(inner, "w") as zf:
+            zf.writestr("证据.pdf", b"%PDF-1.4")
+        att = AttachmentInfo(filename="材料.zip", content=inner.getvalue(), content_type="application/zip")
+        expanded, stats = expand_archive_attachments([att])
+        assert stats["expanded"] is True
+        assert "证据.pdf" in [a.filename for a in expanded]
+
 
 class TestSafeMemberName:
     def test_plain(self):

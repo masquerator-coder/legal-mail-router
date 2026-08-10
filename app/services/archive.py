@@ -74,10 +74,14 @@ def is_archive(filename: str, content: bytes = b"") -> bool:
     lower = filename.lower()
     if any(lower.endswith(sfx) for sfx in _ARCHIVE_SUFFIXES):
         return True
+    # 扩展名优先：OOXML（docx/xlsx/pptx）等 zip 容器是文档格式，不是压缩包
+    if any(lower.endswith(sfx) for sfx in _ZIP_CONTAINER_EXTS):
+        return False
     # 扩展名兜底：按 magic bytes 识别
     if content:
-        if content[:4] in (b"PK\x03\x04", b"PK\x05\x06") or content[:2] == b"PK":
-            return True  # zip
+        if content[:2] == b"PK":
+            # zip 家族：OOXML 文档（含 [Content_Types].xml）不是压缩包
+            return not _looks_like_ooxml(content)
         if content[:2] == b"\x1f\x8b":
             return True  # gzip
         if content[:3] == b"BZh":
@@ -89,6 +93,29 @@ def is_archive(filename: str, content: bytes = b"") -> bool:
         if content[:7] in (b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00"):
             return True  # rar (rar4 / rar5)
     return False
+
+
+# 以 zip 为容器但属于文档/应用的格式（OOXML 办公文档、OpenDocument、EPUB 等），
+# 内部是结构化文件而非「附件包」，解压会破坏其可读性，故不视为压缩包。
+_ZIP_CONTAINER_EXTS = (
+    # Office Open XML（docx / xlsx / pptx 及其模板/宏变体）
+    ".docx", ".docm", ".dotx", ".dotm",
+    ".xlsx", ".xlsm", ".xltx", ".xltm",
+    ".pptx", ".pptm", ".potx", ".potm", ".ppsx", ".ppsm",
+    # OpenDocument
+    ".odt", ".ods", ".odp",
+    # 其他常见 zip 容器
+    ".epub", ".jar", ".vsdx",
+)
+
+
+def _looks_like_ooxml(content: bytes) -> bool:
+    """检查 zip 内容是否为 OOXML 文档（OOXML 压缩包必含 [Content_Types].xml）"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            return "[Content_Types].xml" in zf.namelist()
+    except Exception:
+        return False
 
 
 def _strip_archive_suffix(filename: str) -> str:
