@@ -496,6 +496,23 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     db.add(log)
     db.flush()
 
+    # ── 展开压缩包附件（zip/rar/7z/tar 等）──
+    # 解压出的文件替代压缩包进入保存 / 分组 / 分析流程；
+    # 展开失败不中断主流程（保留原附件，按原逻辑处理）。
+    if eml.attachments:
+        try:
+            from app.services.archive import expand_archive_attachments
+            eml.attachments, arc_stats = expand_archive_attachments(eml.attachments)
+            if arc_stats.get("expanded"):
+                logger.info(
+                    f"压缩包附件展开完成: 共展开 {arc_stats.get('extracted', 0)} 个文件"
+                    f"（解压文件已进入后续处理流程）"
+                )
+            for err in arc_stats.get("errors", []):
+                logger.warning(f"压缩包附件展开提示: {err}")
+        except Exception as e:
+            logger.warning(f"压缩包附件展开异常（按原附件继续处理）: {e}")
+
     # ── 保存附件 ──
     attachment_records = []
     if account.download_attachments and eml.attachments:

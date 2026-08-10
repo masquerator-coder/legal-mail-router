@@ -62,6 +62,7 @@
 - **发件人过滤 + 全局黑名单** — 每个邮箱账户可配置发件人白名单/黑名单，同时支持全局发件人黑名单（两者 OR 组合，任一匹配即过滤）
 - **重复邮件防护** — 基于 Message-ID 的批量查重，同一封邮件不会被重复处理
 - **附件文本提取** — 支持 PDF、DOCX、DOC（antiword）、XLSX、TXT 等格式
+- **压缩包附件解压** — 附件为 zip / tar / tar.gz / gz / bz2 / xz（内置支持）或 rar / 7z（需系统安装 7z/unrar/unar，Docker 镜像已内置 p7zip-full 与 unar，rar 含 RAR5）时自动解压，解压出的文件替代压缩包进入保存、分组与分析流程；内置 zip-slip 路径穿越防护、解压大小/数量/嵌套深度限制；解压失败时保留原附件不中断处理
 - **附件路径沙箱** — 附件读取/删除限定在 `data/` 目录与系统临时目录内，防止路径越界
 
 ### AI 智能分析
@@ -130,6 +131,7 @@
 | 任务调度 | APScheduler（BackgroundScheduler，Asia/Shanghai） |
 | LLM 调用 | httpx (OpenAI 兼容 API)，支持多模态 |
 | 文档解析 | PyMuPDF / python-docx / openpyxl / antiword |
+| 压缩包解压 | zipfile / tarfile / gzip / bz2 / lzma（内置），rar/7z 走系统 7z/unrar/unar 命令 |
 | Word 生成 | python-docx（着色标注、格式保留、段落填充） |
 | OCR | PaddleOCR / OpenAI Vision / 自定义 HTTP 服务 |
 | 加密 | cryptography (Fernet) |
@@ -288,6 +290,7 @@ legal-mail-router/
 │   ├── flash.py             # Flash 消息中间件
 │   ├── services/            # 核心业务逻辑
 │   │   ├── email_fetcher.py # 邮件拉取（163 raw socket / 标准 IMAP）+ 附件提取 + 黑名单过滤
+│   │   ├── archive.py      # 压缩包附件解压（zip/tar/gz/bz2/xz 内置，rar/7z 走外部命令）+ 安全限制
 │   │   ├── llm_analyzer.py  # 多阶段 LLM 分析（分组/类型识别/类型专属分析）+ 修订生成 + 上下文窗口探测
 │   │   ├── scheduler.py     # 定时调度 + 转发决策 + 进度追踪 + 每日报告
 │   │   ├── mail_forwarder.py# SMTP 转发 + Word 生成 + 模板填充 + 重试机制
