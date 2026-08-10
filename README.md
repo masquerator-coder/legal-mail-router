@@ -35,7 +35,8 @@
 收到邮件
   │
   ▼
-① 拉取与预处理    附件提取（PDF/DOCX/DOC/XLSX/TXT/图片）→ 保存附件
+① 拉取与预处理    附件提取（PDF/DOCX/DOC/XLSX/TXT/图片/压缩包）→ 保存原始附件
+  │                   压缩包自动解压（zip/rar/7z/tar 等，仅用于分析链路）
   │
   ▼
 ② 附件预分类      LLM 按文书类型对附件分组（可关闭；同组附件视为同一份文书）
@@ -218,7 +219,7 @@ docker compose up -d
 | `data/legal_mail.db` | 所有配置和处理记录 |
 | `data/.encryption_key` | 加密密钥（纯随机生成），丢失无法解密密码 |
 | `data/.session_secret` | Web 会话密钥，重启不失效 |
-| `data/attachments/` | 邮件附件 |
+| `data/attachments/` | 邮件附件（压缩包按原邮件原样保存；解压文件不落盘，仅用于分析） |
 
 > 跨机器迁移时须同时复制 `.encryption_key` 和 `.session_secret`。
 
@@ -290,7 +291,7 @@ legal-mail-router/
 │   ├── flash.py             # Flash 消息中间件
 │   ├── services/            # 核心业务逻辑
 │   │   ├── email_fetcher.py # 邮件拉取（163 raw socket / 标准 IMAP）+ 附件提取 + 黑名单过滤
-│   │   ├── archive.py      # 压缩包附件解压（zip/tar/gz/bz2/xz 内置，rar/7z 走外部命令）+ 安全限制
+│   │   ├── archive.py      # 压缩包附件解压（zip/tar/gz/bz2/xz 内置，rar/7z 走外部命令；仅分析链路使用，磁盘保留原始压缩包）+ 安全限制
 │   │   ├── llm_analyzer.py  # 多阶段 LLM 分析（分组/类型识别/类型专属分析）+ 修订生成 + 上下文窗口探测
 │   │   ├── scheduler.py     # 定时调度 + 转发决策 + 进度追踪 + 每日报告
 │   │   ├── mail_forwarder.py# SMTP 转发 + Word 生成 + 模板填充 + 重试机制
@@ -361,6 +362,22 @@ print(f'已删除 {c} 条待处理记录')
 
 - 检查 LLM 配置的 `max_tokens` 是否过小（合同/协议等文书需完整输出修改版正文，建议 ≥ 4096）
 - 系统内置 JSON 修复：自动转义 `revised_document` 中未转义的换行、清理尾逗号、提取 JSON 片段
+
+### 压缩包附件无法解压
+
+邮件附件为压缩包时系统自动解压用于分析（磁盘仍保留原始压缩包）。若处理日志出现 `未找到可用的解压工具` 或 `外部解压失败` 的 warning，按以下排查：
+
+- **zip / tar / gz / bz2 / xz** — 内置支持，无需外部工具；失败通常是文件损坏，原附件保留不影响主流程
+- **rar / 7z** — 依赖系统命令，容器内自检：
+
+  ```bash
+  docker exec legal-mail-router sh -c "which 7z unar lsar"
+  ```
+
+  - `rar` 解压走 `unrar` → `unar` → `7z`（p7zip 的 7z **不含 RAR 解码器**）；RAR5 格式必须由 `unar` 处理
+  - `7z` 解压走 `7z` → `unar`
+  - 缺少工具时：Docker 重建镜像（`docker compose build && docker compose up -d`，镜像内置 `p7zip-full` + `unar`）；宿主机运行需自行安装 7-Zip / unrar / unar
+- 解压失败不会中断邮件处理：压缩包按原附件保留，日志记录 warning
 
 ## License
 
