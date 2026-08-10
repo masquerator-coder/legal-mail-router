@@ -496,24 +496,9 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     db.add(log)
     db.flush()
 
-    # ── 展开压缩包附件（zip/rar/7z/tar 等）──
-    # 解压出的文件替代压缩包进入保存 / 分组 / 分析流程；
-    # 展开失败不中断主流程（保留原附件，按原逻辑处理）。
-    if eml.attachments:
-        try:
-            from app.services.archive import expand_archive_attachments
-            eml.attachments, arc_stats = expand_archive_attachments(eml.attachments)
-            if arc_stats.get("expanded"):
-                logger.info(
-                    f"压缩包附件展开完成: 共展开 {arc_stats.get('extracted', 0)} 个文件"
-                    f"（解压文件已进入后续处理流程）"
-                )
-            for err in arc_stats.get("errors", []):
-                logger.warning(f"压缩包附件展开提示: {err}")
-        except Exception as e:
-            logger.warning(f"压缩包附件展开异常（按原附件继续处理）: {e}")
-
-    # ── 保存附件 ──
+    # ── 保存附件（原始附件，保持与原邮件附件一致）──
+    # 压缩包（zip/rar/7z 等）按原样落盘，不保存解压出的文件；
+    # 解压仅用于后续分组与分析链路。
     attachment_records = []
     if account.download_attachments and eml.attachments:
         attachment_records = save_attachments(eml, log.id, account.username)
@@ -531,6 +516,23 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     # 如果在此期间持写事务，Web 端删除邮件日志将被阻塞至超时。
     db.commit()
     db.refresh(log)
+
+
+    # ── 展开压缩包附件（zip/rar/7z/tar 等，仅用于分组与分析，不落盘）──
+    # 原始压缩包已在上方保存；展开失败不中断主流程（按原附件继续处理）。
+    if eml.attachments:
+        try:
+            from app.services.archive import expand_archive_attachments
+            eml.attachments, arc_stats = expand_archive_attachments(eml.attachments)
+            if arc_stats.get("expanded"):
+                logger.info(
+                    f"压缩包附件展开完成: 共展开 {arc_stats.get('extracted', 0)} 个文件"
+                    f"（磁盘附件保留原始压缩包，解压文件仅用于分析）"
+                )
+            for err in arc_stats.get("errors", []):
+                logger.warning(f"压缩包附件展开提示: {err}")
+        except Exception as e:
+            logger.warning(f"压缩包附件展开异常（按原附件继续处理）: {e}")
 
 
     # ── 提取附件文本（per-attachment + combined） ──
