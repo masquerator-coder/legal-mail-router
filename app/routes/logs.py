@@ -15,7 +15,7 @@ from app.database import get_db, db_retry_commit
 from app.models import EmailLog, Attachment, EmailAccount, DefaultConfig
 from app.services.scheduler import scheduler
 from app.config import ATTACHMENTS_DIR, resolve_attachment_path
-from app.services.mail_forwarder import forward_email, get_default_smtp_config
+from app.services.mail_forwarder import forward_email, get_default_smtp_config, dedupe_smtp_cfgs
 from app.csrf import check_csrf
 from urllib.parse import quote
 
@@ -193,9 +193,12 @@ async def resend_email(
     if not account:
         return {"success": False, "message": "关联邮箱账户不存在"}
 
-    # 获取 SMTP 配置
-    smtp = _infer_smtp_for_log(account, db) or get_default_smtp_config(db)
-    if not smtp:
+    # 获取 SMTP 配置候选（优先收件邮箱账户推断，不可用时回退默认 SMTP）
+    smtp_cfgs = dedupe_smtp_cfgs([
+        _infer_smtp_for_log(account, db),
+        get_default_smtp_config(db),
+    ])
+    if not smtp_cfgs:
         return {"success": False, "message": "未配置 SMTP 服务器"}
 
     # 解析已有的 LLM 分析结果
@@ -232,30 +235,41 @@ async def resend_email(
     if not targets:
         return {"success": False, "message": "未配置转发目标邮箱"}
 
-    # 逐个转发
+    # 逐个转发（按候选发件服务器 failover：收件邮箱 SMTP 不可用时回退默认 SMTP）
     all_success = True
     last_error = ""
     for target in targets:
-        success, error_detail = forward_email(
-            smtp_host=smtp["host"],
-            smtp_port=smtp["port"],
-            smtp_username=smtp["username"],
-            smtp_password_encrypted=smtp["password_encrypted"],
-            from_email=smtp["username"],
-            to_email=target,
-            to_name="",
-            original_subject=log.subject or "",
-            original_body=log.body_text or log.body_preview or "",
-            original_sender=log.sender or "",
-            original_recipient=log.recipient or "",
-            original_date=log.received_at,
-            analyses_results=analyses,
-            attachment_paths=attachment_paths,
-            analysis_output_mode=analysis_output_mode,
-        )
+        success = False
+        error_detail = "无可用 SMTP 候选"
+        for idx, smtp in enumerate(smtp_cfgs):
+            success, error_detail = forward_email(
+                smtp_host=smtp["host"],
+                smtp_port=smtp["port"],
+                smtp_username=smtp["username"],
+                smtp_password_encrypted=smtp["password_encrypted"],
+                from_email=smtp["username"],
+                to_email=target,
+                to_name="",
+                original_subject=log.subject or "",
+                original_body=log.body_text or log.body_preview or "",
+                original_sender=log.sender or "",
+                original_recipient=log.recipient or "",
+                original_date=log.received_at,
+                analyses_results=analyses,
+                attachment_paths=attachment_paths,
+                analysis_output_mode=analysis_output_mode,
+            )
+            if success:
+                break
+            if idx < len(smtp_cfgs) - 1:
+                logger.warning(
+                    f"发件服务器 {smtp['host']}:{smtp['port']} 不可用，"
+                    f"自动回退下一个 SMTP → {target} | 原因: {error_detail}"
+                )
         if not success:
             all_success = False
-            last_error = f"SMTP: {smtp['host']}:{smtp['port']} → {target} | 原因: {error_detail}"
+            hosts = " / ".join(f"{c['host']}:{c['port']}" for c in smtp_cfgs)
+            last_error = f"SMTP: {hosts} → {target} | 原因: {error_detail}"
             logger.error(f"重新转发失败: {last_error}")
 
     # 更新状态

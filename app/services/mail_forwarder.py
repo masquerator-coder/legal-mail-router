@@ -560,6 +560,26 @@ def get_default_smtp_config(db_session) -> Optional[dict]:
     return None
 
 
+def dedupe_smtp_cfgs(smtp_cfgs: list) -> list:
+    """SMTP 候选列表去重并过滤空值（按 host/port/username/密码 完全一致判定）"""
+    seen = set()
+    result = []
+    for cfg in smtp_cfgs:
+        if not cfg:
+            continue
+        key = (
+            cfg.get("host"),
+            cfg.get("port"),
+            cfg.get("username"),
+            cfg.get("password_encrypted"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(cfg)
+    return result
+
+
 # ── 修改版文书 docx 生成 ──
 
 def _parse_revision_markers(text: str) -> list[tuple[str, str]]:

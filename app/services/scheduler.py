@@ -837,30 +837,42 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     all_success = True
     last_error = ""
     for ft in forward_targets:
-        smtp_cfg = ft["smtp_cfg"]
+        smtp_cfgs = ft["smtp_cfgs"]
         target_email = ft["email"]
-        if not smtp_cfg:
+        if not smtp_cfgs:
             continue
-        success, error_detail = forward_email(
-            smtp_host=smtp_cfg["host"],
-            smtp_port=smtp_cfg["port"],
-            smtp_username=smtp_cfg["username"],
-            smtp_password_encrypted=smtp_cfg["password_encrypted"],
-            from_email=smtp_cfg["username"],
-            to_email=target_email,
-            to_name="",
-            original_subject=eml.subject,
-            original_body=eml.body_text,
-            original_sender=eml.sender,
-            original_recipient=eml.recipient,
-            original_date=eml.date,
-            analyses_results=all_analyses if all_analyses else None,
-            attachment_paths=full_attachment_paths,
-            analysis_output_mode=analysis_output_mode,
-        )
+        # 按候选顺序发送：当前发件服务器不可用时自动回退下一个
+        success = False
+        error_detail = "无可用 SMTP 候选"
+        for idx, smtp_cfg in enumerate(smtp_cfgs):
+            success, error_detail = forward_email(
+                smtp_host=smtp_cfg["host"],
+                smtp_port=smtp_cfg["port"],
+                smtp_username=smtp_cfg["username"],
+                smtp_password_encrypted=smtp_cfg["password_encrypted"],
+                from_email=smtp_cfg["username"],
+                to_email=target_email,
+                to_name="",
+                original_subject=eml.subject,
+                original_body=eml.body_text,
+                original_sender=eml.sender,
+                original_recipient=eml.recipient,
+                original_date=eml.date,
+                analyses_results=all_analyses if all_analyses else None,
+                attachment_paths=full_attachment_paths,
+                analysis_output_mode=analysis_output_mode,
+            )
+            if success:
+                break
+            if idx < len(smtp_cfgs) - 1:
+                logger.warning(
+                    f"发件服务器 {smtp_cfg['host']}:{smtp_cfg['port']} 不可用，"
+                    f"自动回退下一个 SMTP → {target_email} | 原因: {error_detail}"
+                )
         if not success:
             all_success = False
-            last_error = f"SMTP: {smtp_cfg.get('host', '?')}:{smtp_cfg.get('port', '?')} → {target_email} | 原因: {error_detail}"
+            hosts = " / ".join(f"{c['host']}:{c['port']}" for c in smtp_cfgs)
+            last_error = f"SMTP: {hosts} → {target_email} | 原因: {error_detail}"
             logger.error(f"转发失败: {last_error}")
 
     if all_success:
@@ -985,10 +997,10 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
     - 垃圾过滤 → 跳过（返回空列表）
     - 非法律文书/法律文书 → 统一按路由规则匹配（account_ids 匹配），兜底默认邮箱
 
-    返回 [{"email": str, "smtp_cfg": dict}, ...] 或空列表（跳过）
+    返回 [{"email": str, "smtp_cfgs": [dict, ...]}, ...] 或空列表（跳过）
     """
     from app.models import DefaultConfig, RoutingRule
-    from app.services.mail_forwarder import get_default_smtp_config
+    from app.services.mail_forwarder import get_default_smtp_config, dedupe_smtp_cfgs
 
     llm_doc_type = analysis.get("doc_type", "") if analysis else ""
     llm_confidence = analysis.get("confidence", 0.5) if analysis else 0.0
@@ -1009,7 +1021,6 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
     # ── 法律文书 → 查路由规则 ──
     targets = []
     seen = set()
-    matched_rule_with_smtp = None  # 首个配置了独立 SMTP 的命中规则
     all_rules = db.query(RoutingRule).filter_by(enabled=True).order_by(RoutingRule.id).all()
     for rule in all_rules:
         ids_str = (rule.account_ids or "").strip()
@@ -1026,13 +1037,9 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
                 if str(account.id) in ids:
                     targets.append(email)
                     seen.add(email)
-                    if rule.smtp_host and matched_rule_with_smtp is None:
-                        matched_rule_with_smtp = rule
             else:
                 targets.append(email)
                 seen.add(email)
-                if rule.smtp_host and matched_rule_with_smtp is None:
-                    matched_rule_with_smtp = rule
 
     if not targets:
         default_email = db.query(DefaultConfig).filter_by(key="default_forward_email").first()
@@ -1046,27 +1053,24 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
 
     log.target_email = ",".join(targets)
 
-    # SMTP 选择优先级：规则级配置 → 系统默认 → 从 IMAP 账户推断
-    # （账户推断用 IMAP 授权码当 SMTP 密码，仅在无任何显式配置时兜底）
-    smtp = None
-    if matched_rule_with_smtp:
-        smtp = {
-            "host": matched_rule_with_smtp.smtp_host,
-            "port": matched_rule_with_smtp.smtp_port or 587,
-            "username": matched_rule_with_smtp.smtp_username or account.username,
-            "password_encrypted": matched_rule_with_smtp.smtp_password_encrypted or account.password_encrypted,
-        }
-        logger.info(f"规则级 SMTP: {smtp['host']}:{smtp['port']} (规则 #{matched_rule_with_smtp.id})")
-    if not smtp:
-        smtp = get_default_smtp_config(db)
-    if not smtp:
-        smtp = _infer_smtp_from_account(account)
-    if not smtp:
+    # SMTP 选择优先级（发件服务器）：收件邮箱账户推断(主) → 系统默认(兜底)
+    # 发送时按序尝试，收件邮箱 SMTP 不可用时自动回退默认 SMTP（failover）
+    smtp_cfgs = []
+    account_smtp = _infer_smtp_from_account(account)
+    if account_smtp:
+        smtp_cfgs.append(account_smtp)
+        logger.info(f"主发件服务器: {account_smtp['host']}:{account_smtp['port']}（收件邮箱 {account.username} 推断）")
+    default_smtp = get_default_smtp_config(db)
+    if default_smtp:
+        smtp_cfgs.append(default_smtp)
+        logger.info(f"兜底发件服务器: {default_smtp['host']}:{default_smtp['port']}（系统默认 SMTP）")
+    smtp_cfgs = dedupe_smtp_cfgs(smtp_cfgs)
+    if not smtp_cfgs:
         log.status = "failed"
         log.error_message = "未配置 SMTP 服务器"
         return []
 
-    return [{"email": t, "smtp_cfg": smtp} for t in targets]
+    return [{"email": t, "smtp_cfgs": smtp_cfgs} for t in targets]
 
 
 def _infer_smtp_from_account(account) -> Optional[dict]:

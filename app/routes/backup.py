@@ -113,10 +113,6 @@ async def export_backup(db: Session = Depends(get_db)):
             "target_email": rule.target_email,
             "target_name": rule.target_name,
             "account_names": account_names,
-            "smtp_host": rule.smtp_host,
-            "smtp_port": rule.smtp_port,
-            "smtp_username": rule.smtp_username,
-            "smtp_password_encrypted": rule.smtp_password_encrypted,
             "priority": rule.priority,
             "enabled": rule.enabled,
         })
@@ -291,7 +287,6 @@ async def import_backup(
 
         # 导入路由规则 — 按 (doc_type, target_email) 匹配，存在则更新，不存在则创建
         for item in data.get("routing_rules", []):
-            _check_encrypted(item.get("smtp_password_encrypted", ""))
             # 从 account_names（列表）或 account_name（旧格式兼容）构建 account_ids
             account_ids_str = ""
             names = item.get("account_names") or []
@@ -319,10 +314,6 @@ async def import_backup(
                 existing.keywords = item.get("keywords", "")
                 existing.target_name = item.get("target_name", "")
                 existing.account_ids = account_ids_str
-                existing.smtp_host = item.get("smtp_host", "")
-                existing.smtp_port = item.get("smtp_port", 587)
-                existing.smtp_username = item.get("smtp_username", "")
-                existing.smtp_password_encrypted = item.get("smtp_password_encrypted", "")
                 existing.priority = item.get("priority", 0)
                 existing.enabled = item.get("enabled", True)
             else:
@@ -332,10 +323,6 @@ async def import_backup(
                     target_email=target_email,
                     target_name=item.get("target_name", ""),
                     account_ids=account_ids_str,
-                    smtp_host=item.get("smtp_host", ""),
-                    smtp_port=item.get("smtp_port", 587),
-                    smtp_username=item.get("smtp_username", ""),
-                    smtp_password_encrypted=item.get("smtp_password_encrypted", ""),
                     priority=item.get("priority", 0),
                     enabled=item.get("enabled", True),
                 )

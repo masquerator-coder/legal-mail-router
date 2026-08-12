@@ -129,3 +129,33 @@ class TestParseRevisionMarkers:
     def test_no_markers_returns_normal(self):
         from app.services.mail_forwarder import _parse_revision_markers as parse
         assert parse("纯文本") == [("normal", "纯文本")]
+
+
+class TestDedupeSmtpCfgs:
+    """SMTP 候选列表去重"""
+
+    def test_filters_none_and_dedupes(self):
+        from app.services.mail_forwarder import dedupe_smtp_cfgs
+
+        base = {"host": "smtp.qq.com", "port": 465, "username": "a@qq.com",
+                "password_encrypted": "enc1"}
+        same = dict(base)
+        other = {"host": "smtp.163.com", "port": 587, "username": "b@163.com",
+                 "password_encrypted": "enc2"}
+        result = dedupe_smtp_cfgs([None, base, same, other, None])
+        assert result == [base, other]
+
+    def test_same_host_different_credential_kept(self):
+        from app.services.mail_forwarder import dedupe_smtp_cfgs
+
+        cfg1 = {"host": "smtp.qq.com", "port": 465, "username": "a@qq.com",
+                "password_encrypted": "enc1"}
+        cfg2 = {"host": "smtp.qq.com", "port": 465, "username": "a@qq.com",
+                "password_encrypted": "enc2"}
+        assert dedupe_smtp_cfgs([cfg1, cfg2]) == [cfg1, cfg2]
+
+    def test_empty_list(self):
+        from app.services.mail_forwarder import dedupe_smtp_cfgs
+
+        assert dedupe_smtp_cfgs([]) == []
+        assert dedupe_smtp_cfgs([None, None]) == []
