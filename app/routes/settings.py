@@ -37,7 +37,7 @@ SETTING_DEFAULTS = {
     "log_retention_days": "90",  # 默认 90 天；设为 0 表示永久保留（不推荐）
     "llm_retry_interval": "10",  # LLM 分析重试间隔（秒）
     "llm_max_retries": "3",      # LLM 分析最大重试次数
-    "analysis_output_mode": "attachment",  # AI解读输出模式: content=邮件正文, attachment=Word附件
+    "analysis_output_mode": "content",  # AI解读输出模式: content=邮件正文, attachment=Word附件（权威默认值，scheduler.py / logs.py / mail_forwarder.py 兜底需与此一致）
     "revision_enabled": "false",        # 是否生成修改版文书
     "revision_highlight": "true",       # 色彩标注改动（蓝色新增/红色修改/删除线建议删除）
     "context_window_tokens": "0",       # 上下文窗口大小(0=自动探测)

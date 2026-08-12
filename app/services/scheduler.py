@@ -832,7 +832,8 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
         except ValueError:
             logger.warning(f"附件路径越界，跳过转发: {att.get('file_path')}")
     output_mode_cfg = db.query(DefaultConfig).filter_by(key="analysis_output_mode").first()
-    analysis_output_mode = output_mode_cfg.value if output_mode_cfg and output_mode_cfg.value else "attachment"
+    # 兜底值需与 settings.SETTING_DEFAULTS["analysis_output_mode"] 保持一致
+    analysis_output_mode = output_mode_cfg.value if output_mode_cfg and output_mode_cfg.value else "content"
 
     all_success = True
     last_error = ""
