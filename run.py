@@ -293,6 +293,13 @@ def cmd_status(args):
 
 
 def main():
+    # Windows 控制台默认 GBK 无法输出 ⚖️ 等 Emoji，强制 UTF-8 避免启动脚本崩溃
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(
         description="邮件智能分析转发系统 — 启动与管理",
         formatter_class=argparse.RawDescriptionHelpFormatter,
