@@ -1,5 +1,6 @@
 services:
   legal-mail-router:
+    image: legal-mail-router
     build: .
     container_name: legal-mail-router
     restart: unless-stopped
