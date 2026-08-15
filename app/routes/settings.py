@@ -1,6 +1,7 @@
 """
 系统设置路由 — 基本参数配置
 """
+import json
 import logging
 import signal
 import sys
@@ -28,6 +29,35 @@ def _is_valid_port(value: str) -> bool:
     except ValueError:
         return False
 
+# 北大法宝 MCP 服务器默认配置（Token 用占位符 __PKULAW_TOKEN__，首次使用时在设置页替换为真实 Token）
+_MCP_DEFAULT_TOKEN = "__PKULAW_TOKEN__"
+
+_PKULAW_MCP_SERVERS = {
+    "pkulaw-law-search": "https://apim-gateway.pkulaw.com/mcp-law-search-service",
+    "pkulaw-law-keyword": "https://apim-gateway.pkulaw.com/mcp-law",
+    "pkulaw-case-semantic-search": "https://apim-gateway.pkulaw.com/mcp-case-search-service",
+    "pkulaw-case-keyword": "https://apim-gateway.pkulaw.com/mcp-case",
+    "pkulaw-law-item-keyword": "https://apim-gateway.pkulaw.com/mcp-fatiao",
+    "pkulaw-law-recognition": "https://apim-gateway.pkulaw.com/law_recognition",
+    "pkulaw-case-number-recognition": "https://apim-gateway.pkulaw.com/case_number_recognition",
+    "pkulaw-citation-validator": "https://apim-gateway.pkulaw.com/pku_citation_validator",
+    "pkulaw-doc-link": "https://apim-gateway.pkulaw.com/add-doc-link",
+}
+
+DEFAULT_MCP_SERVERS = json.dumps(
+    {
+        "mcpServers": {
+            name: {
+                "type": "streamableHttp",
+                "url": url,
+                "headers": {"Authorization": f"Bearer {_MCP_DEFAULT_TOKEN}"},
+            }
+            for name, url in _PKULAW_MCP_SERVERS.items()
+        }
+    },
+    ensure_ascii=False,
+)
+
 # 可配置的参数键及其默认值
 SETTING_DEFAULTS = {
     "system_name": "邮件智能分析转发系统",
@@ -46,13 +76,11 @@ SETTING_DEFAULTS = {
     "admin_email": "",              # 日报接收邮箱（空=不发送）
     "daily_report_enabled": "true", # 日报开关
     "daily_report_time": "09:00",   # 日报发送时间 (HH:MM, 24小时制)
-    # ── 法律知识库（LLM Wiki）──
-    "kb_enabled": "false",           # 启用知识库检索
-    "kb_api_base": "http://127.0.0.1:19828",  # LLM Wiki API 地址
-    "kb_token": "",                  # API Token（在 LLM Wiki 设置页生成）
-    "kb_project_id": "",             # 知识库项目 ID
-    "kb_search_max_chars": "5000",   # 知识库检索结果最大字符数（0=不截断）
     "email_body_max_chars": "8000",  # 送入 LLM 的邮件正文最大字符数（0=不截断）
+    # ── MCP 工具（如北大法宝法规检索） ──
+    "mcp_enabled": "false",        # 启用 MCP 工具（第二阶段文书分析时供 LLM 调用）
+    "mcp_servers": DEFAULT_MCP_SERVERS,  # MCP 服务器配置 JSON（预填北大法宝，Token 占位符 __PKULAW_TOKEN__）
+    "mcp_max_turns": "5",           # MCP 工具调用的最大轮次（模型需多轮检索后才输出最终 JSON，默认 5 较稳妥）
     "llm_timeout": "180",            # LLM 调用超时（秒），含分析 + 修改版文书
     "context_window_usage_ratio": "0.50",  # 输入占上下文窗口的比例（0.1-0.95）
     "token_estimation_method": "approximate",  # token估算方法: approximate / tiktoken
@@ -136,13 +164,10 @@ async def save_settings(
     admin_email: str = Form(""),
     daily_report_enabled: str = Form("true"),
     daily_report_time: str = Form("09:00"),
-    # ── 法律知识库 ──
-    kb_enabled: str = Form("false"),
-    kb_api_base: str = Form("http://127.0.0.1:19828"),
-    kb_token: str = Form(""),
-    kb_project_id: str = Form(""),
-    kb_search_max_chars: str = Form("5000"),
     email_body_max_chars: str = Form("8000"),
+    mcp_enabled: str = Form("false"),
+    mcp_servers: str = Form(""),
+    mcp_max_turns: int = Form(5),
     llm_timeout: int = Form(180),
     context_window_usage_ratio: str = Form("0.50"),
     token_estimation_method: str = Form("approximate"),
@@ -184,13 +209,10 @@ async def save_settings(
     _save_setting(db, "admin_email", admin_email.strip())
     _save_setting(db, "daily_report_enabled", "true" if daily_report_enabled.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "daily_report_time", daily_report_time.strip())
-    # ── 法律知识库 ──
-    _save_setting(db, "kb_enabled", "true" if kb_enabled.lower() in ("true", "on", "1") else "false")
-    _save_setting(db, "kb_api_base", kb_api_base.strip())
-    _save_setting(db, "kb_token", kb_token.strip())
-    _save_setting(db, "kb_project_id", kb_project_id.strip())
-    _save_setting(db, "kb_search_max_chars", kb_search_max_chars.strip())
     _save_setting(db, "email_body_max_chars", email_body_max_chars.strip())
+    _save_setting(db, "mcp_enabled", "true" if mcp_enabled.lower() in ("true", "on", "1") else "false")
+    _save_setting(db, "mcp_servers", mcp_servers.strip())
+    _save_setting(db, "mcp_max_turns", str(mcp_max_turns))
     _save_setting(db, "llm_timeout", str(llm_timeout))
     _save_setting(db, "context_window_usage_ratio", context_window_usage_ratio.strip())
     _save_setting(db, "token_estimation_method", token_estimation_method.strip())
@@ -357,27 +379,30 @@ async def detect_context_window_endpoint(request: Request, db: Session = Depends
         return {"success": False, "message": f"探测失败: {e}"}
 
 
-@router.get("/kb-health")
-async def kb_health_check(api_base: str = "http://127.0.0.1:19828"):
-    """测试知识库连接（服务端代理，避免浏览器 CORS 限制）"""
-    from app.services.kb_client import health_check
-    try:
-        ok = await health_check(api_base)
-        if ok:
-            return {"success": True, "message": "知识库服务连接成功"}
-        else:
-            return {"success": False, "message": "知识库服务不可达"}
-    except Exception as e:
-        return {"success": False, "message": f"连接失败: {e}"}
+@router.get("/mcp-tools")
+async def mcp_list_tools(config: str = "", db: Session = Depends(get_db)):
+    """测试 MCP 连接并列出可用工具（只读，不保存）。用于设置页「列出工具」按钮。
 
+    config: 可选，当前设置页文本域里的 MCP 配置 JSON（测试未保存的改动）；
+            为空时回退到数据库已保存的配置。
 
-def get_kb_config(db: Session) -> dict:
-    """读取法律知识库（LLM Wiki）配置，供 LLM 分析流程使用"""
-    return {
-        "enabled": _get_setting(db, "kb_enabled") == "true",
-        "api_base": _get_setting(db, "kb_api_base").strip() or "http://127.0.0.1:19828",
-        "token": _get_setting(db, "kb_token").strip(),
-        "project_id": _get_setting(db, "kb_project_id").strip(),
-    }
+    注意：通过 ``asyncio.to_thread(list_mcp_tools, ...)`` 在独立线程 + 独立事件
+    循环里执行 —— mcp SDK 的 anyio 任务组与 Starlette BaseHTTPMiddleware
+    （CSRF 中间件）存在已知冲突，直接在端点里跑会返回 HTTP 500。
+    """
+    import asyncio
+
+    from app.services.mcp_client import list_mcp_tools, parse_server_configs
+
+    raw_cfg = config.strip() if config and config.strip() else (_get_setting(db, "mcp_servers") or "")
+    servers = parse_server_configs(raw_cfg)
+    if not servers:
+        return {
+            "success": False,
+            "message": "未配置有效的 MCP 服务器（配置为空或 JSON 无效）",
+            "tools": [],
+        }
+    return await asyncio.to_thread(list_mcp_tools, servers)
+
 
 

@@ -57,23 +57,6 @@ class TestBuildPrompt:
         )
         assert body in prompt
 
-    def test_kb_context_injection(self):
-        """知识库上下文应注入到 prompt 末尾"""
-        kb_ctx = "## 相关法律法规参考（来自知识库）\n【民法典.md】\n第一百二十条..."
-        prompt = build_prompt(
-            subject="test", sender="s", body="body",
-            kb_context=kb_ctx,
-        )
-        assert kb_ctx in prompt
-        # kb_context 应在邮件内容之后
-        assert prompt.index("body") < prompt.index("相关法律法规参考")
-
-    def test_empty_kb_context_ignored(self):
-        """空 kb_context 不影响输出"""
-        prompt_no_kb = build_prompt(subject="a", sender="b", body="c")
-        prompt_empty_kb = build_prompt(subject="a", sender="b", body="c", kb_context="")
-        assert prompt_no_kb == prompt_empty_kb
-
     def test_custom_prompt_without_placeholders(self):
         """自定义提示词不含已知占位符时不报错"""
         prompt = build_prompt(
@@ -445,3 +428,83 @@ class TestRoleLlmCfg:
         role_db.add(DefaultConfig(key="llm_role_classifier", value="99999"))  # 不存在的ID
         role_db.commit()
         assert _get_role_llm_cfg(role_db, "classifier").name == "A"  # 回退 analyzer
+
+
+class TestMcpToolLoopFallback:
+    """MCP 工具循环不收敛时，应优雅回退为不使用工具的普通分析（不整篇失败）。"""
+
+    def _tool_call_reply(self):
+        return {"choices": [{"message": {"role": "assistant", "content": None,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                            "function": {"name": "search_article", "arguments": "{}"}}]}}]}
+
+    def _json_reply(self, content):
+        return {"choices": [{"message": {"role": "assistant", "content": content}}]}
+
+    class _FakeResp:
+        def __init__(self, data):
+            self.data = data
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return self.data
+
+    class _FakeMcp:
+        def __init__(self, servers):
+            from types import SimpleNamespace
+            self.tools = [SimpleNamespace(name="search_article", description="d",
+                                          input_schema={}, server="s1")]
+            self.connected_servers = ["s1"]
+            self.citation_links = []
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return None
+        def has_tools(self):
+            return True
+        def list_openai_tools(self):
+            return [{"type": "function", "function": {"name": "search_article", "parameters": {}}}]
+        async def call(self, name, args):
+            return "法规检索结果"
+
+    @pytest.mark.asyncio
+    async def test_tool_loop_nonconvergence_falls_back(self, monkeypatch):
+        # 前两轮模型只回 tool_calls（不收敛），第三轮（回退的普通分析）返回有效 JSON
+        replies = [
+            self._tool_call_reply(),
+            self._tool_call_reply(),
+            self._json_reply('{"doc_type": "合同协议", "case_summary": "s", '
+                             '"ai_interpretation": "a", "urgency": "high", "confidence": 0.9}'),
+        ]
+        state = {"i": 0}
+
+        class _FakeClient:
+            def __init__(self, *a, **k):
+                self._closed = False
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                self._closed = True
+                return None
+            async def post(self, *a, **k):
+                # 若回退块被错误地放到 async with 块外，client 已关闭，此处应抛错（与生产一致）
+                if self._closed:
+                    raise RuntimeError("Cannot send a request, as the client has been closed.")
+                data = replies[min(state["i"], len(replies) - 1)]
+                state["i"] += 1
+                return TestMcpToolLoopFallback._FakeResp(data)
+
+        monkeypatch.setattr(m, "decrypt", lambda e: "test-key")
+        monkeypatch.setattr(m, "httpx", type("HH", (), {"AsyncClient": _FakeClient}))
+        from app.services import mcp_client as mcp_mod
+        monkeypatch.setattr(mcp_mod, "MCPClient", self._FakeMcp)
+
+        result = await m.analyze_email(
+            api_url="http://llm/v1", api_key_encrypted="enc", model_name="m",
+            subject="主题", sender="发件人", body="正文",
+            mcp_servers=[{"name": "s1", "url": "http://mcp", "headers": {}}],
+            mcp_max_turns=1,  # max_rounds=2 → 两轮 tool_calls 后触发回退
+        )
+        # 回退结果应正常返回，且共发出 3 次请求（2 轮工具 + 1 次普通分析）
+        assert result["doc_type"] == "合同协议"
+        assert state["i"] == 3

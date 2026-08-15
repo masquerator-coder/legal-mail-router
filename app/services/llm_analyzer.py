@@ -29,6 +29,16 @@ _DEFAULT_DOC_TYPES = [
 # 系统兜底类型：无论配置文件如何，均强制包含
 _FALLBACK_DOC_TYPES = ("其他法律文书", "非法律文书")
 
+# MCP 工具使用要求（启用 MCP 时注入提示词，指导模型实时查询法规并附引用链接）
+_MCP_USAGE_INSTRUCTION = """## 法律检索工具（MCP）
+本次分析已提供法律检索工具，可实时查询「北大法宝」权威法律法规数据库。请遵循：
+1. 当需要引用具体法律法规、司法解释或法条原文时，请调用相应工具检索（如 adjust_provisions 获取权威条文原文及司法解释、search_article 语义检索法规、get_article/get_law_item_content 按法规标题+条号精确取条）。
+2. 必须以工具返回的权威条文原文为依据进行分析与引用，严禁仅凭训练数据编造法条内容或条号。
+3. 每引用一条法规，须在 ai_interpretation 报告末尾附加「引用依据」小节，逐条列出：法规名称、对应条文、来源链接（取自工具返回结果中的 url 字段）。
+4. 若生成了修改版文书 revised_document 且其中引用了法规，请在文书正文结束后另起一行附「引用依据」列表（法规名称 + 来源链接）。
+5. 工具调用失败或未返回结果时，正常按现有知识与逻辑完成分析，不要中断，也不要编造引用链接。
+"""
+
 
 def _get_doc_types() -> list:
     """获取文书类型清单：从 文书类型.conf 读取（每行一个类型），缺失时回退内置默认。
@@ -126,7 +136,6 @@ def _escape_json_string_newlines(text: str) -> str:
 
 def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
                   body_max_chars: int = 8000,
-                  kb_context: str = "",
                   today_str: str = "",
                   analysis_instructions: str = "") -> str:
     """构建分析 prompt。body_max_chars 为邮件正文字符上限（0=不截断）。
@@ -174,9 +183,6 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
     if analysis_instructions and not template_has_analysis_placeholder:
         logger.warning("提示词模板未包含 {analysis_instructions} 占位符，已将文书分析流程提示词追加到提示词末尾")
         prompt += "\n\n" + analysis_instructions
-    # 注入知识库检索结果
-    if kb_context:
-        prompt += "\n\n" + kb_context
     return prompt
 
 
@@ -193,18 +199,23 @@ async def analyze_email(
     attachment_texts: str = "",
     images: list = None,
     model_type: str = "unknown",
-    kb_context: str = "",
     body_max_chars: int = 8000,
     timeout: int = 180,
     context_window: int = 0,
     usage_ratio: float = 0.50,
     token_method: str = "approximate",
     analysis_instructions: str = "",
+    mcp_servers: list = None,
+    mcp_max_turns: int = 5,
 ) -> dict:
     """
     使用 LLM 分析邮件（含附件文本）—— 第二阶段文书分析
 
     analysis_instructions: 按文书类型读取的分析流程提示词，嵌入主模板 {analysis_instructions} 占位符。
+
+    mcp_servers: MCP 服务器配置（list of {name,url,headers} 或兼容形态）。非空时启用 MCP 工具
+                 调用循环（如北大法宝法规检索），模型可实时查法规并在报告/修改版文书末尾附引用链接。
+    mcp_max_turns: MCP 工具调用的最大轮次（每轮可含多个工具调用），超出则取当前内容。
 
     返回:
     {
@@ -220,7 +231,7 @@ async def analyze_email(
     """
     api_key = decrypt(api_key_encrypted)
 
-    # 构建 base prompt（不含 kb_context，因为它需要单独跟踪用于截断）
+    # 构建 base prompt
     prompt = build_prompt(subject, sender, body, custom_prompt,
                           body_max_chars=body_max_chars,
                           analysis_instructions=analysis_instructions)
@@ -232,21 +243,45 @@ async def analyze_email(
     if context_window > 0:
         parts = {
             "template_with_body": prompt,
-            "kb_context": kb_context,
             "attachment_texts": attachment_texts,
         }
         parts = truncate_prompt_parts(parts, context_window, usage_ratio, expected_output_tokens, token_method)
         prompt = parts["template_with_body"]
-        kb_context = parts.get("kb_context", "")
         attachment_texts = parts.get("attachment_texts", "")
-
-    # 拼接 kb_context
-    if kb_context:
-        prompt += "\n\n" + kb_context
 
     # 拼接附件内容
     if attachment_texts:
         prompt += f"\n\n## 附件内容\n{attachment_texts}"
+
+    # 保存「不含 MCP 引导语」的原始提示词，供工具循环不收敛时回退用（见下方降级逻辑）
+    prompt_base = prompt
+
+    # ── MCP 工具连接（如北大法宝法规检索） ──
+    mcp_client = None
+    mcp_used = False
+    if mcp_servers:
+        from app.services.mcp_client import MCPClient, parse_server_configs
+        parsed = parse_server_configs(mcp_servers)
+        if parsed:
+            try:
+                mcp_client = await MCPClient(parsed).__aenter__()
+                if mcp_client.has_tools():
+                    prompt += "\n\n" + _MCP_USAGE_INSTRUCTION
+                    logger.info(
+                        "MCP 已启用：发现 %d 个工具（服务器：%s）",
+                        len(mcp_client.tools), ", ".join(mcp_client.connected_servers),
+                    )
+                else:
+                    logger.warning("MCP 服务器已连接但未发现工具，本次分析不使用工具")
+                    mcp_client = None
+            except Exception as e:
+                logger.warning("MCP 初始化失败，本次分析不使用工具: [%s] %s", type(e).__name__, str(e)[:200])
+                if mcp_client is not None:
+                    try:
+                        await mcp_client.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                mcp_client = None
 
     # 确保 api_url 以 /v1 结尾的格式
     if not api_url.endswith("/chat/completions"):
@@ -278,22 +313,100 @@ async def analyze_email(
     else:
         user_message = {"role": "user", "content": prompt}
 
+    messages = [
+        {"role": "system", "content": f"你是一位资深法律文书分析专家。文书类型已由系统识别阶段确定，请按提示词中嵌入的类型专属分析流程进行解读与审核，无需重新判断文书类型。严格按JSON格式返回分析结果和修订文书，不要包含markdown代码块标记。禁止输出分析过程、思考步骤或推理说明，直接输出JSON。\n\n重要：当前真实日期是 {date.today().isoformat()}（这是今天的实际日期，你仅需据此计算时效和截止日等时间）"},
+        user_message,
+    ]
+
     payload = {
         "model": model_name,
-        "messages": [
-            {"role": "system", "content": f"你是一位资深法律文书分析专家。文书类型已由系统识别阶段确定，请按提示词中嵌入的类型专属分析流程进行解读与审核，无需重新判断文书类型。严格按JSON格式返回分析结果和修订文书，不要包含markdown代码块标记。禁止输出分析过程、思考步骤或推理说明，直接输出JSON。\n\n重要：当前真实日期是 {date.today().isoformat()}（这是今天的实际日期，你仅需据此计算时效和截止日等时间）"},
-            user_message,
-        ],
+        "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    use_tools = mcp_client is not None and mcp_client.has_tools()
+    if use_tools:
+        payload["tools"] = mcp_client.list_openai_tools()
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(api_url, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            max_rounds = (mcp_max_turns or 5) + 1 if use_tools else 1
+            for _ in range(max_rounds):
+                response = await client.post(api_url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                msg = data["choices"][0]["message"]
 
-    content = data["choices"][0]["message"]["content"].strip()
+                tool_calls = msg.get("tool_calls")
+                if not tool_calls:
+                    content = (msg.get("content") or "").strip()
+                    break
+
+                # 工具调用轮：执行 MCP 工具并把结果回填给模型
+                mcp_used = True
+                logger.info("LLM 请求调用 %d 个 MCP 工具", len(tool_calls))
+                messages.append({
+                    "role": "assistant",
+                    "content": msg.get("content"),
+                    "tool_calls": tool_calls,
+                })
+                for tc in tool_calls:
+                    fn = tc.get("function") or {}
+                    name = fn.get("name")
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                    except Exception:
+                        args = {}
+                    if not name:
+                        continue
+                    result_text = await mcp_client.call(name, args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id"),
+                        "content": result_text,
+                    })
+                payload["messages"] = messages
+            else:
+                # 达到最大轮次仍无最终内容
+                content = ""
+                logger.warning("MCP 工具调用达到最大轮次 %d，未获得最终 JSON 内容", mcp_max_turns or 5)
+
+            # MCP 工具循环未收敛（模型持续请求工具但始终不输出最终 JSON）的优雅降级：
+            # 用「不含工具定义、不含 MCP 引导语」的原始消息重跑一次普通分析，
+            # 保证 MCP 失败 / 模型不收敛不会让整篇文书分析失败（回归到 MCP 之前的可用行为）。
+            if use_tools and not content:
+                logger.warning(
+                    "MCP 工具循环在 %d 轮内未收敛，回退为不使用工具的普通分析（避免整篇分析失败）",
+                    (mcp_max_turns or 5),
+                )
+                if use_vision:
+                    fallback_user = {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_base},
+                            *[p for p in messages[1]["content"] if p.get("type") == "image_url"],
+                        ],
+                    }
+                else:
+                    fallback_user = {"role": "user", "content": prompt_base}
+                payload = {
+                    "model": model_name,
+                    "messages": [messages[0], fallback_user],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                }
+                response = await client.post(api_url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                content = (data["choices"][0]["message"].get("content") or "").strip()
+                mcp_used = False
+    finally:
+        if mcp_client is not None:
+            try:
+                await mcp_client.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug("MCP 客户端关闭异常: %s", e)
+
 
     # 清理可能的 markdown 代码块标记
     if content.startswith("```"):
@@ -305,8 +418,7 @@ async def analyze_email(
 
     try:
         result = json.loads(content)
-        validated = _validate_llm_output(result)
-        return validated
+        return _finalize_with_citations(_validate_llm_output(result), mcp_used, mcp_client)
     except json.JSONDecodeError:
         # 尝试修复常见 JSON 问题（revised_document 中未转义的换行符等）
         import re
@@ -318,7 +430,7 @@ async def analyze_email(
             result = json.loads(repaired)
             validated = _validate_llm_output(result)
             logger.info("JSON 修复后解析成功")
-            return validated
+            return _finalize_with_citations(validated, mcp_used, mcp_client)
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -328,7 +440,7 @@ async def analyze_email(
         if match:
             try:
                 result = json.loads(match.group())
-                return _validate_llm_output(result)
+                return _finalize_with_citations(_validate_llm_output(result), mcp_used, mcp_client)
             except (json.JSONDecodeError, ValueError):
                 pass
 
@@ -566,13 +678,14 @@ async def analyze_email_two_stage(
     attachment_texts: str = "",
     images: list = None,
     model_type: str = "unknown",
-    kb_context: str = "",
     body_max_chars: int = 8000,
     timeout: int = 180,
     context_window: int = 0,
     usage_ratio: float = 0.50,
     token_method: str = "approximate",
     classifier_cfg: dict = None,
+    mcp_servers: list = None,
+    mcp_max_turns: int = 5,
 ) -> dict:
     """两阶段邮件分析编排。
 
@@ -633,13 +746,14 @@ async def analyze_email_two_stage(
         attachment_texts=attachment_texts,
         images=images,
         model_type=model_type,
-        kb_context=kb_context,
         body_max_chars=body_max_chars,
         timeout=timeout,
         context_window=context_window,
         usage_ratio=usage_ratio,
         token_method=token_method,
         analysis_instructions=analysis_instructions,
+        mcp_servers=mcp_servers,
+        mcp_max_turns=mcp_max_turns,
     )
 
     # 合并：doc_type/confidence 以第一阶段识别结果为准（保证路由与日志稳定）
@@ -654,6 +768,32 @@ async def analyze_email_two_stage(
 
 
 _VALID_URGENCIES = frozenset({"high", "medium", "low"})
+
+
+def _finalize_with_citations(validated: dict, mcp_used: bool, mcp_client) -> dict:
+    """MCP 使用后，若报告/修改版文书尚未含来源链接，把工具返回的法规链接兜底追加到末尾。
+
+    主要靠提示词让模型自行附加「引用依据」；此处作为兜底，仅当输出中完全没有 pkulaw 链接时补上，
+    避免重复，也保证「报告/修改版文书末尾附引用链接」的需求始终达成。
+    """
+    if not (mcp_used and mcp_client and getattr(mcp_client, "citation_links", None)):
+        return validated
+    links = list(dict.fromkeys(mcp_client.citation_links[:10]))
+    if not links:
+        return validated
+
+    ai = validated.get("ai_interpretation") or ""
+    if ai and "pkulaw.com" not in ai:
+        validated["ai_interpretation"] = (
+            ai + "\n\n【引用依据】\n" + "\n".join(f"- {u}" for u in links)
+        ).strip()
+
+    rd = validated.get("revised_document")
+    if rd and "pkulaw.com" not in str(rd):
+        validated["revised_document"] = (
+            str(rd) + "\n\n【引用依据】\n" + "\n".join(f"- {u}" for u in links)
+        ).strip()
+    return validated
 
 
 def _validate_llm_output(result: dict) -> dict:

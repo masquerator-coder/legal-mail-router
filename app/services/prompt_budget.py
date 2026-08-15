@@ -5,12 +5,11 @@ Provides pre-submission length checking against the LLM context window,
 with priority-based truncation when the assembled prompt exceeds the budget.
 
 Priority (lowest first, cut first):
-  KB context -> Attachment texts (at attachment boundaries) -> Email body (from end) -> Prompt template (never)
+  Attachment texts (at attachment boundaries) -> Email body (from end) -> Prompt template (never)
 
 Usage:
   parts = {
       "template_with_body": str,   # prompt template with {body} substituted
-      "kb_context": str,           # knowledge base context
       "attachment_texts": str,     # attachment text (without "## 附件内容" prefix)
   }
 
@@ -63,28 +62,25 @@ def truncate_prompt_parts(
     """Truncate prompt parts by priority until within context window budget.
 
     Returns modified parts dict with truncation applied.
-    Priority (ascending, cut first): kb_context -> attachments -> body -> template (never cut)
+    Priority (ascending, cut first): attachments -> body -> template (never cut)
     """
     raw_template = parts.get("template_with_body", "")
-    raw_kb = parts.get("kb_context", "")
     raw_att = parts.get("attachment_texts", "")
 
-    if not (raw_kb or raw_att):
+    if not raw_att:
         return parts
 
     # Input budget = context_window * usage_ratio - output_tokens
     input_budget = int(context_window_tokens * usage_ratio) - output_tokens
     input_budget = max(input_budget, 1024)
 
-    def _assemble(t, k, a):
+    def _assemble(t, a):
         p = t
-        if k:
-            p += "\n\n" + k
         if a:
             p += "\n\n## \u9644\u4ef6\u5185\u5bb9\n" + a  # 附件内容
         return p
 
-    current_tokens = estimate_tokens(_assemble(raw_template, raw_kb, raw_att), token_method)
+    current_tokens = estimate_tokens(_assemble(raw_template, raw_att), token_method)
     if current_tokens <= input_budget:
         return parts
 
@@ -95,19 +91,7 @@ def truncate_prompt_parts(
 
     result = dict(parts)
 
-    # Level 1: remove KB context
-    if raw_kb:
-        kb_tok = estimate_tokens(raw_kb, token_method)
-        logger.info("Truncation L1: removed KB context (~%s tokens)", kb_tok)
-        result["kb_context"] = ""
-        raw_kb = ""
-        current_tokens = estimate_tokens(
-            _assemble(raw_template, "", raw_att), token_method,
-        )
-        if current_tokens <= input_budget:
-            return result
-
-    # Level 2: remove attachments individually (starting from the last one)
+    # Level 1: remove attachments individually (starting from the last one)
     if raw_att:
         att_segments = raw_att.split("=== ")
         att_parts = []
@@ -120,17 +104,17 @@ def truncate_prompt_parts(
         while att_parts and current_tokens > input_budget:
             removed = att_parts.pop()
             removed_tok = estimate_tokens(removed, token_method)
-            logger.info("Truncation L2: removed attachment %s... (~%s tokens)", removed[:50], removed_tok)
+            logger.info("Truncation L1: removed attachment %s... (~%s tokens)", removed[:50], removed_tok)
             remaining_att = "\n\n".join(att_parts)
             current_tokens = estimate_tokens(
-                _assemble(raw_template, "", remaining_att), token_method,
+                _assemble(raw_template, remaining_att), token_method,
             )
             if current_tokens <= input_budget:
                 result["attachment_texts"] = remaining_att
                 return result
         result["attachment_texts"] = "\n\n".join(att_parts) if att_parts else ""
 
-    # Level 3: truncate email body (from the end, in 15% chunks)
+    # Level 2: truncate email body (from the end, in 15% chunks)
     if current_tokens > input_budget:
         body_marker = "## Input"
         output_marker = "## Output"
@@ -146,11 +130,11 @@ def truncate_prompt_parts(
                 cut = max(1, int(len(body_region) * 0.15))
                 body_region = body_region[:-cut]
                 current_tokens = estimate_tokens(
-                    _assemble(template_head + body_region + template_tail, "", result.get("attachment_texts", "")),
+                    _assemble(template_head + body_region + template_tail, result.get("attachment_texts", "")),
                     token_method,
                 )
             result["template_with_body"] = template_head + body_region + template_tail
-            logger.info("Truncation L3: body truncated to ~%s tokens", estimate_tokens(body_region, token_method))
+            logger.info("Truncation L2: body truncated to ~%s tokens", estimate_tokens(body_region, token_method))
 
         if current_tokens > input_budget:
             # Final fallback: only keep the template structure
@@ -159,7 +143,6 @@ def truncate_prompt_parts(
                 x >= 0 for x in [body_start, output_start]
             ) else raw_template[:input_budget * 2]
             result["attachment_texts"] = ""
-            result["kb_context"] = ""
             logger.warning("Truncation fallback: only prompt template kept, body+attachments removed")
 
     return result

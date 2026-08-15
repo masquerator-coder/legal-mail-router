@@ -178,7 +178,7 @@
                            class="form-control" style="width:120px;"
                            min="0" max="100000" step="100">
                     <div class="form-hint">
-                        送入 LLM 分析的邮件正文最大字符数。0=不限制（独立于知识库，即使未启用知识库检索也生效）
+                        送入 LLM 分析的邮件正文最大字符数。0=不限制
                     </div>
                 </div>
             </div>
@@ -284,69 +284,52 @@
         </div>
     </div>
 
-    <!-- 法律知识库（LLM Wiki） -->
+    <!-- MCP 工具（北大法宝法规检索） -->
     <div class="card">
-        <div class="card-header"><h3>📚 法律知识库（LLM Wiki）</h3></div>
+        <div class="card-header"><h3>🔗 MCP 工具（法律检索）</h3></div>
         <div class="card-body">
             <div class="form-group">
-                <label>启用知识库检索</label>
+                <label>启用 MCP 工具</label>
                 <div style="margin-top:6px;">
-                    <input type="hidden" name="kb_enabled" value="false">
-                    <input type="checkbox" name="kb_enabled" value="true"
-                           {% if settings.kb_enabled == 'true' %}checked{% endif %}
-                           onchange="toggleKbFields(this.checked)"
+                    <input type="hidden" name="mcp_enabled" value="false">
+                    <input type="checkbox" name="mcp_enabled" value="true"
+                           {% if settings.mcp_enabled == 'true' %}checked{% endif %}
+                           onchange="toggleMcpFields(this.checked)"
                            style="width:18px;height:18px;cursor:pointer;">
-                    <span style="margin-left:6px;font-size:14px;">LLM 分析时自动检索相关法律法规</span>
+                    <span style="margin-left:6px;font-size:14px;">第二阶段文书分析时，LLM 可调用 MCP 工具实时查询法律法规</span>
                 </div>
                 <div class="form-hint">
-                    启用后，每次 LLM 分析前会根据邮件内容检索 LLM Wiki 知识库，将匹配的法律法规作为参考注入分析提示词。知识库服务不可用时不影响正常分析流程。
+                    启用后，LLM 分析文书需引用法规时，可调用工具查询「北大法宝」等权威数据库，并依据返回的条文原文引用；报告与修改版文书末尾会附加来源链接。工具不可用时自动降级，不影响正常分析。
                 </div>
             </div>
 
-            <div id="kb-fields-group" style="margin-top:16px;display:none;">
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-                    <div class="form-group">
-                        <label for="kb_api_base">API 地址</label>
-                        <input type="text" id="kb_api_base" name="kb_api_base"
-                               value="{{ settings.kb_api_base }}"
-                               class="form-control" style="width:100%;"
-                               placeholder="http://127.0.0.1:19828">
-                        <div class="form-hint">LLM Wiki 的 HTTP API 地址</div>
-                    </div>
-                    <div class="form-group">
-                        <label for="kb_project_id">项目 ID</label>
-                        <input type="text" id="kb_project_id" name="kb_project_id"
-                               value="{{ settings.kb_project_id }}"
-                               class="form-control" style="width:100%;"
-                               placeholder="填写 LLM Wiki 项目 ID">
-                        <div class="form-hint">知识库项目 ID（在 LLM Wiki 项目列表中查看）</div>
+            <div id="mcp-fields-group" style="margin-top:16px;display:none;">
+                <div class="form-group">
+                    <label for="mcp_servers">MCP 服务器配置（JSON）</label>
+                    <textarea id="mcp_servers" name="mcp_servers" rows="12"
+                              class="form-control" style="width:100%;font-family:monospace;font-size:13px;"
+                              placeholder='{"mcpServers": {"pkulaw-law-search": {"type": "streamableHttp", "url": "https://...", "headers": {"Authorization": "Bearer TOKEN"}}}}'>{{ settings.mcp_servers }}</textarea>
+                    <div class="form-hint">
+                        已预填北大法宝 9 个服务器；Token 为占位符 <code>__PKULAW_TOKEN__</code>，请替换为你的真实 Token 后保存并「列出可用工具」验证。也支持 mcpServers 对象、服务器列表、名称映射字典三种形态。
                     </div>
                 </div>
-                <div class="form-group" style="margin-top:12px;">
-                    <label for="kb_token">API Token</label>
-                    <div style="display:flex;gap:8px;align-items:center;">
-                        <input type="password" id="kb_token" name="kb_token"
-                               value="{{ settings.kb_token }}"
-                               class="form-control" style="width:100%;"
-                               placeholder="在 LLM Wiki 设置 → API + MCP 中生成">
-                        <button type="button" class="btn btn-outline btn-sm" onclick="toggleKbTokenVisibility()" style="white-space:nowrap;">👁 显示</button>
+
+                <div style="display:flex;gap:24px;margin-top:12px;align-items:center;flex-wrap:wrap;">
+                    <div class="form-group" style="margin:0;">
+                        <label for="mcp_max_turns">工具调用最大轮次</label>
+                        <input type="number" id="mcp_max_turns" name="mcp_max_turns"
+                               value="{{ settings.mcp_max_turns }}"
+                               class="form-control" style="width:90px;"
+                               min="1" max="20" required>
+                        <div class="form-hint">
+                            模型通常需多轮检索法规后才输出最终 JSON，建议 ≥5（越大越易收敛但越慢；失败会自动回退为普通分析）。
+                        </div>
                     </div>
-                    <div class="form-hint">LLM Wiki API Token（Bearer 鉴权），仅本机可达，安全性由本地网络保障</div>
-                </div>
-                <div style="margin-top:12px;">
-                    <button type="button" class="btn btn-outline btn-sm" onclick="testKbConnection()" id="kb-test-btn">
-                        🔗 测试连接
-                    </button>
-                    <span id="kb-test-result" style="margin-left:12px;font-size:13px;"></span>
-                </div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">
-                    <div class="form-group">
-                        <label for="kb_search_max_chars">知识库检索结果上限（字符）</label>
-                        <input type="number" id="kb_search_max_chars" name="kb_search_max_chars"
-                               value="{{ settings.kb_search_max_chars }}"
-                               class="form-control" style="width:120px;"
-                               min="0" max="100000" step="100">
-                        <div class="form-hint">注入提示词的法律法规参考文本最大字符数。0=不限制</div>
+                    <div style="margin-top:18px;">
+                        <button type="button" class="btn btn-outline btn-sm" onclick="testMcpTools()" id="mcp-test-btn">
+                            🔧 列出可用工具
+                        </button>
+                        <span id="mcp-test-result" style="margin-left:12px;font-size:13px;color:var(--text-muted);"></span>
                     </div>
                 </div>
             </div>
@@ -540,13 +523,50 @@ document.addEventListener('DOMContentLoaded', function() {
     if (revCb) toggleRevisionFields(revCb.checked);
     var rtCb = document.querySelector('input[name="review_template_enabled"][type="checkbox"]');
     if (rtCb) toggleReviewTemplateFields(rtCb.checked);
-    var kbCb = document.querySelector('input[name="kb_enabled"][type="checkbox"]');
-    if (kbCb) toggleKbFields(kbCb.checked);
+    var mcpCb = document.querySelector('input[name="mcp_enabled"][type="checkbox"]');
+    if (mcpCb) toggleMcpFields(mcpCb.checked);
 });
 
 function toggleReviewTemplateFields(enabled) {
     var group = document.getElementById('review-template-path-group');
     if (group) group.style.display = enabled ? '' : 'none';
+}
+
+// ── MCP 工具 ──
+function toggleMcpFields(enabled) {
+    var group = document.getElementById('mcp-fields-group');
+    if (group) group.style.display = enabled ? '' : 'none';
+}
+
+async function testMcpTools() {
+    var btn = document.getElementById('mcp-test-btn');
+    var result = document.getElementById('mcp-test-result');
+    var serversInput = document.getElementById('mcp_servers');
+    // 优先测试文本域里的当前内容（可能尚未保存），空则交给后端回退到已保存配置
+    var configVal = serversInput ? serversInput.value : '';
+    btn.disabled = true;
+    btn.textContent = '⏳ 连接中...';
+    result.textContent = '';
+    try {
+        var resp = await fetch('/settings/mcp-tools?config=' + encodeURIComponent(configVal));
+        var data = await resp.json();
+        var span = document.createElement('span');
+        if (data.success) {
+            span.style.color = '#38a169';
+            span.textContent = data.message + '：' + data.tools.map(t => t.name).join(', ');
+        } else {
+            span.style.color = '#e53e3e';
+            span.textContent = '❌ ' + (data.message || '列出失败');
+        }
+        result.appendChild(span);
+    } catch(e) {
+        var span = document.createElement('span');
+        span.style.color = '#e53e3e';
+        span.textContent = '❌ 请求失败: ' + (e.message || '未知错误');
+        result.appendChild(span);
+    }
+    btn.disabled = false;
+    btn.textContent = '🔧 列出可用工具';
 }
 
 async function detectContextWindow() {
@@ -832,55 +852,6 @@ async function changePassword() {
     }
     btn.disabled = false;
     btn.textContent = '🔑 修改密码';
-}
-
-// ── 法律知识库 ──
-function toggleKbFields(enabled) {
-    var group = document.getElementById('kb-fields-group');
-    if (group) group.style.display = enabled ? '' : 'none';
-}
-
-function toggleKbTokenVisibility() {
-    var input = document.getElementById('kb_token');
-    var btn = event.target;
-    if (input.type === 'password') {
-        input.type = 'text';
-        btn.textContent = '🙈 隐藏';
-    } else {
-        input.type = 'password';
-        btn.textContent = '👁 显示';
-    }
-}
-
-async function testKbConnection() {
-    var btn = document.getElementById('kb-test-btn');
-    var result = document.getElementById('kb-test-result');
-    var apiBase = document.getElementById('kb_api_base').value.trim() || 'http://127.0.0.1:19828';
-
-    btn.disabled = true;
-    btn.textContent = '⏳ 测试中...';
-    result.textContent = '';
-
-    try {
-        var resp = await fetch('/settings/kb-health?api_base=' + encodeURIComponent(apiBase));
-        var data = await resp.json();
-        var span = document.createElement('span');
-        if (data.success) {
-            span.style.color = '#38a169';
-            span.textContent = '✅ ' + data.message;
-        } else {
-            span.style.color = '#e53e3e';
-            span.textContent = '❌ ' + data.message;
-        }
-        result.appendChild(span);
-    } catch(e) {
-        var span = document.createElement('span');
-        span.style.color = '#e53e3e';
-        span.textContent = '❌ 请求失败: ' + (e.message || '未知错误');
-        result.appendChild(span);
-    }
-    btn.disabled = false;
-    btn.textContent = '🔗 测试连接';
 }
 
 // ── 多附件分组分析 ──

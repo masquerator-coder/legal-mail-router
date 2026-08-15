@@ -630,6 +630,26 @@ def _parse_revision_markers(text: str) -> list[tuple[str, str]]:
     return merged if merged else [("normal", text)]
 
 
+def _split_citation_section(text: str) -> tuple[str, str]:
+    """把修订文书文本按「引用依据」小节切分为 (正文, 引用依据小节)。
+
+    引用小节从首个以「引用依据」开头的行开始（兼容「引用依据：」「【引用依据】」
+    「〔引用依据〕」等写法），其后的所有行都属于引用小节。这样可在 .docx 中把
+    引用链接与正文在格式上区分开（隔两行 + 绿色字体）。
+    未找到引用小节则返回 (原文, "")。
+    """
+    lines = text.split("\n")
+    start = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith(("引用依据", "【引用依据】", "〔引用依据〕", "「引用依据」")):
+            start = i
+            break
+    if start is None:
+        return text, ""
+    return "\n".join(lines[:start]), "\n".join(lines[start:])
+
+
 def _generate_revision_docx(revision_text: str, doc_type: str,
                             original_subject: str, use_highlight: bool = True) -> Optional[str]:
     """
@@ -677,8 +697,11 @@ def _generate_revision_docx(revision_text: str, doc_type: str,
     # ── 修订正文 ──
     doc.add_heading("修订全文", level=1)
 
+    # 把「引用依据」小节从正文中切出，便于下方单独渲染（隔两行 + 绿色）
+    body_text, citation_text = _split_citation_section(revision_text)
+
     if use_highlight:
-        segments = _parse_revision_markers(revision_text)
+        segments = _parse_revision_markers(body_text)
         for tag, text in segments:
             if not text.strip():
                 continue
@@ -701,14 +724,28 @@ def _generate_revision_docx(revision_text: str, doc_type: str,
                     run.font.strike = True                           # 删除线
                 # normal 使用默认黑色
     else:
-        # 无色彩模式：直接输出全文（含原始标记，由用户自行阅读）
-        for line in revision_text.split("\n"):
+        # 无色彩模式：直接输出正文全文（含原始标记，由用户自行阅读）
+        for line in body_text.split("\n"):
             line = line.strip()
             if not line:
                 continue
             p = doc.add_paragraph(line.strip())
             p.paragraph_format.space_after = Pt(4)
             p.paragraph_format.line_spacing = 1.35
+
+    # ── 引用依据小节：与正文隔开两行，用绿色字体显示 ──
+    if citation_text:
+        doc.add_paragraph("")
+        doc.add_paragraph("")
+        for line in citation_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            p = doc.add_paragraph()
+            p.paragraph_format.space_after = Pt(4)
+            p.paragraph_format.line_spacing = 1.35
+            run = p.add_run(line)
+            run.font.color.rgb = RGBColor(0, 128, 0)               # 绿色
 
     # ── 图例 ──
     if use_highlight:

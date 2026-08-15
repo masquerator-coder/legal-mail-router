@@ -542,7 +542,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     if eml.attachments:
         # per-attachment 提取（供预分类和分组分析使用）
         per_att_results = extract_per_attachment_texts(eml.attachments, ocr_cfg=ctx["ocr_cfg"])
-        # 同时保留 combined 版本（供关键词匹配和知识库检索用）
+        # 同时保留 combined 版本（供关键词匹配等使用）
         texts = []
         imgs = []
         for idx_a, info in per_att_results.items():
@@ -555,39 +555,32 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
         if all_attachment_texts:
             logger.info(f"已提取 {len(eml.attachments)} 个附件文本 ({len(all_attachment_texts)} 字符)")
 
-    # ── 法律知识库检索（一次，基于邮件正文） ──
-    kb_context = ""
-    kb_max_chars = 5000
+    # ── 邮件正文上限（送入 LLM 的正文最大字符数） ──
     body_max_chars = 8000
     try:
-        from app.routes.settings import get_kb_config, _get_setting
-        from app.services.kb_client import search_and_format
-        kb_cfg = get_kb_config(db)
-        try:
-            kb_max_chars = int(_get_setting(db, "kb_search_max_chars") or "5000")
-        except (ValueError, TypeError):
-            pass
-        try:
-            body_max_chars = int(_get_setting(db, "email_body_max_chars") or "8000")
-        except (ValueError, TypeError):
-            pass
-        if kb_cfg["enabled"] and kb_cfg["project_id"]:
-            query = f"{eml.subject} {eml.body_text[:500]}"
-            _update_progress(step="searching_kb", step_label="正在检索法律知识库...")
-            kb_context = search_and_format(
-                query=query,
-                project_id=kb_cfg["project_id"],
-                api_base=kb_cfg["api_base"],
-                token=kb_cfg["token"],
-                top_k=5,
-                max_chars=kb_max_chars,
-            )
-            if kb_context:
-                logger.info(f"知识库检索成功，注入 {len(kb_context)} 字符法律参考")
-            else:
-                logger.info("知识库检索无结果")
+        from app.routes.settings import _get_setting
+        body_max_chars = int(_get_setting(db, "email_body_max_chars") or "8000")
+    except (ValueError, TypeError):
+        pass
+
+    # ── MCP 工具配置（如北大法宝法规检索，仅用于第二阶段文书分析） ──
+    mcp_servers = []
+    mcp_max_turns = 5
+    try:
+        from app.routes.settings import _get_setting
+        from app.services.mcp_client import parse_server_configs
+        if _get_setting(db, "mcp_enabled") == "true":
+            raw_cfg = _get_setting(db, "mcp_servers") or ""
+            mcp_servers = [s.__dict__ for s in parse_server_configs(raw_cfg)]
+            try:
+                mcp_max_turns = int(_get_setting(db, "mcp_max_turns") or "5")
+            except (ValueError, TypeError):
+                mcp_max_turns = 5
+            if mcp_servers:
+                logger.info("MCP 已启用：%d 个服务器参与第二阶段文书分析", len(mcp_servers))
     except Exception as e:
-        logger.warning(f"知识库检索异常（不中断主流程）: {e}")
+        logger.warning("读取 MCP 配置失败（本封邮件不使用工具）: [%s] %s", type(e).__name__, str(e)[:150])
+        mcp_servers = []
 
     # ── 上下文窗口检测 ──
     context_window = 0
@@ -670,13 +663,14 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
             unocr_images=group_unocr_images,
             retry_interval=ctx["llm_retry_interval"],
             max_retries=ctx["llm_max_retries"],
-            kb_context=kb_context,
             body_max_chars=body_max_chars,
             timeout=ctx["llm_timeout"],
             context_window=context_window,
             usage_ratio=usage_ratio,
             token_method=token_method,
             classifier_cfg=ctx.get("classifier_cfg"),
+            mcp_servers=mcp_servers,
+            mcp_max_turns=mcp_max_turns,
         )
         all_analyses.append(g_analysis)
         if g_failed:
@@ -891,13 +885,14 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
 
 def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: list,
                       retry_interval: int, max_retries: int,
-                      kb_context: str = "",
                       body_max_chars: int = 8000,
                       timeout: int = 180,
                       context_window: int = 0,
                       usage_ratio: float = 0.50,
                       token_method: str = "approximate",
-                      classifier_cfg: dict = None) -> tuple[dict | None, bool]:
+                      classifier_cfg: dict = None,
+                      mcp_servers: list = None,
+                      mcp_max_turns: int = 5) -> tuple[dict | None, bool]:
     """执行 LLM 分析（含重试），返回 (analysis, llm_failed)"""
     from app.services.email_fetcher import _run_async_safe
     from app.services.llm_analyzer import analyze_email_two_stage
@@ -941,13 +936,14 @@ def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: li
                     attachment_texts=attachment_texts,
                     images=unocr_images if unocr_images else None,
                     model_type=llm_cfg.model_type or "unknown",
-                    kb_context=kb_context,
                     body_max_chars=body_max_chars,
                     timeout=timeout,
                     context_window=context_window,
                     usage_ratio=usage_ratio,
                     token_method=token_method,
                     classifier_cfg=classifier_cfg,
+                    mcp_servers=mcp_servers,
+                    mcp_max_turns=mcp_max_turns,
                 )
             )
 

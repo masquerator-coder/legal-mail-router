@@ -31,36 +31,36 @@ class TestSettingsDefaults:
         for key in required:
             assert key in defaults, f"Missing key: {key}"
 
-    def test_kb_keys_present(self, defaults):
-        """知识库配置项存在"""
-        kb_keys = ["kb_enabled", "kb_api_base", "kb_token",
-                    "kb_project_id", "kb_search_max_chars", "email_body_max_chars"]
-        for key in kb_keys:
-            assert key in defaults, f"Missing KB key: {key}"
-
     def test_port_default_is_8020(self, defaults):
         assert defaults["system_port"] == "8020"
 
     def test_truncation_defaults(self, defaults):
         """截断默认值正确"""
-        assert defaults["kb_search_max_chars"] == "5000"
         assert defaults["email_body_max_chars"] == "8000"
 
-    def test_kb_defaults(self, defaults):
-        """知识库默认值正确"""
-        assert defaults["kb_enabled"] == "false"
-        assert defaults["kb_api_base"] == "http://127.0.0.1:19828"
-        assert defaults["kb_token"] == ""
-        assert defaults["kb_project_id"] == ""
+    def test_no_kb_keys(self, defaults):
+        """知识库功能已移除，不应再存在 kb_* 配置项"""
+        for key in ("kb_enabled", "kb_api_base", "kb_token",
+                    "kb_project_id", "kb_search_max_chars"):
+            assert key not in defaults, f"KB key should be removed: {key}"
 
+    def test_mcp_keys_present(self, defaults):
+        """MCP 配置项存在"""
+        for key in ("mcp_enabled", "mcp_servers", "mcp_max_turns"):
+            assert key in defaults, f"Missing MCP key: {key}"
 
-class TestGetKbConfig:
-    """get_kb_config 函数"""
-
-    def test_import(self):
-        """函数可导入"""
-        from app.routes.settings import get_kb_config
-        assert callable(get_kb_config)
+    def test_mcp_defaults(self, defaults):
+        """MCP 默认值正确"""
+        assert defaults["mcp_enabled"] == "false"
+        assert defaults["mcp_max_turns"] == "5"
+        # 预填北大法宝 JSON，Token 为占位符，不写真实凭据
+        import json as _json
+        cfg = _json.loads(defaults["mcp_servers"])
+        assert "mcpServers" in cfg
+        assert "pkulaw-law-search" in cfg["mcpServers"]
+        auth = cfg["mcpServers"]["pkulaw-law-search"]["headers"]["Authorization"]
+        assert "__PKULAW_TOKEN__" in auth
+        assert "620dcbb8" not in auth  # 不得泄露真实 Token
 
 
 class TestPortDefaults:
