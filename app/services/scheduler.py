@@ -535,13 +535,68 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
             logger.warning(f"压缩包附件展开异常（按原附件继续处理）: {e}")
 
 
+    # ── 上下文窗口检测（需在附件提取前完成，用于推导附件文本上限） ──
+    context_window = 0
+    usage_ratio = 0.50
+    token_method = "approximate"
+    try:
+        from app.routes.settings import _get_setting
+        from app.services.llm_analyzer import get_effective_context_window, detect_context_window
+        from app.config import decrypt
+
+        cw_setting = _get_setting(db, "context_window_tokens") or "0"
+        raw_ratio = _get_setting(db, "context_window_usage_ratio") or "0.50"
+        raw_method = _get_setting(db, "token_estimation_method") or "approximate"
+        usage_ratio = max(0.1, min(0.95, float(raw_ratio)))
+        token_method = raw_method if raw_method in ("approximate", "tiktoken") else "approximate"
+        if llm_cfg:
+            api_key = decrypt(llm_cfg.api_key_encrypted) if llm_cfg.api_key_encrypted else ""
+            context_window = get_effective_context_window(
+                cw_setting, llm_cfg.api_url, api_key, llm_cfg.model_name,
+            )
+            logger.info(
+                "LLM 上下文窗口: %s tokens, 输入预算占比: %s, token估算方法: %s",
+                context_window, usage_ratio, token_method,
+            )
+    except Exception as e:
+        logger.warning(f"上下文窗口检测异常（使用默认值）: {e}")
+        context_window = 0  # 跳过预算检查
+
+    # ── 由上下文窗口预算协同推导 正文/附件 的文本上限（自动匹配模型窗口） ──
+    from app.services.prompt_budget import estimate_tokens, compute_body_and_attachment_char_budget
+    from app.services.llm_analyzer import _get_default_prompt
+    _template_text = (llm_cfg.analysis_prompt or _get_default_prompt()) if llm_cfg else _get_default_prompt()
+    _output_tokens = min(max(getattr(llm_cfg, "max_tokens", 4096) or 4096, 0), 2000) if llm_cfg else 2000
+    derived_body, derived_attach = compute_body_and_attachment_char_budget(
+        context_window=context_window,
+        usage_ratio=usage_ratio,
+        output_tokens=_output_tokens,
+        template_tokens=estimate_tokens(_template_text),
+    )
+    # 正文上限：默认由窗口推导；用户显式设置 >0 时作为硬上限（取较小者）。
+    # 0 = 自动（由上下文窗口推导）。
+    try:
+        from app.routes.settings import _get_setting
+        _user_body = int(_get_setting(db, "email_body_max_chars") or "0")
+    except (ValueError, TypeError):
+        _user_body = 0
+    body_max_chars = min(derived_body, _user_body) if _user_body > 0 else derived_body
+    attachment_max_chars = derived_attach
+    logger.info(
+        "由窗口推导: 正文上限 %s 字符, 附件上限 %s 字符 (上下文窗口 %s)",
+        body_max_chars, attachment_max_chars, context_window,
+    )
+
     # ── 提取附件文本（per-attachment + combined） ──
     all_attachment_texts = ""
     combined_unocr_images = []
     per_att_results = {}
     if eml.attachments:
         # per-attachment 提取（供预分类和分组分析使用）
-        per_att_results = extract_per_attachment_texts(eml.attachments, ocr_cfg=ctx["ocr_cfg"])
+        per_att_results = extract_per_attachment_texts(
+            eml.attachments, ocr_cfg=ctx["ocr_cfg"],
+            max_chars=attachment_max_chars,
+        )
         # 同时保留 combined 版本（供关键词匹配等使用）
         texts = []
         imgs = []
@@ -554,14 +609,6 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
         combined_unocr_images = imgs
         if all_attachment_texts:
             logger.info(f"已提取 {len(eml.attachments)} 个附件文本 ({len(all_attachment_texts)} 字符)")
-
-    # ── 邮件正文上限（送入 LLM 的正文最大字符数） ──
-    body_max_chars = 8000
-    try:
-        from app.routes.settings import _get_setting
-        body_max_chars = int(_get_setting(db, "email_body_max_chars") or "8000")
-    except (ValueError, TypeError):
-        pass
 
     # ── MCP 工具配置（如北大法宝法规检索，仅用于第二阶段文书分析） ──
     mcp_servers = []
@@ -581,37 +628,6 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     except Exception as e:
         logger.warning("读取 MCP 配置失败（本封邮件不使用工具）: [%s] %s", type(e).__name__, str(e)[:150])
         mcp_servers = []
-
-    # ── 上下文窗口检测 ──
-    context_window = 0
-    usage_ratio = 0.50
-    token_method = "approximate"
-    try:
-        from app.routes.settings import _get_setting
-        from app.services.llm_analyzer import get_effective_context_window, detect_context_window
-        from app.config import decrypt
-
-        # 读取 DB 中的上下文窗口设置
-        cw_setting = _get_setting(db, "context_window_tokens") or "0"
-        raw_ratio = _get_setting(db, "context_window_usage_ratio") or "0.50"
-        raw_method = _get_setting(db, "token_estimation_method") or "approximate"
-
-        usage_ratio = max(0.1, min(0.95, float(raw_ratio)))
-        token_method = raw_method if raw_method in ("approximate", "tiktoken") else "approximate"
-
-        # 获取有效上下文窗口
-        if llm_cfg:
-            api_key = decrypt(llm_cfg.api_key_encrypted) if llm_cfg.api_key_encrypted else ""
-            context_window = get_effective_context_window(
-                cw_setting, llm_cfg.api_url, api_key, llm_cfg.model_name,
-            )
-            logger.info(
-                "LLM 上下文窗口: %s tokens, 输入预算占比: %s, token估算方法: %s",
-                context_window, usage_ratio, token_method,
-            )
-    except Exception as e:
-        logger.warning(f"上下文窗口检测异常（使用默认值）: {e}")
-        context_window = 0  # 跳过预算检查
 
     # ── 预分类：确定附件分组 ──
     groups = _classify_attachments(eml, per_att_results, ctx, db)

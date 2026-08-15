@@ -52,6 +52,76 @@ def estimate_tokens(text: str, method: str = "approximate") -> int:
     return max(estimated, len(text) // 10)
 
 
+def compute_attachment_char_budget(
+    context_window: int,
+    usage_ratio: float = 0.50,
+    output_tokens: int = 2000,
+    template_tokens: int = 1200,
+    body_chars: int = 8000,
+    chars_per_token: float = 1.5,
+    cap: int | None = 500_000,
+    legacy_default: int = 6000,
+) -> int:
+    """由上下文窗口预算反推「每附件提取文本的字符上限」。
+
+    与 truncate_prompt_parts 共用同一个输入预算公式：
+        input_budget_tokens = int(context_window * usage_ratio) - output_tokens
+    从中预留出模板 + 正文 + 拼接开销后，按 chars_per_token（中文近似 ~1.5 字符/token）
+    换算回字符上限。cap 用于防极端（默认 50 万字符）。
+
+    当 context_window 未知（<=0，表示未配置/探测失败）时回到 legacy_default，
+    避免把硬编码 6000 的旧行为破坏掉。
+    """
+    if context_window <= 0:
+        return legacy_default
+
+    input_budget = int(context_window * usage_ratio) - output_tokens
+    reserve = template_tokens + int(body_chars / chars_per_token) + 500
+    budget_chars = int((input_budget - reserve) * chars_per_token)
+    budget_chars = max(1024, budget_chars)
+    if cap:
+        budget_chars = min(budget_chars, cap)
+    return budget_chars
+
+
+def compute_body_and_attachment_char_budget(
+    context_window: int,
+    usage_ratio: float = 0.50,
+    output_tokens: int = 2000,
+    template_tokens: int = 1200,
+    chars_per_token: float = 1.5,
+    body_ratio: float = 0.15,
+    cap: int | None = 500_000,
+    legacy_body: int = 8000,
+    legacy_attach: int = 6000,
+) -> tuple[int, int]:
+    """由上下文窗口预算协同推导「正文 + 附件」的字符上限。
+
+    正文与附件共享同一个输入预算池（扣除模板与拼接开销），按比例拆分：
+      - 正文占 body_ratio（辅助信息，默认 0.15）
+      - 附件占剩余（文书主体，默认 0.85，cap 封顶防极端）
+    二者此消彼长、合计严格不超预算，因此第一阶段（仅丢附件、不截正文的
+    预算模式）也不会因正文过长而超窗。
+
+    返回 (body_max_chars, attachment_max_chars)。窗口未知（<=0）时回退
+    legacy 值，保持旧行为。
+    """
+    if context_window <= 0:
+        return legacy_body, legacy_attach
+
+    input_budget = int(context_window * usage_ratio) - output_tokens
+    reserve = template_tokens + 500  # 模板 + 拼接/系统提示开销
+    available = max(1024, input_budget - reserve)
+    body_tokens = int(available * body_ratio)
+    attach_tokens = max(1024, available - body_tokens)
+
+    body_chars = int(body_tokens * chars_per_token)
+    attach_chars = int(attach_tokens * chars_per_token)
+    if cap:
+        attach_chars = min(attach_chars, cap)
+    return body_chars, attach_chars
+
+
 def truncate_prompt_parts(
     parts: dict[str, str],
     context_window_tokens: int,

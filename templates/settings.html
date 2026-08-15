@@ -177,9 +177,9 @@
                            value="{{ settings.email_body_max_chars }}"
                            class="form-control" style="width:120px;"
                            min="0" max="100000" step="100">
-                    <div class="form-hint">
-                        送入 LLM 分析的邮件正文最大字符数。0=不限制
-                    </div>
+                        <div class="form-hint">
+                            LLM 分析的邮件正文上限。0=由上下文窗口自动推导（推荐）；手动填 &gt;0 作为硬上限
+                        </div>
                 </div>
             </div>
         </div>

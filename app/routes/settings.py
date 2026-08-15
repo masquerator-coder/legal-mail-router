@@ -76,7 +76,7 @@ SETTING_DEFAULTS = {
     "admin_email": "",              # 日报接收邮箱（空=不发送）
     "daily_report_enabled": "true", # 日报开关
     "daily_report_time": "09:00",   # 日报发送时间 (HH:MM, 24小时制)
-    "email_body_max_chars": "8000",  # 送入 LLM 的邮件正文最大字符数（0=不截断）
+    "email_body_max_chars": "0",  # 邮件正文上限（0=由上下文窗口自动推导）
     # ── MCP 工具（如北大法宝法规检索） ──
     "mcp_enabled": "false",        # 启用 MCP 工具（第二阶段文书分析时供 LLM 调用）
     "mcp_servers": DEFAULT_MCP_SERVERS,  # MCP 服务器配置 JSON（预填北大法宝，Token 占位符 __PKULAW_TOKEN__）
@@ -164,7 +164,7 @@ async def save_settings(
     admin_email: str = Form(""),
     daily_report_enabled: str = Form("true"),
     daily_report_time: str = Form("09:00"),
-    email_body_max_chars: str = Form("8000"),
+    email_body_max_chars: str = Form("0"),
     mcp_enabled: str = Form("false"),
     mcp_servers: str = Form(""),
     mcp_max_turns: int = Form(5),

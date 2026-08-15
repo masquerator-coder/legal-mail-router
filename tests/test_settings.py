@@ -35,8 +35,8 @@ class TestSettingsDefaults:
         assert defaults["system_port"] == "8020"
 
     def test_truncation_defaults(self, defaults):
-        """截断默认值正确"""
-        assert defaults["email_body_max_chars"] == "8000"
+        """截断默认值正确：正文上限默认 0=由窗口推导"""
+        assert defaults["email_body_max_chars"] == "0"
 
     def test_no_kb_keys(self, defaults):
         """知识库功能已移除，不应再存在 kb_* 配置项"""

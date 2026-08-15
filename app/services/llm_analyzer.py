@@ -606,6 +606,9 @@ async def classify_doc_type(
     body_max_chars: int = 8000,
     timeout: int = 60,
     custom_prompt: str = "",
+    context_window: int = 0,
+    usage_ratio: float = 0.50,
+    token_method: str = "approximate",
 ) -> dict:
     """第一阶段：调用类型识别 LLM 判断文书类型。
 
@@ -616,10 +619,22 @@ async def classify_doc_type(
     """
     try:
         api_key = decrypt(api_key_encrypted)
-        prompt = build_classify_prompt(subject, sender, body,
-                                       attachment_texts=attachment_texts,
-                                       body_max_chars=body_max_chars,
-                                       custom_prompt=custom_prompt)
+        template_prompt = build_classify_prompt(subject, sender, body,
+                                                attachment_texts="",
+                                                body_max_chars=body_max_chars,
+                                                custom_prompt=custom_prompt)
+        # 分类阶段预算：分类模板无 ## Output marker，truncate 只会触发 L1 附件丢弃，
+        # 保证大附件下类型识别请求不超窗（analyze 阶段已有预算兜底）。
+        if context_window > 0 and attachment_texts:
+            parts = truncate_prompt_parts(
+                {"template_with_body": template_prompt, "attachment_texts": attachment_texts},
+                context_window, usage_ratio, 100, token_method,
+            )
+            template_prompt = parts["template_with_body"]
+            attachment_texts = parts.get("attachment_texts", "")
+        prompt = template_prompt
+        if attachment_texts:
+            prompt += f"\n\n## 附件内容\n{attachment_texts}"
 
         if not api_url.endswith("/chat/completions"):
             api_url = api_url.rstrip("/") + "/chat/completions"
@@ -712,6 +727,9 @@ async def analyze_email_two_stage(
         body_max_chars=body_max_chars,
         timeout=min(timeout, 60),
         custom_prompt=c_prompt or "",
+        context_window=context_window,
+        usage_ratio=usage_ratio,
+        token_method=token_method,
     )
     doc_type = classify_result.get("doc_type", "其他法律文书")
     classifier_confidence = classify_result.get("confidence", 0.5)
