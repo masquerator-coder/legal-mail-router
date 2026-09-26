@@ -43,7 +43,7 @@ async def backup_page(request: Request):
 async def export_backup(db: Session = Depends(get_db)):
     """导出所有配置为 JSON 文件（加密字段保持密文）"""
     data = {
-        "version": 3,
+        "version": 4,
         "exported_at": datetime.now().isoformat(),
         "system_name": "邮件智能分析转发系统",
         "email_accounts": [],
@@ -108,6 +108,7 @@ async def export_backup(db: Session = Depends(get_db)):
                 if acc:
                     account_names.append(acc.name)
         data["routing_rules"].append({
+            "rule_type": rule.rule_type or "account",
             "doc_type": rule.doc_type,
             "keywords": rule.keywords,
             "target_email": rule.target_email,
@@ -285,7 +286,7 @@ async def import_backup(
                 db.add(cfg)
             stats["ocr"] += 1
 
-        # 导入路由规则 — 按 (doc_type, target_email) 匹配，存在则更新，不存在则创建
+        # 导入路由规则 — 按 (匹配方式, 类型, 目标邮箱) 匹配，存在则更新，不存在则创建
         for item in data.get("routing_rules", []):
             # 从 account_names（列表）或 account_name（旧格式兼容）构建 account_ids
             account_ids_str = ""
@@ -298,17 +299,23 @@ async def import_backup(
                 missing = [n for n in names if n not in account_map]
                 if missing:
                     skipped_rule_names.append(
-                        f"{item['doc_type']}→{item['target_email']}（账户不存在: {', '.join(missing)}）"
+                        f"{item.get('doc_type', '')}→{item.get('target_email', '')}（账户不存在: {', '.join(missing)}）"
                     )
                     continue
                 mapped_ids = [str(account_map[n]) for n in names]
                 account_ids_str = ",".join(mapped_ids)
 
-            doc_type = item["doc_type"]
+            # 旧版备份无 rule_type 字段，或按邮箱规则 → 一律回落 account（保证升级导入行为不变）
+            rule_type = str(item.get("rule_type") or "account").strip()
+            if rule_type not in ("account", "doc_type"):
+                rule_type = "account"
+            doc_type = (item.get("doc_type") or "").strip() if rule_type == "doc_type" else ""
+            if rule_type == "doc_type" and not doc_type:
+                rule_type = "account"  # 类型规则缺类型视为无效，回落按邮箱
             target_email = item["target_email"]
-            # 匹配已有规则：同文书类型 + 同目标邮箱
+            # 匹配已有规则：同匹配方式 + 同类型 + 同目标邮箱
             existing = db.query(RoutingRule).filter_by(
-                doc_type=doc_type, target_email=target_email
+                rule_type=rule_type, doc_type=doc_type, target_email=target_email
             ).first()
             if existing:
                 existing.keywords = item.get("keywords", "")
@@ -318,6 +325,7 @@ async def import_backup(
                 existing.enabled = item.get("enabled", True)
             else:
                 rule = RoutingRule(
+                    rule_type=rule_type,
                     doc_type=doc_type,
                     keywords=item.get("keywords", ""),
                     target_email=target_email,

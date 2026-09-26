@@ -178,6 +178,26 @@ def _migrate_llm_config_role(conn):
         conn.commit()
 
 
+def _migrate_routing_rules_rule_type(conn):
+    """自动迁移：为 routing_rules 表补齐 rule_type 列（account=按邮箱 / doc_type=按文书类型）
+
+    存量规则一律视为按邮箱匹配，保证升级后行为不变；doc_type 列早已存在（历史遗留），
+    本版本起正式启用为类型规则的匹配内容。
+    """
+    cols = {row[1] for row in conn.execute(text("PRAGMA table_info(routing_rules)"))}
+    if "rule_type" not in cols:
+        logger.info("迁移: routing_rules 添加 rule_type 列（存量规则默认按邮箱匹配）")
+        conn.execute(text(
+            "ALTER TABLE routing_rules ADD COLUMN rule_type VARCHAR(20) DEFAULT 'account'"
+        ))
+        # 显式回填，兼容 DEFAULT 未生效的历史行（NULL → account）
+        conn.execute(text(
+            "UPDATE routing_rules SET rule_type = 'account' "
+            "WHERE rule_type IS NULL OR rule_type = ''"
+        ))
+        conn.commit()
+
+
 def get_db():
     """FastAPI 依赖：获取数据库会话"""
     db = SessionLocal()
@@ -222,6 +242,11 @@ def init_db():
         if current_version < 5:
             _migrate_llm_config_role(conn)
             _set_schema_version(conn, 5)
+
+        # ── 版本 6: routing_rules 匹配方式（按邮箱 / 按文书类型） ──
+        if current_version < 6:
+            _migrate_routing_rules_rule_type(conn)
+            _set_schema_version(conn, 6)
 
         # 添加查询性能索引和 UNIQUE 约束（SQLite 用 IF NOT EXISTS 安全幂等）
         sqls = [

@@ -13,18 +13,50 @@ from app.services.scheduler import scheduler
 router = APIRouter(prefix="/routing", tags=["路由规则"])
 
 
-def _find_duplicate_rule(db: Session, account_ids: str, target_email: str) -> bool:
-    """检查是否已存在相同的 (account_ids, target_email) 规则"""
+def _find_duplicate_rule(db: Session, rule_type: str, doc_type: str,
+                         account_ids: str, target_email: str) -> bool:
+    """检查是否已存在相同的 (rule_type, doc_type, account_ids, target_email) 规则"""
     from app.models import RoutingRule
     existing = db.query(RoutingRule).filter_by(
+        rule_type=rule_type,
+        doc_type=doc_type,
         account_ids=account_ids,
         target_email=target_email.strip(),
     ).first()
     return existing is not None
 
 
+def _parse_doc_types(raw_list) -> str:
+    """把表单多选的文书类型整理成逗号分隔串（去空、去重、保持提交顺序）"""
+    seen = []
+    for item in raw_list:
+        name = (item or "").strip()
+        if name and name not in seen:
+            seen.append(name)
+    return ",".join(seen)
+
+
+def _normalize_rule_form(rule_type: str, doc_type_list) -> tuple[str, str, str | None]:
+    """校验并规范化「匹配方式」相关表单字段。
+
+    一条规则只能使用一种匹配方式：按邮箱时强制清空 doc_type，按类型时必须至少选一个类型。
+    返回 (rule_type, doc_type, error_message)；error_message 非空表示校验失败。
+    """
+    rule_type = (rule_type or "account").strip()
+    if rule_type not in ("account", "doc_type"):
+        rule_type = "account"
+    if rule_type == "account":
+        return rule_type, "", None
+    doc_type_str = _parse_doc_types(doc_type_list)
+    if not doc_type_str:
+        return rule_type, "", "按文书类型转发时，请至少选择一个文书类型"
+    return rule_type, doc_type_str, None
+
+
 @router.get("")
 async def routing_page(request: Request, db: Session = Depends(get_db)):
+    from app.services.llm_analyzer import _get_doc_types
+
     rules = db.query(RoutingRule).order_by(RoutingRule.id.desc()).all()
     accounts = db.query(EmailAccount).order_by(EmailAccount.name).all()
 
@@ -37,6 +69,9 @@ async def routing_page(request: Request, db: Session = Depends(get_db)):
             ]
         else:
             rule._account_names = []
+        # 按类型规则的匹配内容（供列表展示）
+        rule._rule_type = rule.rule_type or "account"
+        rule._doc_type_names = [t for t in (rule.doc_type or "").split(",") if t.strip()]
 
     default_smtp = {}
     for key in ["default_smtp_host", "default_smtp_port", "default_smtp_username",
@@ -51,6 +86,7 @@ async def routing_page(request: Request, db: Session = Depends(get_db)):
         "rules": rules,
         "accounts": accounts,
         "account_map": account_map,
+        "doc_types": _get_doc_types(),
         "default_smtp": default_smtp,
         "scheduler_running": scheduler.running,
     })
@@ -61,6 +97,7 @@ async def add_rule(
     request: Request,
     db: Session = Depends(get_db),
     target_email: str = Form(...),
+    rule_type: str = Form("account"),
     enabled: str = Form("false"),
     form_csrf: str = Form("", alias="_csrf_token"),
 ):
@@ -70,14 +107,22 @@ async def add_rule(
     account_ids_str = ",".join(aid.strip() for aid in account_ids_list if aid.strip().isdigit())
     _enabled = enabled.lower() in ("true", "on", "1")
 
+    # 匹配方式校验（一条规则只能用一种方式）
+    _rule_type, _doc_type, err = _normalize_rule_form(rule_type, form_data.getlist("doc_type"))
+    if err:
+        flash(request, err, "warning")
+        return RedirectResponse(url="/routing", status_code=303)
+
     # 重复检测
-    existing = _find_duplicate_rule(db, account_ids_str, target_email.strip())
+    existing = _find_duplicate_rule(db, _rule_type, _doc_type, account_ids_str, target_email.strip())
     if existing:
         flash(request, f"已存在相同规则（{target_email}），请勿重复添加", "warning")
         return RedirectResponse(url="/routing", status_code=303)
 
     rule = RoutingRule(
+        rule_type=_rule_type,
         account_ids=account_ids_str,
+        doc_type=_doc_type,
         target_email=target_email.strip(),
         enabled=_enabled,
     )
@@ -93,6 +138,7 @@ async def edit_rule(
     request: Request,
     db: Session = Depends(get_db),
     target_email: str = Form(...),
+    rule_type: str = Form("account"),
     enabled: str = Form("false"),
     form_csrf: str = Form("", alias="_csrf_token"),
 ):
@@ -102,17 +148,27 @@ async def edit_rule(
     account_ids_str = ",".join(aid.strip() for aid in account_ids_list if aid.strip().isdigit())
     _enabled = enabled.lower() in ("true", "on", "1")
 
+    # 匹配方式校验（一条规则只能用一种方式）
+    _rule_type, _doc_type, err = _normalize_rule_form(rule_type, form_data.getlist("doc_type"))
+    if err:
+        flash(request, err, "warning")
+        return RedirectResponse(url="/routing", status_code=303)
+
     rule = db.query(RoutingRule).filter_by(id=rule_id).first()
     if not rule:
         return RedirectResponse(url="/routing", status_code=303)
 
     # 重复检测（排除自身）
-    if rule.target_email.strip() != target_email.strip() or rule.account_ids != account_ids_str:
-        existing = _find_duplicate_rule(db, account_ids_str, target_email.strip())
-        if existing:
+    if (rule.rule_type != _rule_type or rule.doc_type != _doc_type
+            or rule.target_email.strip() != target_email.strip()
+            or rule.account_ids != account_ids_str):
+        existing = _find_duplicate_rule(db, _rule_type, _doc_type, account_ids_str, target_email.strip())
+        if existing and existing.id != rule.id:
             flash(request, f"已存在相同规则（{target_email}），请勿重复添加", "warning")
             return RedirectResponse(url="/routing", status_code=303)
+    rule.rule_type = _rule_type
     rule.account_ids = account_ids_str
+    rule.doc_type = _doc_type
     rule.target_email = target_email.strip()
     rule.enabled = _enabled
     db_retry_commit(db)

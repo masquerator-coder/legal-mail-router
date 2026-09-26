@@ -73,11 +73,18 @@ class RoutingRule(Base):
     __tablename__ = "routing_rules"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_type = Column(
+        String(20), nullable=False, default="account",
+        comment="匹配方式: account=按监控邮箱 / doc_type=按文书类型（一条规则只用一种）"
+    )
     account_ids = Column(
         Text, default="",
-        comment="关联邮箱账户ID(逗号分隔,空=全局规则)"
+        comment="关联邮箱账户ID(逗号分隔,空=全局规则); 两种匹配方式共用,用于限定生效的监控邮箱范围"
     )
-    doc_type = Column(String(50), nullable=False, default="", comment="[废弃] 文书类型 — 当前版本未启用按类型匹配")
+    doc_type = Column(
+        String(50), nullable=False, default="",
+        comment="文书类型(逗号分隔); 仅 rule_type=doc_type 时使用,rule_type=account 时为空"
+    )
     keywords = Column(Text, default="", comment="[废弃] 关键词(逗号分隔) — 当前版本未启用关键词匹配")
     target_email = Column(String(200), nullable=False, comment="目标邮箱")
     target_name = Column(String(100), default="", comment="目标律师姓名")

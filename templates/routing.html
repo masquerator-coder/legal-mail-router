@@ -2,7 +2,7 @@
 {% block content %}
 <div class="page-header">
     <h2>🔀 转发规则</h2>
-    <p>配置每个监控邮箱的转发目标。每条规则 = 一个监控邮箱 → 一个目标邮箱</p>
+    <p>配置邮件转发目标。每条规则可选一种匹配方式：<strong>按邮箱</strong>（该监控邮箱收到的邮件全部转发）或 <strong>按文书类型</strong>（邮件内文书类型命中才转发）</p>
 </div>
 
 <div style="display:grid; grid-template-columns: 2fr 1fr; gap: 20px;">
@@ -19,6 +19,7 @@
             <table class="table">
                 <thead>
                     <tr>
+                        <th>匹配方式</th>
                         <th>监控邮箱</th>
                         <th>转发目标</th>
                         <th>状态</th>
@@ -28,6 +29,16 @@
                 <tbody>
                     {% for rule in rules %}
                     <tr>
+                        <td>
+                            {% if rule._rule_type == 'doc_type' %}
+                                <span class="badge badge-info">📄 按文书类型</span>
+                                <div style="margin-top:4px; font-size:13px;">
+                                    {% for t in rule._doc_type_names %}{{ t }}{% if not loop.last %}、{% endif %}{% endfor %}
+                                </div>
+                            {% else %}
+                                <span class="badge badge-default">📧 按邮箱</span>
+                            {% endif %}
+                        </td>
                         <td>
                             {% if rule._account_names %}
                                 {% for name in rule._account_names %}
@@ -85,6 +96,32 @@
         <div class="modal-body">
             <form method="post" action="/routing/edit/{{ rule.id }}">
                 {{ csrf_token_input(request)|safe }}
+                <div class="form-group">
+                    <label>匹配方式 *</label>
+                    <div>
+                        <label style="display:inline-block; margin-right:16px; font-size:13px; cursor:pointer;">
+                            <input type="radio" name="rule_type" value="account" {% if rule._rule_type != 'doc_type' %}checked{% endif %}
+                                   onchange="toggleRuleType('edit-{{ rule.id }}')"> 📧 按邮箱转发
+                        </label>
+                        <label style="display:inline-block; font-size:13px; cursor:pointer;">
+                            <input type="radio" name="rule_type" value="doc_type" {% if rule._rule_type == 'doc_type' %}checked{% endif %}
+                                   onchange="toggleRuleType('edit-{{ rule.id }}')"> 📄 按文书类型转发
+                        </label>
+                    </div>
+                </div>
+                <div class="form-group" id="edit-{{ rule.id }}-doc-type-group"
+                     style="display:{% if rule._rule_type == 'doc_type' %}block{% else %}none{% endif %};">
+                    <label>文书类型 (可多选，命中任一类型即转发) *</label>
+                    <div style="border:1px solid var(--border-color, #ddd); border-radius:4px; padding:8px; max-height:180px; overflow-y:auto;">
+                        {% for t in doc_types %}
+                            <label style="display:block; padding:3px 0; font-size:13px; cursor:pointer;">
+                                <input type="checkbox" name="doc_type" value="{{ t }}" {% if t in rule._doc_type_names %}checked{% endif %}>
+                                📄 {{ t }}
+                            </label>
+                        {% endfor %}
+                    </div>
+                    <small style="color:var(--text-muted);">类型清单来自项目根目录的「文书类型.conf」，新增类型请修改该文件</small>
+                </div>
                 <div class="form-group">
                     <label>监控邮箱 (可多选，不选 = 所有邮箱)</label>
                     <div style="border:1px solid var(--border-color, #ddd); border-radius:4px; padding:8px; max-height:150px; overflow-y:auto;">
@@ -151,6 +188,32 @@
             <form method="post" action="/routing/add">
                 {{ csrf_token_input(request)|safe }}
                 <div class="form-group">
+                    <label>匹配方式 *</label>
+                    <div>
+                        <label style="display:inline-block; margin-right:16px; font-size:13px; cursor:pointer;">
+                            <input type="radio" name="rule_type" value="account" checked
+                                   onchange="toggleRuleType('add')"> 📧 按邮箱转发
+                        </label>
+                        <label style="display:inline-block; font-size:13px; cursor:pointer;">
+                            <input type="radio" name="rule_type" value="doc_type"
+                                   onchange="toggleRuleType('add')"> 📄 按文书类型转发
+                        </label>
+                    </div>
+                    <small style="color:var(--text-muted);">一条规则只能使用一种匹配方式</small>
+                </div>
+                <div class="form-group" id="add-doc-type-group" style="display:none;">
+                    <label>文书类型 (可多选，命中任一类型即转发) *</label>
+                    <div style="border:1px solid var(--border-color, #ddd); border-radius:4px; padding:8px; max-height:180px; overflow-y:auto;">
+                        {% for t in doc_types %}
+                            <label style="display:block; padding:3px 0; font-size:13px; cursor:pointer;">
+                                <input type="checkbox" name="doc_type" value="{{ t }}">
+                                📄 {{ t }}
+                            </label>
+                        {% endfor %}
+                    </div>
+                    <small style="color:var(--text-muted);">类型清单来自项目根目录的「文书类型.conf」，新增类型请修改该文件</small>
+                </div>
+                <div class="form-group">
                     <label>监控邮箱 (可多选，不选 = 所有邮箱)</label>
                     <div style="border:1px solid var(--border-color, #ddd); border-radius:4px; padding:8px; max-height:150px; overflow-y:auto;">
                         {% for acc in accounts %}
@@ -177,4 +240,20 @@
         </div>
     </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// 匹配方式切换：仅显示当前方式对应的输入区（一条规则只用一种方式）
+function toggleRuleType(scope) {
+    var modal = scope === 'add'
+        ? document.getElementById('add-rule-modal')
+        : document.getElementById('edit-rule-modal-' + scope.split('-')[1]);
+    if (!modal) return;
+    var checked = modal.querySelector('input[name="rule_type"]:checked');
+    var group = document.getElementById(scope + '-doc-type-group');
+    if (!group) return;
+    group.style.display = (checked && checked.value === 'doc_type') ? 'block' : 'none';
+}
+</script>
 {% endblock %}

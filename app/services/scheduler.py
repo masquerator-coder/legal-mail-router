@@ -1004,11 +1004,40 @@ def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: li
     return None, True  # unreachable
 
 
+def _collect_mail_doc_types(analysis, log) -> set:
+    """收集本封邮件涉及的全部文书类型（按类型转发规则的匹配依据）。
+
+    优先级：log.doc_types（多文书分组分析时已落库的全部类型）→ analysis["doc_type"]。
+    两者都取不到时返回空集合，此时按类型规则一律不命中（不会误转发）。
+    """
+    names = set()
+    raw = getattr(log, "doc_types", None)
+    if raw and str(raw).strip():
+        names.update(t.strip() for t in str(raw).split(",") if t.strip())
+    if analysis:
+        single = str(analysis.get("doc_type", "") or "").strip()
+        if single:
+            names.add(single)
+    return names
+
+
+def _match_rule_doc_types(rule, mail_doc_types: set) -> bool:
+    """按文书类型规则匹配：规则列出的类型与邮件类型集合有交集即命中。"""
+    rule_types = {t.strip() for t in (rule.doc_type or "").split(",") if t.strip()}
+    if not rule_types or not mail_doc_types:
+        return False
+    return bool(rule_types & mail_doc_types)
+
+
 def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[dict]:
     """
-    决定转发目标列表:
+    决定转发目标列表（两种匹配方式取并集，同一目标邮箱只转发一次）:
     - 垃圾过滤 → 跳过（返回空列表）
-    - 非法律文书/法律文书 → 统一按路由规则匹配（account_ids 匹配），兜底默认邮箱
+    - rule_type=account  → 按监控邮箱匹配（不选账户=全局规则）
+    - rule_type=doc_type → 按邮件文书类型匹配（doc_type 与邮件类型集合有交集）
+
+    两种方式均可通过 account_ids 限定生效的监控邮箱范围（空=所有邮箱）。
+    全部规则（两种方式）均未命中时兜底默认邮箱；无默认邮箱则标记失败且不转发。
 
     返回 [{"email": str, "smtp_cfgs": [dict, ...]}, ...] 或空列表（跳过）
     """
@@ -1032,6 +1061,7 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
 
     # ── 非法律文书 → 也走路由规则（与法律文书同逻辑）──
     # ── 法律文书 → 查路由规则 ──
+    mail_doc_types = _collect_mail_doc_types(analysis, log)
     targets = []
     seen = set()
     all_rules = db.query(RoutingRule).filter_by(enabled=True).order_by(RoutingRule.id).all()
@@ -1040,17 +1070,23 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
         raw_emails = rule.target_email.strip() if rule.target_email else ""
         if not raw_emails:
             continue
+
+        # 监控邮箱范围（两种匹配方式共用；空 = 不限定）
+        if ids_str:
+            ids = [x.strip() for x in ids_str.split(",") if x.strip().isdigit()]
+            if str(account.id) not in ids:
+                continue
+
+        # 匹配方式分派
+        if (rule.rule_type or "account") == "doc_type":
+            if not _match_rule_doc_types(rule, mail_doc_types):
+                continue
+        # rule_type=account：邮箱范围已在上方判定通过，直接命中
+
         # 解析逗号分隔的多个目标邮箱
         emails = [e.strip() for e in raw_emails.split(",") if e.strip()]
         for email in emails:
-            if email in seen:
-                continue
-            if ids_str:
-                ids = [x.strip() for x in ids_str.split(",") if x.strip().isdigit()]
-                if str(account.id) in ids:
-                    targets.append(email)
-                    seen.add(email)
-            else:
+            if email not in seen:
                 targets.append(email)
                 seen.add(email)
 
