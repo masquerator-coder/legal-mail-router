@@ -133,10 +133,32 @@ class TestDocTypesFile:
         types = _get_doc_types()
         assert len(types) == len(set(types))
 
+    def test_get_doc_types_contains_new_admin_types(self):
+        """新增类型：政府信息公开 / 信访件"""
+        types = _get_doc_types()
+        assert "政府信息公开" in types
+        assert "信访件" in types
+
     def test_get_doc_analysis_prompt_contract(self):
         prompt = _get_doc_analysis_prompt("合同协议")
         assert "条款完整性" in prompt
         assert "修订版文书" in prompt
+
+    def test_new_types_have_dedicated_prompts(self):
+        """新类型须有专属提示词，不得回退「其他法律文书」兜底"""
+        for name, keyword in (("政府信息公开", "20 个工作日"), ("信访件", "60 日")):
+            prompt = _get_doc_analysis_prompt(name)
+            assert prompt, f"{name} 提示词为空"
+            assert "专属分析流程(兜底)" not in prompt, f"{name} 回退到了兜底提示词"
+            assert name in prompt
+            assert keyword in prompt
+            assert "{today}" in prompt  # 期限计算须以当前日期为基准
+
+    def test_new_types_pass_classify_validation(self):
+        """类型识别输出新类型时不得被回退为「其他法律文书」"""
+        for name in ("政府信息公开", "信访件"):
+            r = m._validate_classify_output({"doc_type": name, "confidence": 0.9})
+            assert r["doc_type"] == name
 
     def test_get_doc_analysis_prompt_fallback(self):
         """未知类型应回退到「其他法律文书」提示词"""
