@@ -26,3 +26,6 @@ log/
 
 # Config with secrets (encryption key)
 data/.encryption_key
+
+# 含明文账号密码等敏感资料，禁止提交
+docs/

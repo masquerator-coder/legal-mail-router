@@ -454,11 +454,10 @@
                     </p>
                     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                         <a href="/backup/export" class="btn btn-primary">📥 导出</a>
-                        <form method="post" action="/backup/import" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:center;margin:0;padding:0;">
-                            <input type="file" name="file" accept=".json"
-                                   style="font-size:13px;padding:6px;border:1px solid var(--border);border-radius:6px;max-width:160px;">
-                            <button type="submit" class="btn btn-primary" style="white-space:nowrap;">📤 恢复</button>
-                        </form>
+                        <!-- 恢复表单不可放在本页外层 <form id="settings-form"> 内：
+                             嵌套 form 是非法 HTML，浏览器会丢弃内层标签，
+                             导致点击提交的是外层 /settings/save，备份文件被静默丢弃。
+                             该表单因而移至外层表单闭合之后（见文件下方独立卡片）。 -->
                     </div>
                 </div>
             </div>
@@ -466,6 +465,23 @@
     </form>
 
 </div>  <!-- 关闭主容器 div -->
+
+<!-- 配置恢复（须独立于 settings-form 之外，见上方说明） -->
+<div class="card" style="margin-top:24px;">
+    <div class="card-header"><h3>📤 配置恢复</h3></div>
+    <div class="card-body">
+        <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px;">
+            上传导出的 JSON 备份文件，恢复邮箱、模型、规则与系统设置。恢复为追加合并：同名项更新，新项创建。
+        </p>
+        <form method="post" action="/backup/import" enctype="multipart/form-data"
+              style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0;padding:0;">
+            {{ csrf_token_input(request)|safe }}
+            <input type="file" name="file" accept=".json" class="form-control"
+                   style="font-size:13px;padding:6px;max-width:260px;">
+            <button type="submit" class="btn btn-primary" style="white-space:nowrap;">📤 恢复配置</button>
+        </form>
+    </div>
+</div>
 
 <!-- 修改密码（独立于主表单之外） -->
 <div class="card" style="margin-top:24px;">
@@ -864,30 +880,6 @@ function toggleGroupingFields(enabled) {
 document.addEventListener('DOMContentLoaded', function() {
     toggleGroupingFields(document.querySelector('input[name="attachment_grouping"]')?.checked || false);
 });
-
-
-// 配置备份恢复 — 动态创建表单提交
-function restoreBackup() {
-    var fileInput = document.getElementById('restore-file');
-    if (!fileInput || !fileInput.files.length) {
-        showToast('请先选择备份文件', 'error');
-        return;
-    }
-    fileInput.name = 'file';
-    var tempForm = document.createElement('form');
-    tempForm.method = 'POST';
-    tempForm.action = '/backup/import';
-    tempForm.enctype = 'multipart/form-data';
-    tempForm.style.display = 'none';
-    var csrfOrig = document.querySelector('input[name="_csrf_token"]');
-    if (csrfOrig) {
-        tempForm.appendChild(csrfOrig.cloneNode());
-    }
-    tempForm.appendChild(fileInput.cloneNode(true));
-    document.body.appendChild(tempForm);
-    tempForm.submit();
-}
-
 
 // ── 自动保存：修改设置后防抖自动提交（无保存/取消按钮） ──
 (function() {
