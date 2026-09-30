@@ -303,6 +303,71 @@ def _add_default_smtp(db):
     db.commit()
 
 
+class TestClassifyFailedBlocksRouting:
+    """类型识别失败（兜底值）不得进入路由：否则会误命中规则或给出误导性的失败原因"""
+
+    def test_does_not_hit_matching_rule(self, rule_db):
+        """兜底值恰好等于某条规则的类型时也不得命中（这是失败值，不是模型判断）"""
+        _add_default_smtp(rule_db)
+        _add_rule(rule_db, "other-docs@example.com", rule_type="doc_type",
+                  doc_type="其他法律文书")
+        log = _Log()
+        result = _get_forward_targets(
+            {"doc_type": "其他法律文书", "confidence": 0.5, "classify_failed": True},
+            False, _Account(), rule_db, log,
+        )
+        assert result == []
+        assert log.status == "failed"
+        assert "识别失败" in log.error_message
+        assert log.target_email is None
+
+    def test_does_not_fall_back_to_default_email(self, rule_db):
+        """识别失败时即便配了默认邮箱也不得转发（默认邮箱是兜底路由，不是兜底类型）"""
+        _add_default_smtp(rule_db)
+        _set_default_email(rule_db, "default@example.com")
+        log = _Log()
+        result = _get_forward_targets(
+            {"doc_type": "其他法律文书", "confidence": 0.5, "classify_failed": True},
+            False, _Account(), rule_db, log,
+        )
+        assert result == []
+        assert log.status == "failed"
+
+    def test_error_message_distinguishes_from_no_target(self, rule_db):
+        """错误信息必须区别于「未配置转发目标」，避免把识别失败误诊为路由配置问题"""
+        _add_default_smtp(rule_db)
+        log = _Log()
+        _get_forward_targets(
+            {"doc_type": "其他法律文书", "confidence": 0.5, "classify_failed": True},
+            False, _Account(), rule_db, log,
+        )
+        assert "未配置转发目标" not in log.error_message
+        assert "max_tokens" in log.error_message
+
+    def test_model_chosen_other_legal_still_routes_normally(self, rule_db):
+        """模型主动判定「其他法律文书」时不受影响，仍按正常路由规则走"""
+        _add_default_smtp(rule_db)
+        _add_rule(rule_db, "other-docs@example.com", rule_type="doc_type",
+                  doc_type="其他法律文书")
+        log = _Log()
+        result = _get_forward_targets(
+            {"doc_type": "其他法律文书", "confidence": 0.85},
+            False, _Account(), rule_db, log,
+        )
+        assert _targets(result) == ["other-docs@example.com"]
+
+    def test_petition_type_routes_to_petition_rule(self, rule_db):
+        """识别为「信访件」时应命中信访件专属规则"""
+        _add_default_smtp(rule_db)
+        _add_rule(rule_db, "xinfang@example.com", rule_type="doc_type", doc_type="信访件")
+        _add_rule(rule_db, "notice@example.com", rule_type="doc_type", doc_type="通知书")
+        log = _Log()
+        result = _get_forward_targets(
+            {"doc_type": "信访件", "confidence": 0.85}, False, _Account(), rule_db, log,
+        )
+        assert _targets(result) == ["xinfang@example.com"]
+
+
 # ── 表单校验：一条规则只能使用一种匹配方式 ──
 
 class TestNormalizeRuleForm:

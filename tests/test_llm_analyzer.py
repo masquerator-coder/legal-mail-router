@@ -530,3 +530,234 @@ class TestMcpToolLoopFallback:
         # 回退结果应正常返回，且共发出 3 次请求（2 轮工具 + 1 次普通分析）
         assert result["doc_type"] == "合同协议"
         assert state["i"] == 3
+
+
+class TestClassifyMaxTokens:
+    """分类请求的输出预算下限：推理型模型推理过程计入 max_tokens，预算过小会截断 JSON 输出"""
+
+    class _FakeResp:
+        def __init__(self, data):
+            self.data = data
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.data
+
+    def _install_fake_client(self, monkeypatch, captured, content='{"doc_type": "信访件", "confidence": 0.9}',
+                             finish_reason="stop"):
+        class _FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return None
+
+            async def post(self, *a, **k):
+                captured["payload"] = k.get("json")
+                data = {"choices": [{"message": {"role": "assistant", "content": content},
+                                     "finish_reason": finish_reason}]}
+                return TestClassifyMaxTokens._FakeResp(data)
+
+        monkeypatch.setattr(m, "decrypt", lambda e: "test-key")
+        monkeypatch.setattr(m, "httpx", type("HH", (), {"AsyncClient": _FakeClient}))
+
+    @pytest.mark.asyncio
+    async def test_budget_floor_applied_when_unset(self, monkeypatch):
+        """未指定 max_tokens 时应使用下限，而不是历史的 100"""
+        captured = {}
+        self._install_fake_client(monkeypatch, captured)
+
+        result = await m.classify_doc_type(
+            api_url="http://llm/v1", api_key_encrypted="enc", model_name="m",
+            subject="s", sender="f", body="b",
+        )
+        assert captured["payload"]["max_tokens"] == m._CLASSIFY_MIN_MAX_TOKENS
+        assert captured["payload"]["max_tokens"] > 100
+        assert result["doc_type"] == "信访件"
+        assert not result.get("failed")
+
+    @pytest.mark.asyncio
+    async def test_small_configured_value_raised_to_floor(self, monkeypatch):
+        """配置里给了过小的值（100/0/负数）时必须抬到下限，否则推理会吃光预算"""
+        for small in (100, 0, -5, None):
+            captured = {}
+            self._install_fake_client(monkeypatch, captured)
+            await m.classify_doc_type(
+                api_url="http://llm/v1", api_key_encrypted="enc", model_name="m",
+                subject="s", sender="f", body="b", max_tokens=small,
+            )
+            assert captured["payload"]["max_tokens"] == m._CLASSIFY_MIN_MAX_TOKENS
+
+    @pytest.mark.asyncio
+    async def test_configured_larger_value_respected(self, monkeypatch):
+        """配置值更大时应尊重配置，不被下限压低"""
+        captured = {}
+        self._install_fake_client(monkeypatch, captured)
+        await m.classify_doc_type(
+            api_url="http://llm/v1", api_key_encrypted="enc", model_name="m",
+            subject="s", sender="f", body="b", max_tokens=4096,
+        )
+        assert captured["payload"]["max_tokens"] == 4096
+
+    @pytest.mark.asyncio
+    async def test_parse_failure_marks_failed(self, monkeypatch):
+        """解析失败时兜底值必须带 failed 标记，以便与模型真实判断区分"""
+        captured = {}
+        # 复现生产故障：模型只输出了推理过程，没有 JSON
+        self._install_fake_client(
+            monkeypatch, captured,
+            content='我们根据邮件内容判断：邮件主题是"回复：信访件基本情况登记表"，属于"通知书"类文书。',
+            finish_reason="length",
+        )
+        result = await m.classify_doc_type(
+            api_url="http://llm/v1", api_key_encrypted="enc", model_name="m",
+            subject="s", sender="f", body="b",
+        )
+        assert result["doc_type"] == "其他法律文书"
+        assert result["confidence"] == 0.5
+        assert result["failed"] is True
+
+    @pytest.mark.asyncio
+    async def test_request_error_marks_failed(self, monkeypatch):
+        """请求层异常时同样带 failed 标记"""
+        monkeypatch.setattr(m, "decrypt", lambda e: "test-key")
+
+        class _Boom:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return None
+
+            async def post(self, *a, **k):
+                raise RuntimeError("connection reset")
+
+        monkeypatch.setattr(m, "httpx", type("HH", (), {"AsyncClient": _Boom}))
+        result = await m.classify_doc_type(
+            api_url="http://llm/v1", api_key_encrypted="enc", model_name="m",
+            subject="s", sender="f", body="b",
+        )
+        assert result["failed"] is True
+
+    @pytest.mark.asyncio
+    async def test_model_chosen_other_legal_is_not_marked_failed(self, monkeypatch):
+        """模型主动判断为「其他法律文书」时不得带 failed（否则会误判为识别失败）"""
+        captured = {}
+        self._install_fake_client(
+            monkeypatch, captured,
+            content='{"doc_type": "其他法律文书", "confidence": 0.85}',
+        )
+        result = await m.classify_doc_type(
+            api_url="http://llm/v1", api_key_encrypted="enc", model_name="m",
+            subject="s", sender="f", body="b",
+        )
+        assert result["doc_type"] == "其他法律文书"
+        assert result["confidence"] == 0.85
+        assert not result.get("failed")
+
+
+class TestClassifyDisambiguation:
+    """默认分类模板的易混淆类型消歧规则"""
+
+    def test_template_has_disambiguation_rules(self):
+        template = m._get_default_classify_prompt()
+        # 信访事项答复类文书必须明确归「信访件」而非「通知书」
+        assert "信访件" in template
+        assert "政府信息公开" in template
+        assert "通知书" in template
+        assert "访答" in template  # 信访专用文号特征
+
+    def test_petition_reply_maps_to_petition_type(self):
+        """信访类文书的边界规则应排在「通知书」规则之前，先入为主地引导模型"""
+        prompt = build_classify_prompt(
+            subject="回复：信访件基本情况登记表 -王庆坤", sender="s@e.com",
+            body="信访事项处理意见书",
+        )
+        rules = prompt.split("易混淆类型的区分规则")[1]
+        # 逐条规则的位置比较（引导句中提及的「通知书」不算规则）
+        petition_pos = rules.index("- 信访件：")
+        notice_pos = rules.index("- 通知书：")
+        assert petition_pos < notice_pos
+        # 引导句不得把「通知书」作为示例类型抛出（否则反而强化该词）
+        assert "等字样就归入通知书" not in rules
+
+
+class TestTwoStageClassifyFailure:
+    """第一阶段识别失败时，失败标记必须传到调用方"""
+
+    @pytest.mark.asyncio
+    async def test_flag_propagates_to_result(self, monkeypatch):
+        async def fake_classify(*args, **kwargs):
+            return {"doc_type": "其他法律文书", "confidence": 0.5, "failed": True}
+
+        async def fake_analyze(*args, **kwargs):
+            return {
+                "doc_type": "通知书", "case_summary": "x", "ai_interpretation": "y",
+                "urgency": "medium", "key_date": None, "case_number": None,
+                "involved_parties": "", "confidence": 0.5, "revised_document": None,
+            }
+
+        monkeypatch.setattr(m, "classify_doc_type", fake_classify)
+        monkeypatch.setattr(m, "analyze_email", fake_analyze)
+
+        result = await m.analyze_email_two_stage(
+            api_url="u", api_key_encrypted="k", model_name="m",
+            subject="s", sender="f", body="b",
+        )
+        assert result["classify_failed"] is True
+        # 第二阶段给出的类型不得覆盖兜底值（它不具备独立识别意义）
+        assert result["doc_type"] == "其他法律文书"
+
+    @pytest.mark.asyncio
+    async def test_normal_classify_has_no_failure_flag(self, monkeypatch):
+        async def fake_classify(*args, **kwargs):
+            return {"doc_type": "信访件", "confidence": 0.9}
+
+        async def fake_analyze(*args, **kwargs):
+            return {
+                "doc_type": "信访件", "case_summary": "x", "ai_interpretation": "y",
+                "urgency": "medium", "key_date": None, "case_number": None,
+                "involved_parties": "", "confidence": 0.5, "revised_document": None,
+            }
+
+        monkeypatch.setattr(m, "classify_doc_type", fake_classify)
+        monkeypatch.setattr(m, "analyze_email", fake_analyze)
+
+        result = await m.analyze_email_two_stage(
+            api_url="u", api_key_encrypted="k", model_name="m",
+            subject="s", sender="f", body="b",
+        )
+        assert result["classify_failed"] is False
+
+    @pytest.mark.asyncio
+    async def test_classifier_max_tokens_forwarded(self, monkeypatch):
+        """classifier_max_tokens 应传给分类阶段"""
+        captured = {}
+
+        async def fake_classify(*args, **kwargs):
+            captured.update(kwargs)
+            return {"doc_type": "信访件", "confidence": 0.9}
+
+        async def fake_analyze(*args, **kwargs):
+            return {
+                "doc_type": "信访件", "case_summary": "x", "ai_interpretation": "y",
+                "urgency": "medium", "key_date": None, "case_number": None,
+                "involved_parties": "", "confidence": 0.5, "revised_document": None,
+            }
+
+        monkeypatch.setattr(m, "classify_doc_type", fake_classify)
+        monkeypatch.setattr(m, "analyze_email", fake_analyze)
+
+        await m.analyze_email_two_stage(
+            api_url="u", api_key_encrypted="k", model_name="m",
+            subject="s", sender="f", body="b", classifier_max_tokens=2048,
+        )
+        assert captured["max_tokens"] == 2048

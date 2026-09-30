@@ -217,6 +217,7 @@ def _load_context(account_id: int) -> dict | None:
                 "api_key_encrypted": classifier_row.api_key_encrypted,
                 "model_name": classifier_row.model_name,
                 "analysis_prompt": c_prompt,
+                "max_tokens": classifier_row.max_tokens,
             }
 
         ocr_cfg_row = db.query(OCRConfig).filter_by(is_active=True).first()
@@ -257,6 +258,9 @@ def _load_context(account_id: int) -> dict | None:
     finally:
         db.close()
 
+
+# 附件分组请求的输出预算下限（推理型模型推理过程计入 max_tokens，预算过小会截断 JSON）
+_GROUP_MIN_MAX_TOKENS = 512
 
 # 模型角色 → DefaultConfig 键（角色在 LLM 配置页分配）
 _LLM_ROLE_KEYS = {
@@ -368,7 +372,8 @@ def _classify_attachments(eml, per_att_results: dict, ctx: dict, db) -> list[lis
         
         # 发送轻量分类请求
         result = _run_async_safe(
-            _classify_with_llm(api_url, api_key, classify_llm.model_name, classify_prompt)
+            _classify_with_llm(api_url, api_key, classify_llm.model_name, classify_prompt,
+                               max_tokens=getattr(classify_llm, "max_tokens", 0) or 0)
         )
         if result and isinstance(result, dict) and "groups" in result:
             groups = result["groups"]
@@ -395,14 +400,15 @@ def _classify_attachments(eml, per_att_results: dict, ctx: dict, db) -> list[lis
     return [[i] for i in range(n)]
 
 
-async def _classify_with_llm(api_url: str, api_key: str, model_name: str, prompt: str) -> dict | None:
+async def _classify_with_llm(api_url: str, api_key: str, model_name: str, prompt: str,
+                             max_tokens: int = 0) -> dict | None:
     """发送轻量分类请求到 LLM，返回 JSON 结果"""
     import json
     import httpx
-    
+
     if not api_url.endswith("/chat/completions"):
         api_url = api_url.rstrip("/") + "/chat/completions"
-    
+
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model_name,
@@ -410,7 +416,8 @@ async def _classify_with_llm(api_url: str, api_key: str, model_name: str, prompt
             {"role": "system", "content": "你是一个文档分类助手。严格按照用户要求的 JSON 格式返回结果，不要包含任何多余文字。"},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 200,
+        # 与类型识别同理：推理型模型会把推理计入预算，预算过小会截断 JSON，故设下限
+        "max_tokens": max(_GROUP_MIN_MAX_TOKENS, int(max_tokens or 0)),
         "temperature": 0,
     }
     
@@ -960,6 +967,7 @@ def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: li
                     classifier_cfg=classifier_cfg,
                     mcp_servers=mcp_servers,
                     mcp_max_turns=mcp_max_turns,
+                    classifier_max_tokens=(classifier_cfg or {}).get("max_tokens") or 0,
                 )
             )
 
@@ -1046,6 +1054,17 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
 
     llm_doc_type = analysis.get("doc_type", "") if analysis else ""
     llm_confidence = analysis.get("confidence", 0.5) if analysis else 0.0
+
+    # ── 类型识别失败：不得据此路由 ──
+    # 兜底值「其他法律文书/0.5」与模型真实判断无法区分，若继续走规则匹配，
+    # 要么因无规则命中而落到「未配置转发目标」的误导性提示，要么误命中规则转发到错误邮箱。
+    if analysis and analysis.get("classify_failed"):
+        log.status = "failed"
+        log.error_message = (
+            f"文书类型识别失败（「{llm_doc_type}」为兜底值，非模型判断），已跳过转发。"
+            f"请检查类型识别模型配置（尤其是 max_tokens 是否过小导致 JSON 输出被截断）。"
+        )
+        return []
 
     # ── 垃圾过滤 ──
     is_junk = (

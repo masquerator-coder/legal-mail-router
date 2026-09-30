@@ -29,6 +29,11 @@ _DEFAULT_DOC_TYPES = [
 # 系统兜底类型：无论配置文件如何，均强制包含
 _FALLBACK_DOC_TYPES = ("其他法律文书", "非法律文书")
 
+# 第一阶段类型识别的输出预算下限。
+# 推理型模型（DeepSeek-V4-Flash 等）把推理过程计入 max_tokens，预算过小时 JSON 还没输出就被截断，
+# 表现为「解析失败 → 兜底其他法律文书」。此下限用于兜住模型配置里过小/未设置的值。
+_CLASSIFY_MIN_MAX_TOKENS = 512
+
 # MCP 工具使用要求（启用 MCP 时注入提示词，指导模型实时查询法规并附引用链接）
 _MCP_USAGE_INSTRUCTION = """## 法律检索工具（MCP）
 本次分析已提供法律检索工具，可实时查询「北大法宝」权威法律法规数据库。请遵循：
@@ -475,6 +480,12 @@ def _get_default_classify_prompt() -> str:
 - 如果邮件明显不属于任何法律文书类型（如学术期刊、订阅推送、垃圾广告、个人通信等），选择「非法律文书」并设置 confidence >= 0.9。
 - 如果对文书类型不确定，选择「其他法律文书」并适当降低 confidence。
 
+易混淆类型的区分规则（优先按以下边界判断，不要因为文书带有「通知书」「答复书」等字样就归入其他类型）：
+- 信访件：与信访事项有关的一切文书，包括信访件基本情况登记表、信访事项受理告知书、信访事项处理意见书（答复书）、复查/复核意见书，以及文号含「访答」「信访」「信复」等信访专用字号的文书。凡属于信访渠道办理的告知、答复、意见类文书，一律归「信访件」，不要归入「通知书」。
+- 政府信息公开：围绕「政府信息公开申请」作出的答复，包括政府信息公开申请答复书、政府信息公开告知书、不予公开决定书，以及文号含「信息公开」字样的文书。其申请人主张的是获取特定政府信息，而非信访诉求。
+- 通知书：仅指诉讼、仲裁、行政执法等程序中的程序性告知文书，如应诉通知书、举证通知书、开庭通知书、行政处罚告知书、催告书等，文号通常为「XX通字」「XX告知字」。
+- 当一份文书同时具备多个类型特征时，以文书的**文书名称与文号**为第一判断依据，其次才是正文内容。
+
 返回格式：
 {{"doc_type": "文书类型", "confidence": 0.0-1.0}}
 
@@ -609,13 +620,19 @@ async def classify_doc_type(
     context_window: int = 0,
     usage_ratio: float = 0.50,
     token_method: str = "approximate",
+    max_tokens: int = _CLASSIFY_MIN_MAX_TOKENS,
 ) -> dict:
     """第一阶段：调用类型识别 LLM 判断文书类型。
 
     custom_prompt 为自定义分类提示词模板（LLM 配置 analysis_prompt），为空时使用默认分类模板。
 
+    max_tokens: 分类请求的输出上限。注意「先推理后回答」的模型（如 DeepSeek-V4-Flash、
+    o 系列）会把推理过程也计入该预算，预算过小会导致 JSON 尚未输出即被截断，
+    因此这里强制不低于 _CLASSIFY_MIN_MAX_TOKENS。
+
     返回 {"doc_type": str, "confidence": float}；任何失败（含密钥解密失败）
-    均回退 {"doc_type": "其他法律文书", "confidence": 0.5}，不中断主流程。
+    均回退 {"doc_type": "其他法律文书", "confidence": 0.5, "failed": True}，不中断主流程。
+    failed=True 表示这是识别失败而非模型判断，调用方不得据此路由。
     """
     try:
         api_key = decrypt(api_key_encrypted)
@@ -649,7 +666,7 @@ async def classify_doc_type(
                 {"role": "system", "content": "你是法律文书类型识别专家。只返回 JSON 结果，不要输出任何分析过程或多余文字。"},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": 100,
+            "max_tokens": max(_CLASSIFY_MIN_MAX_TOKENS, int(max_tokens or 0)),
             "temperature": 0,
         }
 
@@ -658,9 +675,18 @@ async def classify_doc_type(
             response.raise_for_status()
             data = response.json()
         content = data["choices"][0]["message"]["content"].strip()
+        finish_reason = (data["choices"][0].get("finish_reason") or "").strip()
+        if finish_reason == "length":
+            logger.error(
+                f"类型识别响应被截断（finish_reason=length，max_tokens={payload['max_tokens']}）："
+                f"推理型模型的推理过程占满了输出预算，JSON 未输出。"
+            )
     except Exception as e:
-        logger.error(f"文书类型识别失败，回退「其他法律文书」: [{type(e).__name__}] {str(e)[:200]}")
-        return {"doc_type": "其他法律文书", "confidence": 0.5}
+        logger.error(
+            f"文书类型识别失败，回退「其他法律文书」（失败兜底值，非模型判断）: "
+            f"[{type(e).__name__}] {str(e)[:200]}"
+        )
+        return {"doc_type": "其他法律文书", "confidence": 0.5, "failed": True}
 
     # 清理可能的 markdown 代码块标记
     if content.startswith("```"):
@@ -673,8 +699,11 @@ async def classify_doc_type(
         result = json.loads(content)
         return _validate_classify_output(result)
     except (json.JSONDecodeError, ValueError, TypeError) as e:
-        logger.error(f"类型识别响应解析失败，回退「其他法律文书」: [{type(e).__name__}] {str(e)[:200]}")
-        return {"doc_type": "其他法律文书", "confidence": 0.5}
+        logger.error(
+            f"类型识别响应解析失败，回退「其他法律文书」（失败兜底值，非模型判断）: "
+            f"[{type(e).__name__}] {str(e)[:200]}"
+        )
+        return {"doc_type": "其他法律文书", "confidence": 0.5, "failed": True}
 
 
 # ── 两阶段编排 ──
@@ -701,6 +730,7 @@ async def analyze_email_two_stage(
     classifier_cfg: dict = None,
     mcp_servers: list = None,
     mcp_max_turns: int = 5,
+    classifier_max_tokens: int = _CLASSIFY_MIN_MAX_TOKENS,
 ) -> dict:
     """两阶段邮件分析编排。
 
@@ -730,10 +760,18 @@ async def analyze_email_two_stage(
         context_window=context_window,
         usage_ratio=usage_ratio,
         token_method=token_method,
+        max_tokens=classifier_max_tokens,
     )
     doc_type = classify_result.get("doc_type", "其他法律文书")
     classifier_confidence = classify_result.get("confidence", 0.5)
-    logger.info(f"第一阶段类型识别: {doc_type} (confidence={classifier_confidence})")
+    classify_failed = bool(classify_result.get("failed"))
+    if classify_failed:
+        logger.warning(
+            f"第一阶段类型识别失败，本次 doc_type=「{doc_type}」为兜底值而非模型判断，"
+            f"该结果不可用于路由决策"
+        )
+    else:
+        logger.info(f"第一阶段类型识别: {doc_type} (confidence={classifier_confidence})")
 
     # ── 非法律文书：跳过第二阶段 ──
     if doc_type == "非法律文书":
@@ -747,6 +785,7 @@ async def analyze_email_two_stage(
             "involved_parties": "",
             "confidence": classifier_confidence,
             "revised_document": None,
+            "classify_failed": classify_failed,
         }
 
     # ── 第二阶段：按类型完整分析 ──
@@ -776,12 +815,21 @@ async def analyze_email_two_stage(
 
     # 合并：doc_type/confidence 以第一阶段识别结果为准（保证路由与日志稳定）
     if analysis and isinstance(analysis, dict):
-        if analysis.get("doc_type") != doc_type:
+        if classify_failed:
+            # 第一阶段失败时 doc_type 是兜底值，第二阶段给出的类型反而更有信息量，
+            # 但不能用它替代识别结果（它是按兜底类型选提示词得出的，不具备独立识别意义）。
+            if analysis.get("doc_type") != doc_type:
+                logger.warning(
+                    f"第一阶段类型识别失败（兜底「{doc_type}」），第二阶段返回「{analysis.get('doc_type')}」"
+                    f"仅供参考，不作为路由依据"
+                )
+        elif analysis.get("doc_type") != doc_type:
             logger.warning(
                 f"第二阶段返回文书类型「{analysis.get('doc_type')}」与第一阶段「{doc_type}」不一致，以第一阶段为准"
             )
         analysis["doc_type"] = doc_type
         analysis["confidence"] = classifier_confidence
+        analysis["classify_failed"] = classify_failed
     return analysis
 
 
