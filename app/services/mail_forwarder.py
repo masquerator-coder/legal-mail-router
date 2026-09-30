@@ -297,7 +297,7 @@ def _generate_analysis_docx(analyses: list[dict], original_subject: str) -> Opti
 
     # 写入临时文件
     tmp = tempfile.NamedTemporaryFile(
-        suffix=".docx", prefix="ai_analysis_", delete=False
+        suffix=".docx", prefix="AI分析报告_", delete=False
     )
     doc.save(tmp.name)
     logger.info(f"AI 分析报告已生成: {tmp.name}")
@@ -776,7 +776,7 @@ def _generate_revision_docx(revision_text: str, doc_type: str,
 
     # 写入临时文件
     tmp = tempfile.NamedTemporaryFile(
-        suffix=".docx", prefix="revision_", delete=False
+        suffix=".docx", prefix="修改版文书_", delete=False
     )
     doc.save(tmp.name)
     logger.info(f"修改版文书已生成: {tmp.name} ({len(revision_text)} 字符)")
@@ -885,7 +885,7 @@ def _fill_review_template(template_path: str, analysis: dict,
 
     # 写入临时文件
     tmp = tempfile.NamedTemporaryFile(
-        suffix=".docx", prefix="review_opinion_", delete=False
+        suffix=".docx", prefix="审核意见_", delete=False
     )
     doc.save(tmp.name)
     logger.info(f"审核意见已生成: {tmp.name} (模板: {tp.name})")
