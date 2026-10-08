@@ -1239,7 +1239,7 @@ def cleanup_old_attachments():
     作为每日定时任务运行，凌晨执行。
     """
     from app.database import SessionLocal
-    from app.models import EmailLog, Attachment, DefaultConfig
+    from app.models import EmailLog, Attachment, DefaultConfig, ForwardRecord
     from app.config import ATTACHMENTS_DIR, resolve_attachment_path
 
     db = SessionLocal()
@@ -1274,7 +1274,8 @@ def cleanup_old_attachments():
                         continue
                     attachment_paths_to_delete.append(full_path)
 
-            # 先删除数据库记录（包含附件记录 + 日志）
+            # 先删除数据库记录（子表必须先删，否则外键约束会报错）
+            db.query(ForwardRecord).filter_by(log_id=log_entry.id).delete()
             db.query(Attachment).filter_by(log_id=log_entry.id).delete()
             db.delete(log_entry)
             deleted_logs += 1

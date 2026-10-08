@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.database import get_db, db_retry_commit
-from app.models import EmailLog, Attachment, EmailAccount, DefaultConfig
+from app.models import EmailLog, Attachment, EmailAccount, DefaultConfig, ForwardRecord
 from app.services.scheduler import scheduler
 from app.config import ATTACHMENTS_DIR, resolve_attachment_path
 from app.services.mail_forwarder import forward_email, get_default_smtp_config, dedupe_smtp_cfgs
@@ -322,6 +322,10 @@ async def delete_selected_logs(
     max_retries = 4
     for attempt in range(max_retries):
         try:
+            # ⚠️ 删除顺序：必须先清掉引用 email_logs 的子表记录。
+            # 连接启用了 PRAGMA foreign_keys=ON，残留引用会直接报
+            # FOREIGN KEY constraint failed 导致整个删除失败。
+            db.query(ForwardRecord).filter(ForwardRecord.log_id.in_(ids)).delete(synchronize_session=False)
             db.query(Attachment).filter(Attachment.log_id.in_(ids)).delete(synchronize_session=False)
             db.query(EmailLog).filter(EmailLog.id.in_(ids)).delete(synchronize_session=False)
             db.commit()
@@ -366,6 +370,8 @@ async def clear_logs(request: Request, form_csrf: str = Form("", alias="_csrf_to
     max_retries = 4
     for attempt in range(max_retries):
         try:
+            # 子表先删（外键约束见 delete_selected_logs 中的说明）
+            db.query(ForwardRecord).delete()
             db.query(Attachment).delete()
             db.query(EmailLog).delete()
             db.commit()
