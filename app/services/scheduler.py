@@ -12,6 +12,7 @@ import json
 import copy
 import time
 import os
+import unicodedata
 from datetime import datetime, timedelta
 import smtplib
 from email.mime.text import MIMEText
@@ -38,31 +39,9 @@ _check_progress = {
     "started_at": None,   # 开始时间 ISO
 }
 
-# 默认主要文书类型列表：这些类型的文书会生成修改版
-# 佐证材料、司法公文、兜底类型不会生成修改版
-REVISION_CANDIDATE_TYPES = frozenset({
-    "合同协议",
-    "起诉状",
-    "答辩状",
-    "上诉状",
-    "仲裁申请书",
-    "执行申请书",
-    "保全申请书",
-    "行政复议申请书",
-    "律师函",
-    "法律意见书",
-    "代理词",
-    "辩护词",
-    "和解协议",
-    "承诺书",
-})
-
-
-def _should_generate_revision(doc_type: str | None) -> bool:
-    """判断该文书类型是否应生成修改版（仅主要文书需要修订）"""
-    if not doc_type:
-        return False
-    return doc_type.strip() in REVISION_CANDIDATE_TYPES
+# 文书类型能力（#修订 / #审查 / #合同）统一由 文书类型.conf 声明，
+# 代码中不再维护任何文书类型清单 —— 见 app/services/llm_analyzer.py 的
+# should_generate_revision / should_generate_review / is_contract_type。
 
 
 def get_progress() -> dict:
@@ -249,6 +228,7 @@ def _load_context(account_id: int) -> dict | None:
             "context_window_tokens": _read_setting("context_window_tokens", "0"),
             "review_template_enabled": _read_setting("review_template_enabled", "false") == "true",
             "review_template_path": _read_setting("review_template_path", "templates/合同审核意见模板.docx"),
+            "review_template_path_civil": _read_setting("review_template_path_civil", "templates/律师审查意见模板.docx"),
             "llm_timeout": int(_read_setting("llm_timeout", "180")),
             # ── 多附件分组分析 ──
             "attachment_grouping": _read_setting("attachment_grouping", "false") == "true",
@@ -700,10 +680,12 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
             all_llm_failed = True
 
         # 修改版文书生成（逐组）——使用单阶段 LLM 输出的 revised_document
+        # 是否可修订由 文书类型.conf 的 #修订 标记决定
+        from app.services.llm_analyzer import should_generate_revision
         if (ctx.get("revision_enabled")
                 and not g_failed
                 and g_analysis
-                and _should_generate_revision(g_analysis.get("doc_type"))
+                and should_generate_revision(g_analysis.get("doc_type"))
                 and llm_cfg):
             try:
                 from app.services.mail_forwarder import _generate_revision_docx
@@ -736,45 +718,57 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
             except Exception as e:
                 logger.error(f"修改版文书生成失败({group_label}): [{type(e).__name__}] {e}")
 
-        # 审核意见模板生成（逐组）
+        # 审查意见模板生成（逐组）
+        # 是否出具由 文书类型.conf 的 #审查 标记决定；
+        # 模板按 #合同 标记分派：合同类用「合同审核意见模板」，其余用「律师审查意见模板」。
+        from app.services.llm_analyzer import should_generate_review, is_contract_type
         if (ctx.get("review_template_enabled")
                 and not g_failed
                 and g_analysis
-                and ctx.get("review_template_path")):
+                and should_generate_review(g_analysis.get("doc_type"))):
             try:
                 from app.services.mail_forwarder import _fill_review_template
                 from app.config import BASE_DIR
 
-                template_full_path = BASE_DIR / ctx["review_template_path"]
-                _update_progress(step="analyzing", step_label=f"正在生成审核意见({group_label})...")
-                # 收集该组的附件文件名（用于提取文书标题）
-                group_filenames = [eml.attachments[i].filename for i in indices] if eml.attachments else []
-                review_path = _fill_review_template(
-                    template_path=str(template_full_path),
-                    analysis=g_analysis,
-                    original_subject=eml.subject,
-                    sender=eml.sender,
-                    body_text=group_attachment_texts or eml.body_text,
-                    attachment_filenames=group_filenames,
-                )
-                if review_path:
-                    review_paths.append(review_path)
-                    suffix = f"-{g_analysis.get('doc_type', '文书')}" if is_grouping else ""
-                    rev_base_name = f"审核意见{suffix}.docx"
-                    if rev_base_name in _seen_revision_names:
-                        _seen_revision_names[rev_base_name] += 1
-                        ext_dot = rev_base_name.rfind(".")
-                        rev_dedup_name = rev_base_name[:ext_dot] + f"_{_seen_revision_names[rev_base_name]}" + rev_base_name[ext_dot:]
-                    else:
-                        _seen_revision_names[rev_base_name] = 0
-                        rev_dedup_name = rev_base_name
-                    attachment_records.append({
-                        "filename": rev_dedup_name,
-                        "file_path": review_path,
-                        "file_size": os.path.getsize(review_path),
-                    })
+                _is_contract = is_contract_type(g_analysis.get("doc_type"))
+                _cfg_key = "review_template_path" if _is_contract else "review_template_path_civil"
+                _rel_path = ctx.get(_cfg_key) or ctx.get("review_template_path")
+                template_full_path = BASE_DIR / _rel_path
+                if not template_full_path.exists():
+                    logger.warning(
+                        f"{'合同' if _is_contract else '律师'}审查意见模板不存在，跳过生成"
+                        f"({group_label}): {_rel_path}"
+                    )
+                else:
+                    _update_progress(step="analyzing", step_label=f"正在生成审查意见({group_label})...")
+                    # 收集该组的附件文件名（用于提取文书标题）
+                    group_filenames = [eml.attachments[i].filename for i in indices] if eml.attachments else []
+                    review_path = _fill_review_template(
+                        template_path=str(template_full_path),
+                        analysis=g_analysis,
+                        original_subject=eml.subject,
+                        sender=eml.sender,
+                        body_text=group_attachment_texts or eml.body_text,
+                        attachment_filenames=group_filenames,
+                    )
+                    if review_path:
+                        review_paths.append(review_path)
+                        suffix = f"-{g_analysis.get('doc_type', '文书')}" if is_grouping else ""
+                        rev_base_name = f"审查意见{suffix}.docx"
+                        if rev_base_name in _seen_revision_names:
+                            _seen_revision_names[rev_base_name] += 1
+                            ext_dot = rev_base_name.rfind(".")
+                            rev_dedup_name = rev_base_name[:ext_dot] + f"_{_seen_revision_names[rev_base_name]}" + rev_base_name[ext_dot:]
+                        else:
+                            _seen_revision_names[rev_base_name] = 0
+                            rev_dedup_name = rev_base_name
+                        attachment_records.append({
+                            "filename": rev_dedup_name,
+                            "file_path": review_path,
+                            "file_size": os.path.getsize(review_path),
+                        })
             except Exception as e:
-                logger.error(f"审核意见模板生成失败({group_label}): [{type(e).__name__}] {e}")
+                logger.error(f"审查意见模板生成失败({group_label}): [{type(e).__name__}] {e}")
 
     # ── 提交分析结果并提前固化 ──
     # 1B 存储格式：doc_type 存首个，doc_types 存全部，llm_raw_response 存数组
@@ -892,6 +886,12 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
             hosts = " / ".join(f"{c['host']}:{c['port']}" for c in smtp_cfgs)
             last_error = f"SMTP: {hosts} → {target_email} | 原因: {error_detail}"
             logger.error(f"转发失败: {last_error}")
+
+        # 逐目标记录转发结果（供「按目标邮箱的每日总结邮件」统计）
+        _record_forward_result(
+            db, log, target_email, ft.get("target_name", ""),
+            all_analyses, success, error_detail,
+        )
 
     if all_success:
         log.status = "forwarded"
@@ -1037,6 +1037,35 @@ def _match_rule_doc_types(rule, mail_doc_types: set) -> bool:
     return bool(rule_types & mail_doc_types)
 
 
+def _record_forward_result(db, log, target_email: str, target_name: str,
+                           all_analyses: list, success: bool, error_detail: str = ""):
+    """记录单个目标邮箱的转发结果（成功/失败各一条）。
+
+    供「按转发目标邮箱的每日总结邮件」统计使用。
+    写入失败不得影响转发主流程，因此整体吞掉异常并记日志。
+    """
+    from app.models import ForwardRecord
+
+    try:
+        doc_types = [a.get("doc_type", "") for a in (all_analyses or []) if a and a.get("doc_type")]
+        rec = ForwardRecord(
+            log_id=log.id,
+            target_email=(target_email or "").strip(),
+            target_name=(target_name or "").strip(),
+            doc_type=doc_types[0] if doc_types else log.doc_type,
+            doc_types=",".join(doc_types) if doc_types else (log.doc_types or ""),
+            subject=log.subject,
+            success=bool(success),
+        )
+        db.add(rec)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning(
+            f"转发记录写入失败（不影响转发）: {target_email} | [{type(e).__name__}] {e}"
+        )
+
+
 def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[dict]:
     """
     决定转发目标列表（两种匹配方式取并集，同一目标邮箱只转发一次）:
@@ -1083,6 +1112,7 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
     mail_doc_types = _collect_mail_doc_types(analysis, log)
     targets = []
     seen = set()
+    target_names = {}  # email → 律师姓名（同一邮箱多条规则时取首个非空）
     all_rules = db.query(RoutingRule).filter_by(enabled=True).order_by(RoutingRule.id).all()
     for rule in all_rules:
         ids_str = (rule.account_ids or "").strip()
@@ -1108,6 +1138,9 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
             if email not in seen:
                 targets.append(email)
                 seen.add(email)
+            _n = (rule.target_name or "").strip()
+            if _n and not target_names.get(email):
+                target_names[email] = _n
 
     if not targets:
         default_email = db.query(DefaultConfig).filter_by(key="default_forward_email").first()
@@ -1138,7 +1171,8 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
         log.error_message = "未配置 SMTP 服务器"
         return []
 
-    return [{"email": t, "smtp_cfgs": smtp_cfgs} for t in targets]
+    return [{"email": t, "target_name": target_names.get(t, ""), "smtp_cfgs": smtp_cfgs}
+            for t in targets]
 
 
 def _infer_smtp_from_account(account) -> Optional[dict]:
@@ -1551,8 +1585,203 @@ def send_daily_report():
         db.close()
 
 
+def _collect_target_summaries(db, since: datetime) -> dict:
+    """按转发目标邮箱聚合 [since, now) 期间的转发情况。
+
+    返回 {target_email: {"name": str, "total": int, "types": {doc_type: count},
+                        "subjects": [(subject, doc_type)], "failed": int}}
+
+    只统计 success=True 的记录用于「转发了多少封」，失败数单独给出。
+    一封邮件的多个类型（多附件分组）按各自类型各计一次，
+    因此各类型数量之和可能大于邮件总数 —— 报表中会说明。
+    """
+    from app.models import ForwardRecord
+
+    records = db.query(ForwardRecord).filter(
+        ForwardRecord.created_at >= since
+    ).order_by(ForwardRecord.created_at).all()
+
+    result: dict = {}
+    for rec in records:
+        email = (rec.target_email or "").strip()
+        if not email:
+            continue
+        entry = result.setdefault(email, {
+            "name": rec.target_name or "",
+            "total": 0,
+            "types": {},
+            "subjects": [],
+            "failed": 0,
+        })
+        if rec.target_name and not entry["name"]:
+            entry["name"] = rec.target_name
+
+        if not rec.success:
+            entry["failed"] += 1
+            continue
+
+        entry["total"] += 1
+        entry["subjects"].append((rec.subject or "(无主题)", rec.doc_type or "未识别"))
+        # 多类型邮件：每个类型各计一次（用于类型分布）
+        types = [t.strip() for t in (rec.doc_types or rec.doc_type or "").split(",") if t.strip()]
+        if not types:
+            types = ["未识别"]
+        for t in dict.fromkeys(types):  # 去重且保持顺序
+            entry["types"][t] = entry["types"].get(t, 0) + 1
+
+    return result
+
+
+def _send_plain_mail(smtp_cfg: dict, to_email: str, subject: str, body: str) -> bool:
+    """用给定 SMTP 配置发送纯文本邮件（不经过 forward_email，避免 AI 模板包裹）"""
+    from app.config import decrypt
+
+    server = None
+    try:
+        smtp_password = decrypt(smtp_cfg["password_encrypted"])
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["From"] = smtp_cfg["username"]
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg["X-Forwarded-By"] = "邮件智能分析转发系统"
+
+        if smtp_cfg["port"] == 465:
+            server = smtplib.SMTP_SSL(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
+        else:
+            server = smtplib.SMTP(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
+            server.starttls()
+
+        server.login(smtp_cfg["username"], smtp_password)
+        server.sendmail(smtp_cfg["username"], [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        logger.error(f"邮件发送失败 → {to_email}: [{type(e).__name__}] {e}")
+        return False
+    finally:
+        if server:
+            try:
+                server.quit()
+            except Exception:
+                pass
+
+
+def _build_target_summary_body(sys_name: str, email: str, name: str,
+                               stat: dict, now_str: str, day_str: str) -> str:
+    """构建单个转发目标的当日总结正文"""
+    total = stat["total"]
+    types = stat["types"]
+    greeting = f"{name} 您好，" if name else "您好，"
+
+    lines = [
+        greeting,
+        "",
+        f"以下是 {sys_name} 统计的、{day_str} 当天转发给 {email} 的文书汇总（{now_str}）：",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+        "📊 今日转发概况",
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+        f"  转发总数：{total} 封",
+    ]
+    if stat["failed"]:
+        lines.append(f"  转发失败：{stat['failed']} 封（已记录，需人工关注）")
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+        "📁 文书类型分布",
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if types:
+        # 按数量降序，数量相同按类型名排序，保证输出稳定
+        ordered = sorted(types.items(), key=lambda kv: (-kv[1], kv[0]))
+
+        def _disp_width(s: str) -> int:
+            """显示宽度：中日韩全角字符按 2 列计，保证等宽对齐"""
+            return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+        width = max(_disp_width(t) for t, _ in ordered)
+        for t, cnt in ordered:
+            pad = " " * max(1, width - _disp_width(t) + 2)
+            pct = (cnt / total * 100) if total else 0
+            lines.append(f"  {t}{pad}{cnt:>3} 封  ({pct:>5.1f}%)")
+        if len(ordered) > 1 and sum(types.values()) != total:
+            lines.append("")
+            lines.append("  说明：一封邮件含多份不同类型文书时会按类型分别计数，")
+            lines.append("        因此各类型数量之和可能大于转发总数。")
+    else:
+        lines.append("  （今日无转发记录）")
+
+    if stat["subjects"]:
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━",
+            "📋 今日转发清单",
+            "━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for subj, dt in stat["subjects"]:
+            s = subj if len(subj) <= 60 else subj[:57] + "..."
+            lines.append(f"  · [{dt}] {s}")
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "此为自动生成的每日汇总，请勿回复。",
+        "如需调整接收邮箱或发送时间，请前往系统设置页面配置。",
+    ]
+    return "\n".join(lines)
+
+
+def send_target_summary_reports():
+    """按转发目标邮箱逐个发送当日总结邮件。
+
+    每个目标邮箱只收到「转发给他自己」的统计，不含其他目标的邮件。
+    数据来自 forward_records 表（逐目标记录，能区分部分成功/失败）。
+    """
+    from app.database import SessionLocal
+    from app.models import DefaultConfig
+
+    db = SessionLocal()
+    try:
+        if _read_setting(db, "target_summary_enabled", "false") != "true":
+            logger.info("转发目标总结邮件未启用，跳过")
+            return
+
+        smtp_cfg = _get_smtp_config_for_report(db)
+        if not smtp_cfg:
+            logger.warning("无法获取 SMTP 配置，跳过转发目标总结邮件")
+            return
+
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        summaries = _collect_target_summaries(db, today)
+
+        if not summaries:
+            logger.info("今日无转发记录，跳过转发目标总结邮件")
+            return
+
+        sys_name = _read_setting(db, "system_name", "邮件智能分析转发系统")
+        now_str = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+        day_str = datetime.now().strftime("%Y年%m月%d日")
+
+        sent = 0
+        for email, stat in summaries.items():
+            body = _build_target_summary_body(
+                sys_name, email, stat["name"], stat, now_str, day_str
+            )
+            subject = f"{sys_name} 转发汇总 {day_str}（{stat['total']} 封）"
+            if _send_plain_mail(smtp_cfg, email, subject, body):
+                sent += 1
+                logger.info(f"转发目标汇总已发送至 {email}（{stat['total']} 封）")
+
+        logger.info(f"转发目标总结邮件完成：{sent}/{len(summaries)} 个目标发送成功")
+    except Exception as e:
+        logger.error(f"生成转发目标总结邮件时出错: {e}", exc_info=True)
+    finally:
+        db.close()
+
+
 def schedule_daily_report_job():
-    """注册每日报告任务（根据配置时间）"""
     from app.database import SessionLocal
     from app.models import DefaultConfig
 
@@ -1582,3 +1811,35 @@ def schedule_daily_report_job():
         misfire_grace_time=900,  # 15分钟容错
     )
     logger.info(f"每日报告任务已注册（每日 {hour:02d}:{minute:02d}）")
+
+
+def schedule_target_summary_job():
+    """注册「转发目标总结邮件」任务（按配置时间，独立于管理员日报）"""
+    from app.database import SessionLocal
+    from app.models import DefaultConfig
+
+    job_id = "target_summary"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+
+    db = SessionLocal()
+    try:
+        time_cfg = db.query(DefaultConfig).filter_by(key="target_summary_time").first()
+        report_time = time_cfg.value.strip() if time_cfg and time_cfg.value.strip() else "18:00"
+    finally:
+        db.close()
+
+    try:
+        hour, minute = map(int, report_time.split(":"))
+    except (ValueError, AttributeError):
+        hour, minute = 18, 0
+
+    scheduler.add_job(
+        func=send_target_summary_reports,
+        trigger=CronTrigger(hour=hour, minute=minute),
+        id=job_id,
+        name="转发目标总结邮件",
+        replace_existing=True,
+        misfire_grace_time=900,  # 15分钟容错
+    )
+    logger.info(f"转发目标总结任务已注册（每日 {hour:02d}:{minute:02d}）")

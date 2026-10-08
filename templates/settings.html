@@ -269,16 +269,30 @@
             </div>
 
             <div id="review-template-path-group" style="margin-top:16px;display:none;">
-                <label for="review_template_path">模板文件路径</label>
+                <label for="review_template_path">合同类文书模板路径</label>
                 <input type="text" id="review_template_path" name="review_template_path"
                        value="{{ settings.review_template_path }}"
                        class="form-control" style="width:480px;"
                        placeholder="templates/合同审核意见模板.docx">
                 <div class="form-hint">
-                    相对于项目根目录的路径。模板需为 .docx 格式，其中的 xxx 将被替换为实际信息。
+                    相对于项目根目录的路径。适用于在 <code>文书类型.conf</code> 中标记了 <code>#合同</code> 的文书类型。
+                    模板需为 .docx 格式，其中的 xxx 将被替换为实际信息。
                     模板示例：<br>
                     P1: "...收到<b>xxx</b>发来的拟与<b>xxx</b>签订的《<b>xxx</b>》。合同内容为<b>xxx</b>事宜。合同价款<b>xxx</b>元。"<br>
                     P6: 日期自动替换为当前日期
+                </div>
+            </div>
+
+            <div id="review-template-civil-path-group" style="margin-top:16px;display:none;">
+                <label for="review_template_path_civil">其他文书模板路径（律师审查意见）</label>
+                <input type="text" id="review_template_path_civil" name="review_template_path_civil"
+                       value="{{ settings.review_template_path_civil }}"
+                       class="form-control" style="width:480px;"
+                       placeholder="templates/律师审查意见模板.docx">
+                <div class="form-hint">
+                    适用于标记了 <code>#审查</code> 但未标记 <code>#合同</code> 的文书类型
+                    （起诉状、律师函、政府信息公开、信访件等）。
+                    模板文件不存在时该类型跳过生成并记录日志，不影响其他类型。
                 </div>
             </div>
         </div>
@@ -382,6 +396,32 @@
                            class="form-control" style="width:260px;"
                            placeholder="输入接收日报的邮箱">
                     <div class="form-hint">留空则不发送。需先配置默认 SMTP</div>
+                </div>
+
+                <!-- 左：转发目标总结开关 -->
+                <div class="form-group">
+                    <label>转发目标总结邮件</label>
+                    <div style="margin-top:6px;">
+                        <input type="hidden" name="target_summary_enabled" value="false">
+                        <input type="checkbox" name="target_summary_enabled" value="true"
+                               {% if settings.target_summary_enabled == 'true' %}checked{% endif %}
+                               onchange="toggleTargetSummaryFields(this.checked)"
+                               style="width:18px;height:18px;cursor:pointer;">
+                        <span style="margin-left:6px;font-size:14px;">启用</span>
+                    </div>
+                    <div class="form-hint">
+                        每天定时<strong>分别</strong>给每个转发目标邮箱发一封汇总邮件，
+                        只统计当天转发给<strong>他本人</strong>的邮件（含文书类型分布与清单）。
+                    </div>
+                </div>
+
+                <!-- 转发目标总结发送时间 -->
+                <div class="form-group" id="target-summary-time-group">
+                    <label for="target_summary_time">总结邮件发送时间</label>
+                    <input type="time" id="target_summary_time" name="target_summary_time"
+                           value="{{ settings.target_summary_time }}"
+                           class="form-control" style="width:150px;">
+                    <div class="form-hint">24 小时制，默认 18:00。与上方管理员日报相互独立</div>
                 </div>
             </div>
         </div>
@@ -519,6 +559,11 @@ function toggleReportFields(enabled) {
     if (timeGroup) timeGroup.style.display = enabled ? '' : 'none';
     if (emailGroup) emailGroup.style.display = enabled ? '' : 'none';
 }
+// 转发目标总结字段联动
+function toggleTargetSummaryFields(enabled) {
+    var timeGroup = document.getElementById('target-summary-time-group');
+    if (timeGroup) timeGroup.style.display = enabled ? '' : 'none';
+}
 // 修改版文书字段联动：取消勾选时隐藏提示词和色彩选项
 function toggleRevisionFields(enabled) {
     var promptGroup = document.getElementById('revision-prompt-group');
@@ -530,6 +575,8 @@ function toggleRevisionFields(enabled) {
 document.addEventListener('DOMContentLoaded', function() {
     var dailyCb = document.querySelector('input[name="daily_report_enabled"][type="checkbox"]');
     if (dailyCb) toggleReportFields(dailyCb.checked);
+    var tsCb = document.querySelector('input[name="target_summary_enabled"][type="checkbox"]');
+    if (tsCb) toggleTargetSummaryFields(tsCb.checked);
     var revCb = document.querySelector('input[name="revision_enabled"][type="checkbox"]');
     if (revCb) toggleRevisionFields(revCb.checked);
     var rtCb = document.querySelector('input[name="review_template_enabled"][type="checkbox"]');
@@ -541,6 +588,8 @@ document.addEventListener('DOMContentLoaded', function() {
 function toggleReviewTemplateFields(enabled) {
     var group = document.getElementById('review-template-path-group');
     if (group) group.style.display = enabled ? '' : 'none';
+    var civilGroup = document.getElementById('review-template-civil-path-group');
+    if (civilGroup) civilGroup.style.display = enabled ? '' : 'none';
 }
 
 // ── MCP 工具 ──
