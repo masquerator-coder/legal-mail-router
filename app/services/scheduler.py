@@ -228,7 +228,7 @@ def _load_context(account_id: int) -> dict | None:
             "context_window_tokens": _read_setting("context_window_tokens", "0"),
             "review_template_enabled": _read_setting("review_template_enabled", "false") == "true",
             "review_template_path": _read_setting("review_template_path", "templates/合同审核意见模板.docx"),
-            "review_template_path_civil": _read_setting("review_template_path_civil", "templates/律师审查意见模板.docx"),
+            "review_template_path_civil": _read_setting("review_template_path_civil", "templates/律师审核意见模板.docx"),
             "llm_timeout": int(_read_setting("llm_timeout", "180")),
             # ── 多附件分组分析 ──
             "attachment_grouping": _read_setting("attachment_grouping", "false") == "true",
@@ -693,12 +693,57 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
                 revision_text = g_analysis.get("revised_document")
 
                 if revision_text:
-                    rev_path = _generate_revision_docx(
-                        revision_text=revision_text,
-                        doc_type=g_analysis.get("doc_type", "其他法律文书"),
-                        original_subject=eml.subject,
-                        use_highlight=ctx.get("revision_highlight", True),
-                    )
+                    # 优先「保持原文格式」：以原始文书为底版注入 Word 原生修订。
+                    # 原文书不是可编辑 docx/doc（如 PDF、扫描件）或注入失败时，
+                    # 回退为原有的纯文本重建方式，并记录降级日志。
+                    _doc_type = g_analysis.get("doc_type", "其他法律文书")
+                    _orig_path = None
+                    try:
+                        _orig_path, _orig_name = _find_original_docx(
+                            indices, eml, attachment_records
+                        )
+                    except Exception as _e:
+                        logger.warning(
+                            f"查找原始文书失败（{group_label}），回退纯文本重建: "
+                            f"[{type(_e).__name__}] {_e}"
+                        )
+
+                    rev_path = None
+                    if _orig_path:
+                        try:
+                            from app.services.redline import build_redlined_docx
+                            _update_progress(
+                                step="analyzing",
+                                step_label=f"正在生成修改版文书({group_label})...",
+                            )
+                            rev_path = build_redlined_docx(
+                                original_path=_orig_path,
+                                revised_text=revision_text,
+                            )
+                            if rev_path:
+                                logger.info(
+                                    f"{group_label} 修改版已保留原文格式"
+                                    f"（底版：{_orig_name}）"
+                                )
+                        except Exception as _e:
+                            logger.warning(
+                                f"原生修订生成失败（{group_label}），回退纯文本重建: "
+                                f"[{type(_e).__name__}] {_e}"
+                            )
+                            rev_path = None
+                    else:
+                        logger.info(
+                            f"{group_label} 无可编辑的原始文书（docx/doc），"
+                            f"修改版将按纯文本重建（格式不保留）"
+                        )
+
+                    if not rev_path:
+                        rev_path = _generate_revision_docx(
+                            revision_text=revision_text,
+                            doc_type=_doc_type,
+                            original_subject=eml.subject,
+                            use_highlight=ctx.get("revision_highlight", True),
+                        )
                     if rev_path:
                         revision_paths.append(rev_path)
                         suffix = f"-{g_analysis.get('doc_type', '文书')}" if is_grouping else ""
@@ -1035,6 +1080,58 @@ def _match_rule_doc_types(rule, mail_doc_types: set) -> bool:
     if not rule_types or not mail_doc_types:
         return False
     return bool(rule_types & mail_doc_types)
+
+
+def _find_original_docx(indices, eml, attachment_records):
+    """为某一组附件找出可作为「修订底版」的原始文书路径。
+
+    优先返回该组第一个 .docx / .doc 附件（保留原生格式的最佳候选）；
+    没有可编辑文档时返回 (None, "")，调用方回退为纯文本重建。
+
+    返回 (绝对路径, 原始文件名)。
+    """
+    if not indices:
+        return None, ""
+    try:
+        from app.config import resolve_attachment_path
+    except Exception:
+        return None, ""
+
+    _DOC_EXT = (".docx", ".doc")
+    candidates = []
+    for i in indices:
+        if i < 0 or i >= len(eml.attachments or []):
+            continue
+        att = eml.attachments[i]
+        fn = getattr(att, "filename", "") or ""
+        ext = os.path.splitext(fn)[1].lower()
+        if ext not in _DOC_EXT:
+            continue
+        # .docx 无需外部转换，优先级更高
+        rank = 0 if ext == ".docx" else 1
+        candidates.append((rank, i, fn))
+    if not candidates:
+        return None, ""
+
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    _, idx, fn = candidates[0]
+
+    rel = None
+    if 0 <= idx < len(attachment_records):
+        rel = attachment_records[idx].get("file_path")
+    if not rel:
+        return None, ""
+
+    try:
+        full = resolve_attachment_path(rel)
+    except Exception as e:
+        logger.warning(f"解析原始附件路径失败: {rel} — {type(e).__name__} {e}")
+        return None, ""
+
+    if not os.path.exists(str(full)):
+        logger.info(f"原始文书不存在，跳过保格式修订: {full}")
+        return None, ""
+    return str(full), fn
 
 
 def _record_forward_result(db, log, target_email: str, target_name: str,
