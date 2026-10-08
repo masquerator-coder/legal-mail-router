@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.database import init_db
-from app.services.scheduler import start_scheduler, shutdown_scheduler, scheduler, schedule_cleanup_job, schedule_daily_report_job
+from app.services.scheduler import start_scheduler, shutdown_scheduler, scheduler, schedule_cleanup_job, schedule_daily_report_job, schedule_target_summary_job
 from app.config import BASE_DIR, load_system_settings, SYSTEM_NAME
 from app import settings as _app_settings  # 动态读取 SYSTEM_NAME（模块全局缓存）
 
@@ -78,6 +78,7 @@ async def lifespan(app: FastAPI):
     start_scheduler()
     schedule_cleanup_job()
     schedule_daily_report_job()
+    schedule_target_summary_job()
     logger.info("调度引擎已启动")
 
     # 初始化管理员密码（首次运行生成随机密码）

@@ -156,3 +156,27 @@ class Attachment(Base):
     created_at = Column(DateTime, default=datetime.now)
 
     email_log = relationship("EmailLog", back_populates="attachments")
+
+
+class ForwardRecord(Base):
+    """逐目标转发记录 — 每成功转发到一个目标邮箱写入一条。
+
+    EmailLog.target_email 存的是逗号拼接的全部目标，无法区分
+    「转给 A 成功、转给 B 失败」，也无法按目标做准确统计；
+    本表以 (log_id, target_email) 为粒度记录实际发送结果，
+    供「按转发目标邮箱的每日总结邮件」统计使用。
+    """
+    __tablename__ = "forward_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    log_id = Column(Integer, ForeignKey("email_logs.id"), nullable=False, comment="关联邮件日志")
+    target_email = Column(String(200), nullable=False, comment="转发目标邮箱")
+    target_name = Column(String(100), default="", comment="目标律师姓名")
+    doc_type = Column(String(50), comment="该封邮件的文书类型（多附件时为首个）")
+    doc_types = Column(Text, comment="该封邮件的全部文书类型（逗号分隔）")
+    subject = Column(String(500), comment="邮件主题（便于报表直接展示）")
+    success = Column(Boolean, default=True, comment="该目标是否转发成功")
+    created_at = Column(DateTime, default=datetime.now, comment="记录时间（当日统计依据）")
+
+    # 索引在 database.init_db() 中统一以 IF NOT EXISTS 建立
+    # （避免此处再声明一份导致重复索引）

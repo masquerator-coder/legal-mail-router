@@ -248,6 +248,11 @@ def init_db():
             _migrate_routing_rules_rule_type(conn)
             _set_schema_version(conn, 6)
 
+        # ── 版本 7: forward_records 逐目标转发记录（按目标邮箱统计用） ──
+        # 表由 Base.metadata.create_all 创建，这里只补索引（幂等）。
+        if current_version < 7:
+            _set_schema_version(conn, 7)
+
         # 添加查询性能索引和 UNIQUE 约束（SQLite 用 IF NOT EXISTS 安全幂等）
         sqls = [
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_email_logs_message_id ON email_logs(message_id)",
@@ -256,6 +261,9 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_email_logs_account_id ON email_logs(account_id)",
             "CREATE INDEX IF NOT EXISTS idx_attachments_log_id ON attachments(log_id)",
             "CREATE INDEX IF NOT EXISTS idx_routing_rules_enabled_priority ON routing_rules(enabled, priority)",
+            "CREATE INDEX IF NOT EXISTS idx_forward_records_target_email ON forward_records(target_email)",
+            "CREATE INDEX IF NOT EXISTS idx_forward_records_created_at ON forward_records(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_forward_records_log_id ON forward_records(log_id)",
         ]
         for sql in sqls:
             conn.execute(text(sql))

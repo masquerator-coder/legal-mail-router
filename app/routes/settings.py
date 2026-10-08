@@ -71,11 +71,15 @@ SETTING_DEFAULTS = {
     "revision_enabled": "false",        # 是否生成修改版文书
     "revision_highlight": "true",       # 色彩标注改动（蓝色新增/红色修改/删除线建议删除）
     "context_window_tokens": "0",       # 上下文窗口大小(0=自动探测)
-    "review_template_enabled": "false", # 启用审核意见模板
-    "review_template_path": "templates/合同审核意见模板.docx",  # 模板文件路径
+    "review_template_enabled": "false", # 启用审查意见模板
+    "review_template_path": "templates/合同审核意见模板.docx",  # 合同类文书模板路径
+    "review_template_path_civil": "templates/律师审查意见模板.docx",  # 非合同文书模板路径
     "admin_email": "",              # 日报接收邮箱（空=不发送）
     "daily_report_enabled": "true", # 日报开关
     "daily_report_time": "09:00",   # 日报发送时间 (HH:MM, 24小时制)
+    # ── 转发目标总结邮件（按目标邮箱分别发送当日转发汇总）──
+    "target_summary_enabled": "false",  # 启用转发目标总结邮件
+    "target_summary_time": "18:00",     # 发送时间 (HH:MM, 24小时制)
     "email_body_max_chars": "0",  # 邮件正文上限（0=由上下文窗口自动推导）
     # ── MCP 工具（如北大法宝法规检索） ──
     "mcp_enabled": "false",        # 启用 MCP 工具（第二阶段文书分析时供 LLM 调用）
@@ -161,9 +165,12 @@ async def save_settings(
     context_window_tokens: str = Form("0"),
     review_template_enabled: str = Form("false"),
     review_template_path: str = Form(""),
+    review_template_path_civil: str = Form(""),
     admin_email: str = Form(""),
     daily_report_enabled: str = Form("true"),
     daily_report_time: str = Form("09:00"),
+    target_summary_enabled: str = Form("false"),
+    target_summary_time: str = Form("18:00"),
     email_body_max_chars: str = Form("0"),
     mcp_enabled: str = Form("false"),
     mcp_servers: str = Form(""),
@@ -206,9 +213,12 @@ async def save_settings(
     _save_setting(db, "context_window_tokens", context_window_tokens.strip())
     _save_setting(db, "review_template_enabled", "true" if review_template_enabled.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "review_template_path", review_template_path.strip())
+    _save_setting(db, "review_template_path_civil", review_template_path_civil.strip())
     _save_setting(db, "admin_email", admin_email.strip())
     _save_setting(db, "daily_report_enabled", "true" if daily_report_enabled.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "daily_report_time", daily_report_time.strip())
+    _save_setting(db, "target_summary_enabled", "true" if target_summary_enabled.lower() in ("true", "on", "1") else "false")
+    _save_setting(db, "target_summary_time", target_summary_time.strip() or "18:00")
     _save_setting(db, "email_body_max_chars", email_body_max_chars.strip())
     _save_setting(db, "mcp_enabled", "true" if mcp_enabled.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "mcp_servers", mcp_servers.strip())
@@ -223,6 +233,15 @@ async def save_settings(
     _save_setting(db, "auto_update_branch", auto_update_branch.strip() or "main")
     _save_setting(db, "auto_update_interval_hours", auto_update_interval_hours.strip() or "6")
     db_retry_commit(db)
+
+    # 定时任务时间/开关变更后立即重新注册，免重启生效
+    try:
+        from app.services.scheduler import schedule_daily_report_job, schedule_target_summary_job
+        schedule_daily_report_job()
+        schedule_target_summary_job()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"重新注册定时任务失败: {_e}")
 
     # 更新全局缓存
     set_system_name(system_name.strip())
