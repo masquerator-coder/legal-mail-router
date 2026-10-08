@@ -109,6 +109,18 @@ def cmd_check(args):
     else:
         print("  - antiword 未安装 (.doc 提取降级)")
 
+    # LibreOffice（.doc → .docx，用于生成保留原文格式的修改版文书）
+    # 复用 redline.find_soffice()：它同时覆盖 PATH 与各平台默认安装路径
+    try:
+        from app.services.redline import find_soffice
+        soffice_path = find_soffice()
+    except Exception:
+        soffice_path = shutil.which("soffice") or shutil.which("libreoffice")
+    if soffice_path:
+        print(f"  ✓ LibreOffice ({soffice_path})")
+    else:
+        print("  - LibreOffice 未安装 (.doc 修改版降级为纯文本重建)")
+
     if missing:
         print(f"\n⚠️  缺失 {len(missing)} 个依赖，运行 'python run.py install' 安装")
     else:

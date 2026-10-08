@@ -134,10 +134,13 @@ class TestDocTypesFile:
         assert len(types) == len(set(types))
 
     def test_get_doc_types_contains_new_admin_types(self):
-        """新增类型：政府信息公开 / 信访件"""
+        """新增类型：政府信息公开 / 信访件 / 履职申请 / 咨询 / 投诉举报"""
         types = _get_doc_types()
         assert "政府信息公开" in types
         assert "信访件" in types
+        assert "履职申请" in types
+        assert "咨询" in types
+        assert "投诉举报" in types
 
     def test_get_doc_analysis_prompt_contract(self):
         prompt = _get_doc_analysis_prompt("合同协议")
@@ -146,7 +149,9 @@ class TestDocTypesFile:
 
     def test_new_types_have_dedicated_prompts(self):
         """新类型须有专属提示词，不得回退「其他法律文书」兜底"""
-        for name, keyword in (("政府信息公开", "20 个工作日"), ("信访件", "60 日")):
+        for name, keyword in (("政府信息公开", "20 个工作日"), ("信访件", "60 日"),
+                              ("履职申请", "两个月"), ("咨询", "12345"),
+                              ("投诉举报", "投诉")):
             prompt = _get_doc_analysis_prompt(name)
             assert prompt, f"{name} 提示词为空"
             assert "专属分析流程(兜底)" not in prompt, f"{name} 回退到了兜底提示词"
@@ -154,9 +159,17 @@ class TestDocTypesFile:
             assert keyword in prompt
             assert "{today}" in prompt  # 期限计算须以当前日期为基准
 
+    def test_admin_entry_prompts_do_not_fall_back_to_each_other(self):
+        """五个入口各有独立提示词，内容互不相同（拆分为独立类型的回归保护）"""
+        names = ("政府信息公开", "履职申请", "信访件", "咨询", "投诉举报")
+        prompts = {n: _get_doc_analysis_prompt(n) for n in names}
+        for n, p in prompts.items():
+            assert p.strip(), f"{n} 提示词为空"
+        assert len({p for p in prompts.values()}) == len(names), "存在重复的提示词内容"
+
     def test_new_types_pass_classify_validation(self):
         """类型识别输出新类型时不得被回退为「其他法律文书」"""
-        for name in ("政府信息公开", "信访件"):
+        for name in ("政府信息公开", "履职申请", "信访件", "咨询", "投诉举报"):
             r = m._validate_classify_output({"doc_type": name, "confidence": 0.9})
             assert r["doc_type"] == name
 
@@ -675,6 +688,12 @@ class TestClassifyDisambiguation:
         assert "通知书" in template
         assert "访答" in template  # 信访专用文号特征
 
+    def test_template_covers_all_admin_entry_types(self):
+        """行政程序五个入口均须有消歧规则（否则新类型易被误判为通知书）"""
+        template = m._get_default_classify_prompt()
+        for name in ("政府信息公开", "履职申请", "信访件", "咨询", "投诉举报"):
+            assert f"- {name}：" in template, f"{name} 缺少边界规则"
+
     def test_petition_reply_maps_to_petition_type(self):
         """信访类文书的边界规则应排在「通知书」规则之前，先入为主地引导模型"""
         prompt = build_classify_prompt(
@@ -829,14 +848,15 @@ class TestRealConfCapabilities:
             assert m.should_generate_review(t) is False, t
 
     def test_newly_added_types_are_revisable(self):
-        """政府信息公开/信访件：此前因硬编码白名单遗漏而丢失修改版（本次修复点）"""
-        for t in ("政府信息公开", "信访件"):
+        """行政程序五个入口：此前因硬编码白名单遗漏而丢失修改版（本次修复点）"""
+        for t in ("政府信息公开", "履职申请", "信访件", "咨询", "投诉举报"):
             assert m.should_generate_revision(t) is True, t
             assert m.should_generate_review(t) is True, t
 
     def test_non_contract_review_uses_civil_template(self):
         """非合同类型有 #审查 但无 #合同 → 用律师审查意见模板"""
-        for t in ("起诉状", "律师函", "政府信息公开", "信访件", "其他法律文书", "通知书"):
+        for t in ("起诉状", "律师函", "政府信息公开", "履职申请", "信访件",
+                  "咨询", "投诉举报", "其他法律文书", "通知书"):
             assert m.should_generate_review(t) is True, t
             assert m.is_contract_type(t) is False, t
 

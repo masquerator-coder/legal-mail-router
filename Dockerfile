@@ -12,12 +12,16 @@ ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 # 安装系统依赖（PyMuPDF 需要）+ antiword 用于 .doc 文本提取
 # + p7zip-full / unar 用于解压 rar（含 RAR5）/ 7z 附件
 # （unrar-free 仅支持 RAR4，modern RAR5 需 unar，故用 unar 替代）
+# + libreoffice-writer-nogui 用于把 .doc 原文转成 .docx，使修改版文书
+#   能保留原文格式（无 GUI 变体，配合 --no-install-recommends 跳过
+#   Java/字体等推荐包；缺失时应用自动降级为纯文本重建，不影响启动）
 RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
     sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list 2>/dev/null; \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         tzdata \
         antiword \
+        libreoffice-writer-nogui \
         p7zip-full \
         unar \
         git \
