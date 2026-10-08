@@ -761,3 +761,177 @@ class TestTwoStageClassifyFailure:
             subject="s", sender="f", body="b", classifier_max_tokens=2048,
         )
         assert captured["max_tokens"] == 2048
+
+
+class TestDocTypeCapabilities:
+    """类型能力标记解析（文书类型.conf 是唯一事实来源）"""
+
+    def test_parse_plain_type(self):
+        """无标记的行 → 类型名 + 空能力集合"""
+        assert m._parse_doc_type_line("判决书") == ("判决书", frozenset())
+
+    def test_parse_single_marker(self):
+        name, caps = m._parse_doc_type_line("合同协议  #修订")
+        assert name == "合同协议"
+        assert caps == frozenset({m.CAP_REVISION})
+
+    def test_parse_multiple_markers(self):
+        name, caps = m._parse_doc_type_line("合同协议   #修订 #审查 #合同")
+        assert name == "合同协议"
+        assert caps == frozenset({m.CAP_REVISION, m.CAP_REVIEW, m.CAP_CONTRACT})
+
+    def test_parse_marker_without_space(self):
+        """# 紧跟类型名也应识别"""
+        name, caps = m._parse_doc_type_line("合同协议#修订")
+        assert name == "合同协议"
+        assert caps == frozenset({m.CAP_REVISION})
+
+    def test_parse_comment_line(self):
+        """整行注释 → 空类型"""
+        assert m._parse_doc_type_line("# 这是注释 #修订") == ("", frozenset())
+
+    def test_parse_blank_line(self):
+        assert m._parse_doc_type_line("   ") == ("", frozenset())
+        assert m._parse_doc_type_line("") == ("", frozenset())
+
+    def test_parse_unknown_marker_ignored(self):
+        """未识别的标记被忽略，但类型名仍保留（笔误不导致类型丢失）"""
+        name, caps = m._parse_doc_type_line("起诉状  #修订 #拼错的标记")
+        assert name == "起诉状"
+        assert caps == frozenset({m.CAP_REVISION})
+
+    def test_unknown_doc_type_has_no_capabilities(self):
+        """不在 conf 中的类型 → 无任何能力（保守：不生成修改版与审查意见）"""
+        assert m.get_doc_type_capabilities("不存在的类型") == frozenset()
+        assert m.get_doc_type_capabilities(None) == frozenset()
+        assert m.get_doc_type_capabilities("") == frozenset()
+
+    def test_fallback_types_always_present(self):
+        """兜底类型无论 conf 是否包含都会补齐"""
+        types = m._get_doc_types()
+        for fb in m._FALLBACK_DOC_TYPES:
+            assert fb in types
+        assert "其他法律文书" in types,"兜底类型应始终可用"
+
+
+class TestRealConfCapabilities:
+    """针对当前仓库 文书类型.conf 的回归（防止新增类型漏配标记）"""
+
+    def test_contract_is_revisable_and_contract_review(self):
+        assert m.should_generate_revision("合同协议") is True
+        assert m.should_generate_review("合同协议") is True
+        assert m.is_contract_type("合同协议") is True
+
+    def test_court_documents_not_revisable(self):
+        """法院出具的裁判文书/程序性告知不修订、不出审查意见"""
+        for t in ("判决书", "裁定书", "传票"):
+            assert m.should_generate_revision(t) is False, t
+            assert m.should_generate_review(t) is False, t
+
+    def test_newly_added_types_are_revisable(self):
+        """政府信息公开/信访件：此前因硬编码白名单遗漏而丢失修改版（本次修复点）"""
+        for t in ("政府信息公开", "信访件"):
+            assert m.should_generate_revision(t) is True, t
+            assert m.should_generate_review(t) is True, t
+
+    def test_non_contract_review_uses_civil_template(self):
+        """非合同类型有 #审查 但无 #合同 → 用律师审查意见模板"""
+        for t in ("起诉状", "律师函", "政府信息公开", "信访件", "其他法律文书", "通知书"):
+            assert m.should_generate_review(t) is True, t
+            assert m.is_contract_type(t) is False, t
+
+    def test_no_hardcoded_doc_type_list_in_scheduler(self):
+        """scheduler 不应再维护文书类型清单（回归保护）"""
+        import app.services.scheduler as sched
+        assert not hasattr(sched, "REVISION_CANDIDATE_TYPES")
+        assert not hasattr(sched, "_should_generate_revision")
+
+
+class TestRevisionSectionByType:
+    """主模板修订章节按类型能力渲染"""
+
+    def test_revisable_type_gets_marking_spec(self):
+        sec = m._build_revision_section("合同协议")
+        assert "生成修改版文书" in sec
+        assert "【新增】" in sec and "【/新增】" in sec
+
+    def test_non_revisable_type_gets_null_instruction(self):
+        for t in ("判决书", "裁定书", "传票", "证据材料"):
+            sec = m._build_revision_section(t)
+            assert "不生成修改版文书" in sec, t
+            assert "null" in sec, t
+            assert "【新增】" not in sec, t
+
+    def test_none_doc_type_is_non_revisable(self):
+        sec = m._build_revision_section(None)
+        assert "不生成修改版文书" in sec
+
+    def test_build_prompt_renders_revision_field_desc(self):
+        """Output schema 的 revised_document 说明随类型变化，且无占位符残留"""
+        p_rev = build_prompt("s", "a@b.c", "body", doc_type="合同协议")
+        p_none = build_prompt("s", "a@b.c", "body", doc_type="判决书")
+        assert "{revision_field_desc}" not in p_rev
+        assert "{revision_field_desc}" not in p_none
+        assert "{revision_instructions}" not in p_rev
+        assert "{revision_instructions}" not in p_none
+        assert "固定为null（本类型无需修订）" in p_none
+        assert "固定为null（本类型无需修订）" not in p_rev
+
+    def test_build_prompt_backward_compatible_without_doc_type(self):
+        """不传 doc_type 时按「不可修订」渲染（保守），不抛异常"""
+        prompt = build_prompt("s", "a@b.c", "body")
+        assert "不生成修改版文书" in prompt
+
+    def test_custom_prompt_without_revision_placeholder_gets_appended(self):
+        """自定义模板未含 {revision_instructions} 时，修订要求追加到末尾"""
+        prompt = build_prompt(
+            "s", "a@b.c", "body",
+            custom_prompt="自定义模板 {subject} {body}",
+            doc_type="合同协议",
+        )
+        assert "自定义模板" in prompt
+        assert "生成修改版文书" in prompt
+
+    def test_classify_prompt_unaffected_by_markers(self):
+        """类型识别候选清单：标记不应进入 {doc_types} 列表"""
+        prompt = build_classify_prompt(subject="s", sender="a@b.c", body="b")
+        assert "#修订" not in prompt
+        assert "#审查" not in prompt
+        for t in ("合同协议", "判决书", "政府信息公开", "信访件"):
+            assert t in prompt
+
+
+class TestTwoStageForwardsDocType:
+    """回归：第二阶段必须收到第一阶段识别出的 doc_type（否则提示词无法按类型渲染）"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("doc_type,expect_revision", [
+        ("合同协议", True),
+        ("政府信息公开", True),   # 此前因硬编码白名单遗漏
+        ("信访件", True),         # 此前因硬编码白名单遗漏
+        ("判决书", False),
+    ])
+    async def test_doc_type_reaches_analyze_email(self, monkeypatch,
+                                                  doc_type, expect_revision):
+        captured = {}
+
+        async def fake_classify(*args, **kwargs):
+            return {"doc_type": doc_type, "confidence": 0.9}
+
+        async def fake_analyze(*args, **kwargs):
+            captured["doc_type"] = kwargs.get("doc_type")
+            return {
+                "doc_type": doc_type, "case_summary": "x", "ai_interpretation": "y",
+                "urgency": "medium", "key_date": None, "case_number": None,
+                "involved_parties": "", "confidence": 0.5, "revised_document": None,
+            }
+
+        monkeypatch.setattr(m, "classify_doc_type", fake_classify)
+        monkeypatch.setattr(m, "analyze_email", fake_analyze)
+
+        await m.analyze_email_two_stage(
+            api_url="u", api_key_encrypted="k", model_name="m",
+            subject="s", sender="f", body="b",
+        )
+        assert captured["doc_type"] == doc_type
+        assert m.should_generate_revision(captured["doc_type"]) is expect_revision

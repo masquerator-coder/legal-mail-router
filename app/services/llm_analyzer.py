@@ -29,6 +29,18 @@ _DEFAULT_DOC_TYPES = [
 # 系统兜底类型：无论配置文件如何，均强制包含
 _FALLBACK_DOC_TYPES = ("其他法律文书", "非法律文书")
 
+# ── 类型能力标记（在 文书类型.conf 的类型行行尾以 `#标记` 声明）──
+# 是否生成修改版文书 / 审查意见，**只由 文书类型.conf 决定**，
+# 代码中不再维护任何文书类型清单（避免清单多处维护、新增类型漏同步）。
+CAP_REVISION = "修订"   # 生成「修改版文书.docx」
+CAP_REVIEW = "审查"     # 生成审查意见.docx
+CAP_CONTRACT = "合同"   # 审查意见使用「合同审核意见模板」（合同专用字段），否则用律师审查意见模板
+
+_CAPABILITY_MARKERS = frozenset({CAP_REVISION, CAP_REVIEW, CAP_CONTRACT})
+
+# 类型 → 能力集合 的缓存（key 为 conf 文件的 mtime+size，文件变更自动失效）
+_doc_type_caps_cache: tuple | None = None
+
 # 第一阶段类型识别的输出预算下限。
 # 推理型模型（DeepSeek-V4-Flash 等）把推理过程计入 max_tokens，预算过小时 JSON 还没输出就被截断，
 # 表现为「解析失败 → 兜底其他法律文书」。此下限用于兜住模型配置里过小/未设置的值。
@@ -45,37 +57,108 @@ _MCP_USAGE_INSTRUCTION = """## 法律检索工具（MCP）
 """
 
 
+def _parse_doc_type_line(raw: str) -> tuple[str, frozenset]:
+    """解析 文书类型.conf 的一行，返回 (类型名, 能力集合)。
+
+    行格式：``类型名 [#标记 ...]``。标记可紧跟类型名（无空格），也可是多个。
+    以 ``#`` 开头的整行是注释，由调用方过滤。
+    未识别的标记会被忽略（不报错），避免因笔误导致类型丢失。
+    """
+    line = (raw or "").strip()
+    if not line or line.startswith("#"):
+        return "", frozenset()
+
+    name, _, marker_part = line.partition("#")
+    name = name.strip()
+    if not name:
+        return "", frozenset()
+
+    caps = set()
+    for token in re.split(r"[\s#]+", marker_part.strip()):
+        token = token.strip()
+        if token in _CAPABILITY_MARKERS:
+            caps.add(token)
+    return name, frozenset(caps)
+
+
+def _load_doc_type_caps() -> dict[str, frozenset]:
+    """读取 文书类型.conf，返回 {类型名: 能力集合}（保持文件中的顺序）。
+
+    内置兜底类型（其他法律文书/非法律文书）无论文件是否包含都会补齐。
+    文件读取失败或为空时回退内置清单，此时所有类型均无能力标记。
+    结果按文件 mtime+size 缓存，修改 conf 后无需重启即生效。
+    """
+    global _DOC_TYPES_FILE, _doc_type_caps_cache
+    if _DOC_TYPES_FILE is None:
+        from app.config import BASE_DIR
+        _DOC_TYPES_FILE = BASE_DIR / "文书类型.conf"
+
+    # 缓存键：文件 mtime + size（文件不存在时为 None）
+    try:
+        st = _DOC_TYPES_FILE.stat()
+        cache_key = (str(_DOC_TYPES_FILE), st.st_mtime_ns, st.st_size)
+    except OSError:
+        cache_key = (str(_DOC_TYPES_FILE), None, None)
+
+    if _doc_type_caps_cache and _doc_type_caps_cache[0] == cache_key:
+        return _doc_type_caps_cache[1]
+
+    caps_map: dict[str, frozenset] = {}
+    try:
+        if _DOC_TYPES_FILE.exists():
+            text = _DOC_TYPES_FILE.read_text(encoding="utf-8")
+            for line in text.splitlines():
+                name, caps = _parse_doc_type_line(line)
+                if name and name not in caps_map:
+                    caps_map[name] = caps
+    except Exception as e:
+        logger.error(f"读取 文书类型.conf 失败: [{type(e).__name__}] {e}")
+
+    if not caps_map:
+        logger.error("文书类型.conf 不存在或为空，使用内置默认文书类型清单")
+        caps_map = {name: frozenset() for name in _DEFAULT_DOC_TYPES}
+    else:
+        # 自动补齐系统兜底类型
+        for fb in _FALLBACK_DOC_TYPES:
+            caps_map.setdefault(fb, frozenset())
+
+    _doc_type_caps_cache = (cache_key, caps_map)
+    return caps_map
+
+
 def _get_doc_types() -> list:
     """获取文书类型清单：从 文书类型.conf 读取（每行一个类型），缺失时回退内置默认。
 
     系统兜底类型（其他法律文书/非法律文书）无论配置文件是否包含都会自动补齐。
     """
-    global _DOC_TYPES_FILE
-    if _DOC_TYPES_FILE is None:
-        from app.config import BASE_DIR
-        _DOC_TYPES_FILE = BASE_DIR / "文书类型.conf"
+    return list(_load_doc_type_caps().keys())
 
-    doc_types = []
-    try:
-        if _DOC_TYPES_FILE.exists():
-            text = _DOC_TYPES_FILE.read_text(encoding="utf-8")
-            for line in text.splitlines():
-                name = line.strip()
-                if name and not name.startswith("#"):
-                    if name not in doc_types:
-                        doc_types.append(name)
-    except Exception as e:
-        logger.error(f"读取 文书类型.conf 失败: [{type(e).__name__}] {e}")
 
-    if not doc_types:
-        logger.error("文书类型.conf 不存在或为空，使用内置默认文书类型清单")
-        doc_types = list(_DEFAULT_DOC_TYPES)
-    else:
-        # 自动补齐系统兜底类型
-        for fb in _FALLBACK_DOC_TYPES:
-            if fb not in doc_types:
-                doc_types.append(fb)
-    return doc_types
+def get_doc_type_capabilities(doc_type: str | None) -> frozenset:
+    """获取某文书类型的能力集合（来自 文书类型.conf 的行尾标记）。
+
+    返回值是 CAP_REVISION / CAP_REVIEW / CAP_CONTRACT 的子集。
+    未知类型（不在 conf 中）返回空集合——即不生成修改版，也不生成审查意见。
+    """
+    name = (doc_type or "").strip()
+    if not name:
+        return frozenset()
+    return _load_doc_type_caps().get(name, frozenset())
+
+
+def should_generate_revision(doc_type: str | None) -> bool:
+    """该类型是否应生成修改版文书（由 文书类型.conf 的 #修订 标记决定）"""
+    return CAP_REVISION in get_doc_type_capabilities(doc_type)
+
+
+def should_generate_review(doc_type: str | None) -> bool:
+    """该类型是否应生成审查意见（由 文书类型.conf 的 #审查 标记决定）"""
+    return CAP_REVIEW in get_doc_type_capabilities(doc_type)
+
+
+def is_contract_type(doc_type: str | None) -> bool:
+    """该类型是否使用合同审核意见模板（由 文书类型.conf 的 #合同 标记决定）"""
+    return CAP_CONTRACT in get_doc_type_capabilities(doc_type)
 
 
 def _get_doc_analysis_prompt(doc_type: str) -> str:
@@ -139,21 +222,68 @@ def _escape_json_string_newlines(text: str) -> str:
     return re.sub(r'(?<=: )"((?:[^"\\]|\\.)*)"', _fix, text)
 
 
+def _build_revision_section(doc_type: str | None) -> str:
+    """按文书类型能力生成主模板 {revision_instructions} 占位符内容。
+
+    可修订类型（conf 中带 #修订）：输出完整的「生成修改版文书」章节与改动标记规范。
+    其余类型：明确告知无需输出修订正文，避免模型生成代码随后会丢弃的内容。
+    """
+    if should_generate_revision(doc_type):
+        return """### 步骤三：生成修改版文书（对应输出字段 revised_document）
+基于以上审核发现，在 `revised_document` 字段输出完整的修改后文书正文。修订原则：
+1. 逐条修正条款问题；补充缺失的关键条款（违约责任、争议解决、送达地址、管辖约定等），调整明显失衡的权利义务条款。
+2. 保持原文的整体结构、段落顺序与行文风格。
+3. 修订建议与现行法律法规强制性规定明显冲突时，原文保留并标注【待核实】。
+
+**改动标记规范（颜色标注指令）：** 系统按以下标记渲染颜色（最终文档只显示颜色，不显示标记文字）：
+
+| 标记（须成对包裹全部内容） | 渲染效果 |
+| --- | --- |
+| 【新增】…【/新增】 | 蓝色 |
+| 【修改】…【/修改】 | 红色 |
+| 【删除】…【/删除】 | 红色 + 删除线 |
+
+使用要求：
+1. 开标记与闭合标记必须成对（闭合格式固定为【/标记名】），内容无论多长都须完整包裹；**禁止只在段落行首加【新增】等开标记而不闭合**。
+2. 标记不得嵌套；未改动的段落原样输出，不加任何标记。
+3. 原文中的【待确认】等业务占位符不是修订标记，原样保留；不要用「（新增）」等文字代替标记。
+
+**修订输出规则：**
+- 只输出修订后的文书正文，不加「以下是修改版」等前言，不输出分析过程、思考步骤或推理说明。
+- 输出较长时优先保证 JSON 结构完整（所有字段闭合、引号正确），可适当精简 ai_interpretation，但不得截断输出。"""
+
+    return """### 步骤三：不生成修改版文书
+本类型文书无需修订，`revised_document` 字段请直接输出 `null`，不要输出任何修订后的文书正文。"""
+
+
+def _build_revision_field_desc(doc_type: str | None) -> str:
+    """Output JSON schema 中 revised_document 字段的说明文字（按类型能力生成）"""
+    if should_generate_revision(doc_type):
+        return "完整的修改后文书正文（含【新增】【修改】【删除】标记）"
+    return "固定为null（本类型无需修订）"
+
+
 def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
                   body_max_chars: int = 8000,
                   today_str: str = "",
-                  analysis_instructions: str = "") -> str:
+                  analysis_instructions: str = "",
+                  doc_type: str | None = None) -> str:
     """构建分析 prompt。body_max_chars 为邮件正文字符上限（0=不截断）。
 
     analysis_instructions 为按文书类型读取的分析流程提示词，嵌入主模板的
     {analysis_instructions} 占位符位置；为空时占位符被替换为空串。
+
+    doc_type 决定该类型是否输出修订内容（由 文书类型.conf 的 #修订 标记决定）：
+    可修订类型渲染「生成修改版文书」章节，其余类型渲染为「无需修订」的说明，
+    避免提示词要求模型输出代码随后会丢弃的字段。
     """
     if not today_str:
         from datetime import date
         today_str = date.today().isoformat()
     template = custom_prompt if custom_prompt.strip() else _get_default_prompt()
-    # 模板是否引用 {analysis_instructions} 占位符（在哨兵替换前检查）
+    # 模板是否引用占位符（在哨兵替换前检查）
     template_has_analysis_placeholder = "{analysis_instructions}" in template
+    template_has_revision_placeholder = "{revision_instructions}" in template
 
     # 截断过长的正文
     if body_max_chars > 0 and len(body) > body_max_chars:
@@ -165,9 +295,18 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
     if analysis_instructions and "{today}" in analysis_instructions:
         analysis_instructions = analysis_instructions.replace("{today}", today_str)
 
+    revision_instructions = _build_revision_section(doc_type)
+    revision_field_desc = _build_revision_field_desc(doc_type)
+
+    # 分析流程提示词中可引用 {today}，此处单独替换（format 不递归处理参数值）
+    if analysis_instructions and "{today}" in analysis_instructions:
+        analysis_instructions = analysis_instructions.replace("{today}", today_str)
+
     # ⚠️ 用户自定义提示词中可能包含未转义的 { }（如 JSON 示例格式）
     # 需要先保护已知占位符，转义其余花括号，再恢复占位符后调用 .format()
-    KNOWN_PLACEHOLDERS = {"{subject}", "{sender}", "{body}", "{today}", "{analysis_instructions}"}
+    KNOWN_PLACEHOLDERS = {"{subject}", "{sender}", "{body}", "{today}",
+                          "{analysis_instructions}", "{revision_instructions}",
+                          "{revision_field_desc}"}
     # 保护阶段：替换已知占位符为唯一哨兵
     sentinel_map = {}
     for i, ph in enumerate(KNOWN_PLACEHOLDERS):
@@ -182,9 +321,15 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
         template = template.replace(sentinel, ph)
 
     format_args = dict(subject=subject, sender=sender, body=body_truncated,
-                       today=today_str, analysis_instructions=analysis_instructions)
+                       today=today_str, analysis_instructions=analysis_instructions,
+                       revision_instructions=revision_instructions,
+                       revision_field_desc=revision_field_desc)
     prompt = template.format(**format_args)
-    # 自定义模板若未引用 {analysis_instructions} 占位符，将分析流程提示词追加到末尾，避免指令静默丢失
+    # 自定义模板若未引用 {revision_instructions} 占位符，把修订要求追加到末尾，
+    # 避免「模板未含占位符 → 模型仍被要求输出 revised_document」的静默不一致。
+    if revision_instructions and not template_has_revision_placeholder:
+        logger.warning("提示词模板未包含 {revision_instructions} 占位符，已将修订要求追加到提示词末尾")
+        prompt += "\n\n" + revision_instructions
     if analysis_instructions and not template_has_analysis_placeholder:
         logger.warning("提示词模板未包含 {analysis_instructions} 占位符，已将文书分析流程提示词追加到提示词末尾")
         prompt += "\n\n" + analysis_instructions
@@ -212,11 +357,15 @@ async def analyze_email(
     analysis_instructions: str = "",
     mcp_servers: list = None,
     mcp_max_turns: int = 5,
+    doc_type: str | None = None,
 ) -> dict:
     """
     使用 LLM 分析邮件（含附件文本）—— 第二阶段文书分析
 
     analysis_instructions: 按文书类型读取的分析流程提示词，嵌入主模板 {analysis_instructions} 占位符。
+
+    doc_type: 第一阶段识别出的文书类型，决定是否要求模型输出 revised_document
+              （由 文书类型.conf 的 #修订 标记决定）。
 
     mcp_servers: MCP 服务器配置（list of {name,url,headers} 或兼容形态）。非空时启用 MCP 工具
                  调用循环（如北大法宝法规检索），模型可实时查法规并在报告/修改版文书末尾附引用链接。
@@ -239,7 +388,8 @@ async def analyze_email(
     # 构建 base prompt
     prompt = build_prompt(subject, sender, body, custom_prompt,
                           body_max_chars=body_max_chars,
-                          analysis_instructions=analysis_instructions)
+                          analysis_instructions=analysis_instructions,
+                          doc_type=doc_type)
 
     # 预算检查（在提交前检测是否需要截断）
     # 注意：预算计算用的 expected_output_tokens 不等同于 max_tokens（API 输出上限），
@@ -811,6 +961,7 @@ async def analyze_email_two_stage(
         analysis_instructions=analysis_instructions,
         mcp_servers=mcp_servers,
         mcp_max_turns=mcp_max_turns,
+        doc_type=doc_type,
     )
 
     # 合并：doc_type/confidence 以第一阶段识别结果为准（保证路由与日志稳定）
