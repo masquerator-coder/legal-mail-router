@@ -73,7 +73,7 @@ SETTING_DEFAULTS = {
     "context_window_tokens": "0",       # 上下文窗口大小(0=自动探测)
     "review_template_enabled": "false", # 启用审查意见模板
     "review_template_path": "templates/合同审核意见模板.docx",  # 合同类文书模板路径
-    "review_template_path_civil": "templates/律师审查意见模板.docx",  # 非合同文书模板路径
+    "review_template_path_civil": "templates/律师审核意见模板.docx",  # 非合同文书模板路径
     "admin_email": "",              # 日报接收邮箱（空=不发送）
     "daily_report_enabled": "true", # 日报开关
     "daily_report_time": "09:00",   # 日报发送时间 (HH:MM, 24小时制)

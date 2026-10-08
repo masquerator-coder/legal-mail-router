@@ -876,12 +876,18 @@ def _fill_review_template(template_path: str, analysis: dict,
         ]
         _replace_xxx_in_paragraph(p1, replacements)
 
-    # ── P2: 保持不动（模板已有律所措辞）──
+    # ── P2: 模板自带的律所措辞，保持不动 ──
+
+    # ── 插入 AI 分析正文 ──
+    # 模板正文原本只有模板自带的固定措辞，不含实质审查结论。
+    # 这里把 LLM 的 ai_interpretation（审查分析）按段落插入 P2 之后，
+    # 使审查意见具备可用的实质内容；同时把模板标题改写为与文书类型匹配。
+    _insert_analysis_body(doc, analysis)
 
     # ── P6: 替换日期 ──
     if len(doc.paragraphs) > 6:
         p6_text = datetime.now().strftime("%Y年%m月%d日")
-        _replace_paragraph_text(doc.paragraphs[6], p6_text)
+        _replace_paragraph_text(doc.paragraphs[-1], p6_text)
 
     # 写入临时文件
     tmp = tempfile.NamedTemporaryFile(
@@ -890,6 +896,81 @@ def _fill_review_template(template_path: str, analysis: dict,
     doc.save(tmp.name)
     logger.info(f"审核意见已生成: {tmp.name} (模板: {tp.name})")
     return tmp.name
+
+
+def _insert_analysis_body(doc, analysis: dict):
+    """把 LLM 的审查分析正文插入模板（在开头两段之后、落款之前）。
+
+    模板正文只含固定措辞，本身没有实质审查结论；此处按段落插入
+    ai_interpretation 的内容，并尽量沿用模板正文字体。
+
+    - 标题（P0）中的「合同审核意见」按文书类型改写，避免起诉状等
+      非合同文书顶着「合同审核意见」的抬头。
+    - 无 ai_interpretation 时静默跳过（保持模板原样，不报错）。
+    """
+    import copy
+    import re as _re
+
+    text = (analysis.get("ai_interpretation") or "").strip()
+    if not text:
+        return
+
+    paras = doc.paragraphs
+    if not paras:
+        return
+
+    # ── 标题改写：模板自带抬头 → 按文书类型命名 ──
+    doc_type = (analysis.get("doc_type") or "").strip()
+    if doc_type:
+        title = paras[0]
+        if "审核意见" in (title.text or "") or "审查意见" in (title.text or ""):
+            _replace_paragraph_text(title, f"{doc_type}审查意见")
+
+    # ── 正文插入点：模板前两段之后（落款前）──
+    anchor = paras[1] if len(paras) > 1 else paras[0]
+
+    # 样式参考：取模板正文字体的 rPr，使插入内容与模板一致
+    ref_rpr = None
+    for p in paras[:3]:
+        if p.runs:
+            found = p.runs[0]._element.find(
+                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rPr"
+            )
+            if found is not None:
+                ref_rpr = copy.deepcopy(found)
+            break
+
+    # 按空行切块，块内按单换行切行
+    blocks = [b for b in _re.split(r"\n\s*\n", text) if b.strip()]
+    if not blocks:
+        blocks = [text]
+
+    from docx.oxml.ns import qn
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+    for blk in blocks:
+        lines = [ln.strip() for ln in blk.split("\n") if ln.strip()] or [blk]
+        for ln in lines:
+            # 克隆锚点段落 → 保留 pPr（段落格式），清掉正文
+            new_p = copy.deepcopy(anchor._element)
+            for child in list(new_p):
+                if child.tag == W + "pPr":
+                    continue
+                new_p.remove(child)
+
+            run = new_p.makeelement(W + "r", {})
+            if ref_rpr is not None:
+                run.append(copy.deepcopy(ref_rpr))
+            t = new_p.makeelement(W + "t", {})
+            t.text = ln
+            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            run.append(t)
+            new_p.append(run)
+
+            anchor._element.addnext(new_p)
+            # 后续内容插到刚插入的段落之后，保持顺序
+            from docx.text.paragraph import Paragraph
+            anchor = Paragraph(new_p, anchor._parent)
 
 
 def _extract_amount(text: str) -> str:
