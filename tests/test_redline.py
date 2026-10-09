@@ -934,3 +934,142 @@ def _accepted_paragraph_texts(body_xml: str) -> list:
         if txt:
             out.append(txt)
     return out
+
+
+# ── C 方案：标记段的「段落回流」 ──
+
+class TestReflowMarkedSegments:
+    """标记段必须按**换行**回流成段落，而不是每个标记段各成一段。
+
+    回归背景：`_parse_marked_text` 是按**标记**切分的，不是按段落切分的。
+    「只改一句话」会被切成 3 个片段（前文 normal + 改动 modify + 后文 normal）。
+    若把每个片段都当成一个目标段落，目标段数就多于原文段数，段落级 LCS
+    全部错位，产物里出现「维修工程维修工程」这种重复文本，
+    接受/拒绝修订都还原不出正确结果。
+    """
+
+    def test_mid_paragraph_marker_stays_one_paragraph(self):
+        """标记在段落中间（前后无换行）→ 必须仍是一个段落"""
+        from app.services.redline import _parse_marked_text, _reflow_marked_segments
+        segs = _parse_marked_text(
+            "工程名称：鑫庭花园外墙示范小城镇安置房专项【修改】维修工程【/修改】")
+        groups = _reflow_marked_segments(segs)
+        assert len(groups) == 1, f"段内标记不应拆段: {groups}"
+        assert "".join(t for _, t in groups[0]) == \
+            "工程名称：鑫庭花园外墙示范小城镇安置房专项维修工程"
+
+    def test_mid_paragraph_marker_keeps_kinds(self):
+        """回流后各片段的标记类型必须保留（供着色/修订类型判定）"""
+        from app.services.redline import (
+            _parse_marked_text, _reflow_marked_segments, _render_paragraph_group,
+        )
+        segs = _parse_marked_text("第一条 甲方应在【修改】60【/修改】日内支付。")
+        groups = _reflow_marked_segments(segs)
+        assert len(groups) == 1
+        kinds = [k for k, _ in groups[0]]
+        assert "modify" in kinds
+        text, kind = _render_paragraph_group(groups[0])
+        assert text == "第一条 甲方应在60日内支付。"
+        assert kind == "modify"
+
+    def test_trailing_add_stays_one_paragraph(self):
+        """段尾追加内容（无换行）→ 仍是一个段落，不应变成两段"""
+        from app.services.redline import _parse_marked_text, _reflow_marked_segments
+        segs = _parse_marked_text("第二条 工期。【新增】本条经双方确认后生效。【/新增】")
+        groups = _reflow_marked_segments(segs)
+        assert len(groups) == 1, f"段尾追加不应拆段: {groups}"
+
+    def test_real_newline_splits_paragraphs(self):
+        """真实换行分隔的两个段落标题 → 必须拆成两段"""
+        from app.services.redline import _parse_marked_text, _reflow_marked_segments
+        segs = _parse_marked_text("第一条 工期\n第二条 价款")
+        groups = _reflow_marked_segments(segs)
+        assert len(groups) == 2, f"换行分隔应拆段: {groups}"
+
+    def test_blank_line_splits_paragraphs(self):
+        """空行 → 必定拆段"""
+        from app.services.redline import _parse_marked_text, _reflow_marked_segments
+        segs = _parse_marked_text("第一条 工期\n\n第二条 价款")
+        groups = _reflow_marked_segments(segs)
+        assert len(groups) == 2
+
+    def test_soft_newline_is_preserved(self):
+        """判定为「不断段」的换行必须作为软换行保留在段内
+
+        不能把 `\\n` 吃掉：下游依赖它决定是否用真实 <w:p> 分段（铁律 4）。
+        """
+        from app.services.redline import (
+            _parse_marked_text, _reflow_marked_segments, _render_paragraph_group,
+        )
+        segs = _parse_marked_text(
+            "12.1 协商不成时，可按下列第 2 种方式解决：\n"
+            "①向仲裁委员会申请仲裁；\n"
+            "②向人民法院起诉。")
+        groups = _reflow_marked_segments(segs)
+        text, _ = _render_paragraph_group(groups[0])
+        assert "\n" in text, "软换行不应被吞掉"
+        assert text.count("\n") == 2
+
+    def test_single_line_group_unchanged(self):
+        """单行内容 → 一段，回归最基本情形"""
+        from app.services.redline import _parse_marked_text, _reflow_marked_segments
+        segs = _parse_marked_text("普通的一段话。")
+        groups = _reflow_marked_segments(segs)
+        assert len(groups) == 1
+
+    def test_empty_segments_returns_empty(self):
+        from app.services.redline import _reflow_marked_segments
+        assert _reflow_marked_segments([]) == []
+
+
+class TestNoDuplicateTextAfterMidParagraphEdit:
+    """段内标记不得导致文本重复（C 方案的核心回归）。"""
+
+    def test_mid_paragraph_edit_does_not_duplicate(self, tmp_path):
+        """「只改一句话」接受修订后，文本必须与预期完全一致、无重复。"""
+        src = _make_minimal_docx(
+            tmp_path / "dup.docx",
+            ["工程名称：某示范小城镇安置房专项维修工程"],
+        )
+        revised = "工程名称：某示范小城镇安置房专项【修改】维修工程【/修改】"
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        accepted = "".join(_accepted_paragraph_texts(body))
+        assert accepted == "工程名称：某示范小城镇安置房专项维修工程"
+        assert "维修工程维修工程" not in accepted
+        os.remove(out)
+
+    def test_trailing_add_does_not_duplicate_paragraph(self, tmp_path):
+        """段尾【新增】不得把整段复制一遍（既保留原文又插入一份相同段落）。"""
+        src = _make_minimal_docx(
+            tmp_path / "tail.docx",
+            ["第二条 工期。", "第三条 价款。"],
+        )
+        revised = ("第二条 工期。【新增】本条经双方确认后生效。【/新增】\n\n"
+                   "第三条 价款。")
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        accepted = _accepted_paragraph_texts(body)
+        # 原文段只能出现一次
+        assert sum(1 for t in accepted if t.startswith("第二条 工期。")) == 1
+        joined = "".join(accepted)
+        assert joined.count("第二条 工期。") == 1
+        assert "本条经双方确认后生效。" in joined
+        os.remove(out)
+
+    def test_paragraph_count_matches_source(self, tmp_path):
+        """段内细化的产物段落数必须与原文一致（不得凭空增加段落）。"""
+        paras = [f"第{i}条 内容{i}。" for i in range(1, 11)]
+        src = _make_minimal_docx(tmp_path / "count.docx", paras)
+        # 只在第 3 段中间改一处，其余不变
+        revised = "\n\n".join(
+            "第3条 【修改】修改后【/修改】内容3。" if p == "第3条 内容3。" else p
+            for p in paras
+        )
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        assert len(_accepted_paragraph_texts(body)) == len(paras)
+        os.remove(out)

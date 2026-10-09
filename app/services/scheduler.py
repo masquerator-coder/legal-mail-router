@@ -225,6 +225,7 @@ def _load_context(account_id: int) -> dict | None:
             "llm_retry_interval": int(_read_setting("llm_retry_interval", "10")),
             "llm_max_retries": int(_read_setting("llm_max_retries", "3")),
             "revision_enabled": _read_setting("revision_enabled", "false") == "true",
+            "revision_native": _read_setting("revision_native", "true") == "true",
             "revision_highlight": _read_setting("revision_highlight", "true") == "true",
             "context_window_tokens": _read_setting("context_window_tokens", "0"),
             "review_template_enabled": _read_setting("review_template_enabled", "false") == "true",
@@ -695,48 +696,59 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
                 revision_text = g_analysis.get("revised_document")
 
                 if revision_text:
-                    # 优先「保持原文格式」：以原始文书为底版注入 Word 原生修订。
-                    # 原文书不是可编辑 docx/doc（如 PDF、扫描件）或注入失败时，
-                    # 回退为原有的纯文本重建方式，并记录降级日志。
+                    # 两条生成路径，由「Word 原生修订」开关（revision_native）决定：
+                    #   - 开启（默认）：以原始文书为底版注入 OOXML 原生修订标记，
+                    #     保留页面设置/字体/页眉页脚；原文书不是可编辑 docx/doc
+                    #     或注入失败时，回退为下面的颜色标记方式。
+                    #   - 关闭：直接用颜色标记方式（python-docx 从空白文档重建，
+                    #     蓝=新增/红=修改/红+删除线=建议删除）。
                     _doc_type = g_analysis.get("doc_type", "其他法律文书")
-                    _orig_path = None
-                    try:
-                        _orig_path, _orig_name = _find_original_docx(
-                            indices, eml, attachment_records
-                        )
-                    except Exception as _e:
-                        logger.warning(
-                            f"查找原始文书失败（{group_label}），回退纯文本重建: "
-                            f"[{type(_e).__name__}] {_e}"
-                        )
-
+                    _use_native = ctx.get("revision_native", True)
+                    _orig_name = None
                     rev_path = None
-                    if _orig_path:
+
+                    if _use_native:
+                        _orig_path = None
                         try:
-                            from app.services.redline import build_redlined_docx
-                            _update_progress(
-                                step="analyzing",
-                                step_label=f"正在生成修改版文书({group_label})...",
+                            _orig_path, _orig_name = _find_original_docx(
+                                indices, eml, attachment_records
                             )
-                            rev_path = build_redlined_docx(
-                                original_path=_orig_path,
-                                revised_text=revision_text,
-                            )
-                            if rev_path:
-                                logger.info(
-                                    f"{group_label} 修改版已保留原文格式"
-                                    f"（底版：{_orig_name}）"
-                                )
                         except Exception as _e:
                             logger.warning(
-                                f"原生修订生成失败（{group_label}），回退纯文本重建: "
+                                f"查找原始文书失败（{group_label}），回退纯文本重建: "
                                 f"[{type(_e).__name__}] {_e}"
                             )
-                            rev_path = None
+
+                        if _orig_path:
+                            try:
+                                from app.services.redline import build_redlined_docx
+                                _update_progress(
+                                    step="analyzing",
+                                    step_label=f"正在生成修改版文书({group_label})...",
+                                )
+                                rev_path = build_redlined_docx(
+                                    original_path=_orig_path,
+                                    revised_text=revision_text,
+                                )
+                                if rev_path:
+                                    logger.info(
+                                        f"{group_label} 修改版已保留原文格式"
+                                        f"（底版：{_orig_name}）"
+                                    )
+                            except Exception as _e:
+                                logger.warning(
+                                    f"原生修订生成失败（{group_label}），回退纯文本重建: "
+                                    f"[{type(_e).__name__}] {_e}"
+                                )
+                                rev_path = None
+                        else:
+                            logger.info(
+                                f"{group_label} 无可编辑的原始文书（docx/doc），"
+                                f"修改版将按纯文本重建（格式不保留）"
+                            )
                     else:
                         logger.info(
-                            f"{group_label} 无可编辑的原始文书（docx/doc），"
-                            f"修改版将按纯文本重建（格式不保留）"
+                            f"{group_label} 已关闭 Word 原生修订，使用颜色标记方式生成修改版"
                         )
 
                     if not rev_path:

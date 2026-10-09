@@ -531,15 +531,22 @@ def _apply_segments_to_body(body, segments, author, date_str, rev_ids) -> int:
     if not entries:
         return 0
 
-    # 构造目标段落序列：空行必定拆段；单换行则按行文形态判断
-    # （见 `_split_target_paragraphs` / `_looks_like_standalone_paragraph`）
+    # 构造目标段落序列。
+    # ⚠️ 必须先按「段落边界」回流标记段（`_reflow_marked_segments`），
+    # 不能把每个标记段直接当成一个目标段落：标记是按**标记**切的，不是按段落切的，
+    # 「只改一句话」会被切成 3 段（前文/normal + 改动/modify + 后文/normal），
+    # 目标段数多于原文段数 → 段落级 LCS 错位 → 产物出现重复文本、
+    # 接受/拒绝修订都还原不出正确结果。
     target = []
-    for kind, content in segments:
-        for raw in _split_target_paragraphs(content):
-            text = raw.strip()
-            if not text:
-                continue
-            target.append((kind if kind != "normal" else "normal", text))
+    for group in _reflow_marked_segments(segments):
+        text, kind = _render_paragraph_group(group)
+        if not text.strip():
+            continue
+        # 用 rstrip("\n") 而非 strip()：去掉换行残留，保留原文的行内/尾随空格。
+        # 尾随空格参与段落匹配（原文常用空格补齐对齐），strip 掉会让
+        # 「根本没改动的段落」被判成修改。只裁换行，与 `_paragraph_text`
+        # 还原出的原文形态保持一致。
+        target.append((kind, text.rstrip("\n")))
 
     if not target:
         return 0
@@ -596,6 +603,140 @@ def _looks_like_standalone_paragraph(line: str) -> bool:
     if len(s) <= 20 and not re.search(r"[，,。；;：:]", s):
         return True
     return False
+
+
+def _reflow_marked_segments(segments: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
+    """把标记段序列「回流」成**段落组**：每组对应一个目标段落。
+
+    ## 为什么必须回流
+
+    `_parse_marked_text` 按**标记**切分，而不是按**段落**切分。于是
+    「只改一句话」这种最常见的修订会被切成多段：
+
+        原文：  工程名称：鑫庭花园外墙示范小城镇安置房专项维修工程
+        修订：  工程名称：…专项【修改】维修工程【/修改】
+        解析：  [(normal, '工程名称：…专项'), (modify, '维修工程')]
+
+    若把每个标记段各自当作一个目标段落，目标段数（2）多于原文段数（1），
+    段落级 LCS 全部错位，尾部内容被推着往后挤，产物里会出现
+    「维修工程维修工程」这种重复文本，接受/拒绝修订都还原不出正确结果
+    （往返不变量被破坏）。
+
+    ## 判据：只有「换行」才是段落边界
+
+    标记切出的碎片之间**没有换行** —— 它们是同一行上的连续文本，被标记
+    人为切开。因此：
+
+    1. 相邻片段之间**没有换行** → 必然同属一个段落，**无条件合并**。
+       这是本函数的核心：绝不能用「看起来像独立段落」去判断碎片，
+       因为碎片本身就是半截话（`工程名称：…专项` 像标签、`维修工程` 又很短，
+       两个判据都会误判成独立段落）。
+    2. 相邻片段之间**有换行** → 才按行判断：
+       - 空行（连续两个及以上换行）**一律**拆段；
+       - 单个换行：换行前那一行「看起来像完整段落」
+         （见 `_looks_like_standalone_paragraph`）→ 拆段；
+         否则视作段内软换行（如 ``甲方：…\\n乙方：…``），不拆。
+
+    返回 [[(kind, text), ...], ...]，每个内层列表是一个目标段落的标记段序列。
+    """
+    # 把整条序列重新拼回**带标记归属的字符流**，以便按真实换行切分。
+    # 每个字符记住它来自哪个 kind，切分后据此还原标记类型。
+    chars: list[tuple[str, str]] = []      # [(kind, ch)]
+    for kind, content in segments:
+        if content is None:
+            continue
+        text = content.replace("\r\n", "\n").replace("\r", "\n")
+        for ch in text:
+            chars.append((kind, ch))
+
+    if not chars:
+        return []
+
+    # 按换行切成「行」：每行是 [(kind, ch), ...]（不含 \n）
+    raw_lines: list[list[tuple[str, str]]] = [[]]
+    for kind, ch in chars:
+        if ch == "\n":
+            raw_lines.append([])
+        else:
+            raw_lines[-1].append((kind, ch))
+
+    # 逐行决定是否断段。
+    # 断段判据与旧版 `_split_target_paragraphs` 保持一致（**双向**判断）：
+    #   - 上一行以「非终结标点」收尾（如「：」「，」）→ 句子没说完，不断开；
+    #   - 上一行像完整段落 → 断开；
+    #   - 当前行像完整段落开头（条款号/短标签/短标题）→ 断开；
+    #   - 否则视为段内软换行，不断开。
+    # 注意这里判定的前提是「两行之间确实存在换行」—— 标记切出的碎片不含换行，
+    # 会落在同一个 line 里，天然被合并，不会走到这里被误拆。
+    #
+    # ⚠️ 不断开的行之间必须**保留那个 `\n`**：它是段内软换行，
+    # 下游 `_replace_paragraph_inline` 依赖它决定是否用真实 `<w:p>` 分段
+    # （见铁律 4）。若在这里把换行吃掉，软换行信息就永久丢失，
+    # 「原文一行、修订后在中间另起一段」的场景会退化成一段平铺的长文本。
+    groups: list[list[tuple[str, str]]] = []
+    cur: list[tuple[str, str]] = []
+    prev_line_text = None      # 上一非空行的纯文本
+    pending_break = False      # 待决的换行：不断段时需作为 "\n" 补回
+
+    def _flush():
+        nonlocal cur, prev_line_text, pending_break
+        if any(c.strip() for _, c in cur):
+            groups.append(cur)
+        cur = []
+        prev_line_text = None
+        pending_break = False
+
+    for line in raw_lines:
+        line_text = "".join(c for _, c in line)
+        if not line_text.strip():
+            # 空行 → 强制断段
+            _flush()
+            continue
+        if cur and prev_line_text is not None:
+            # 上一行以非终结标点收尾 → 续行，必定不断
+            if not _CONT_RE.search(prev_line_text.strip()):
+                if (_looks_like_standalone_paragraph(prev_line_text)
+                        or _looks_like_standalone_paragraph(line_text)):
+                    _flush()
+            if cur and pending_break:
+                # 判定为「不断段」→ 把这个换行作为软换行保留在段内
+                cur.append(("normal", "\n"))
+        cur.extend(line)
+        prev_line_text = line_text
+        pending_break = True
+    _flush()
+
+    # 合并每段内相邻同类片段
+    out: list[list[tuple[str, str]]] = []
+    for grp in groups:
+        merged: list[tuple[str, str]] = []
+        for kind, ch in grp:
+            if merged and merged[-1][0] == kind:
+                merged[-1] = (kind, merged[-1][1] + ch)
+            else:
+                merged.append((kind, ch))
+        out.append(merged)
+    return out
+
+
+def _render_paragraph_group(group: list[tuple[str, str]]) -> tuple[str, str]:
+    """把一个段落组渲染成 (目标纯文本, 段落级 kind)。
+
+    目标纯文本 = 各片段文本直接拼接（标记只影响着色，不进入正文）。
+    段落级 kind 取组内最「强」的标记：delete > modify > add > normal，
+    供 `_diff_apply` 判定整段意图（例如整段【删除】）。
+    """
+    text = "".join(t for _, t in group)
+    kinds = {k for k, _ in group if k != "normal"}
+    if "delete" in kinds:
+        kind = "delete"
+    elif "modify" in kinds:
+        kind = "modify"
+    elif "add" in kinds:
+        kind = "add"
+    else:
+        kind = "normal"
+    return text, kind
 
 
 def _split_target_paragraphs(content: str) -> list[str]:
@@ -1239,6 +1380,15 @@ def _extract_forced_ops(orig_texts, target, sm):
     「未改动」而静默忽略这条指令。因此在 diff 结果之上做一次重切：
     凡目标段落 kind 非 normal 的，其对应的 opcode 一律不保留为 equal。
 
+    ⚠️ 带 `add` 标记的段落**不一定是「整段新增」**：
+    LLM 常在原文段落末尾追加一句，写成 ``原文…【新增】补充句【/新增】``。
+    此时目标段落文本 ≈ 原文段落文本（只多了一句），按位置一一对应，
+    应当作为**该段的段内细化**处理（equal + ins），而不是「插入一个全新段落」——
+    后者会把原文那段留下、再插入一份几乎相同的段落，Word 里看起来就是
+    「整段重复」，接受修订后原文与新增句会同时出现两遍。
+    因此这里把「与原段落高度相似」的 add 段落降级为 delete_marked（走段内细化），
+    只有确实找不到对应原文段（相似度过低）的才按 insert 处理。
+
     返回 [(tag, i1, i2, j1, j2, kinds)]，已按原始顺序排好；
     数据不足以安全重切时返回 None（调用方回退为纯 diff 行为）。
     """
@@ -1275,14 +1425,59 @@ def _extract_forced_ops(orig_texts, target, sm):
             if marked:
                 # 该区间内目标段落带标记 → 对应原文段落按标记强制处理
                 seg_kinds = kinds[j1 + k:j1 + k2]
-                if all(sk == "add" for sk in seg_kinds):
+                if all(sk == "add" for sk in seg_kinds) and \
+                        not _add_is_actually_edit(orig_texts, i1 + k, i1 + k2,
+                                                  target, j1 + k, j1 + k2):
+                    # 确属「整段新增」：原文侧无对应内容
                     out.append(("insert", i1 + k, i1 + k, j1 + k, j1 + k2, seg_kinds))
                 else:
+                    # 含 modify/delete，或 add 实为「在原段末尾追加」→ 段内细化
                     out.append(("delete_marked", i1 + k, i1 + k2, j1 + k, j1 + k2, seg_kinds))
             else:
                 out.append(("equal", i1 + k, i1 + k2, j1 + k, j1 + k2, []))
             k = k2
     return out
+
+
+# add 段落与原文段落相似度超过该值，判定为「在原段末尾追加内容」而非整段新增。
+# 取 0.5：追加一句通常只占原段一小部分，相似度远高于此；
+# 而真正的新增段落与原文段落的相似度通常很低，不会误判。
+_ADD_EDIT_SIMILARITY = 0.5
+
+
+def _add_is_actually_edit(orig_texts, i1, i2, target, j1, j2) -> bool:
+    """判断带 `add` 标记的目标段落是否其实是「在对应原文段落上追加内容」。
+
+    用于把 ``原文…【新增】补充句【/新增】`` 这种写法识别为**段内细化**，
+    避免被当成「整段新增」而产出重复段落。
+
+    判据：目标段落与**同位置**原文段落的相似度 ≥ `_ADD_EDIT_SIMILARITY`，
+    且原文段落文本确实构成目标段落的**前缀**（追加发生在段尾）。
+
+    只在两侧长度可一一对应时判断；无法对应时返回 False（保守按整段新增）。
+    """
+    import difflib
+
+    n_old = i2 - i1
+    n_new = j2 - j1
+    if n_old <= 0 or n_new <= 0 or n_old != n_new:
+        return False
+    for m in range(n_old):
+        oi = i1 + m
+        tj = j1 + m
+        if oi >= len(orig_texts) or tj >= len(target):
+            return False
+        old = orig_texts[oi]
+        new = _normalize(target[tj][1])
+        if not old or not new:
+            return False
+        # 前缀关系：原文段整体出现在目标段开头 → 追加式修订
+        if new.startswith(old):
+            return True
+        ratio = difflib.SequenceMatcher(None, old, new, autojunk=False).ratio()
+        if ratio < _ADD_EDIT_SIMILARITY:
+            return False
+    return True
 
 
 def _kind_of(target, j1, j2) -> str:

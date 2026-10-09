@@ -24,7 +24,7 @@ class TestSettingsDefaults:
             "default_check_interval", "monitor_days",
             "log_retention_days", "llm_retry_interval", "llm_max_retries",
             "analysis_output_mode", "revision_enabled",
-            "revision_highlight", "context_window_tokens",
+            "revision_native", "revision_highlight", "context_window_tokens",
             "review_template_enabled", "review_template_path",
             "admin_email", "daily_report_enabled", "daily_report_time",
         ]
@@ -61,6 +61,38 @@ class TestSettingsDefaults:
         auth = cfg["mcpServers"]["pkulaw-law-search"]["headers"]["Authorization"]
         assert "__PKULAW_TOKEN__" in auth
         assert "620dcbb8" not in auth  # 不得泄露真实 Token
+
+
+class TestRevisionNativeSwitch:
+    """修改版文书「Word 原生修订」开关"""
+
+    @pytest.fixture
+    def defaults(self):
+        from app.routes.settings import SETTING_DEFAULTS
+        return SETTING_DEFAULTS
+
+    def test_default_is_on(self, defaults):
+        """默认开启原生修订：保持既有线上行为（当前走的就是原生修订）"""
+        assert defaults["revision_native"] == "true"
+
+    def test_switch_key_present(self, defaults):
+        assert "revision_native" in defaults
+
+    def test_save_form_accepts_switch(self):
+        """保存接口必须接收 revision_native 表单字段（缺省时为 true）"""
+        import inspect
+        from app.routes import settings as settings_mod
+        sig = inspect.signature(settings_mod.save_settings)
+        assert "revision_native" in sig.parameters
+        assert sig.parameters["revision_native"].default.default == "true"
+
+    def test_save_normalizes_truthy_values(self):
+        """on/1/true 均解析为开启；其余为关闭"""
+        truthy = ("true", "on", "1", "True", "ON")
+        for v in truthy:
+            assert v.lower() in ("true", "on", "1")
+        for v in ("false", "off", "0", ""):
+            assert v.lower() not in ("true", "on", "1")
 
 
 class TestPortDefaults:

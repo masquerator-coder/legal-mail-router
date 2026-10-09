@@ -1,6 +1,7 @@
 """
 Mail Forwarder — 转发正文构建测试（原发件人/原收件人/原收件日期/原主题注明）
 """
+import os
 import pytest
 from datetime import datetime
 from app.services.mail_forwarder import _build_email_body
@@ -129,6 +130,74 @@ class TestParseRevisionMarkers:
     def test_no_markers_returns_normal(self):
         from app.services.mail_forwarder import _parse_revision_markers as parse
         assert parse("纯文本") == [("normal", "纯文本")]
+
+
+class TestColorMarkedRevisionDocx:
+    """颜色标记方式生成修改版文书（revision_native 关闭时的回退路径）"""
+
+    def test_generates_docx_with_color_marks(self, tmp_path):
+        """颜色方式能正常产出 docx，且蓝/红/删除线三色齐备"""
+        from app.services.mail_forwarder import _generate_revision_docx
+        out = _generate_revision_docx(
+            revision_text="第一条 价款。【新增】补充条款。【/新增】"
+                          "【修改】改为十日。【/修改】【删除】旧条款【/删除】",
+            doc_type="合同协议",
+            original_subject="测试主题",
+            use_highlight=True,
+        )
+        assert out and os.path.exists(out)
+
+        from docx import Document
+        doc = Document(out)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "补充条款" in text
+        assert "改为十日" in text
+        assert "旧条款" in text
+        # 标记文字本身不得出现在正文里
+        assert "【新增】" not in text and "【/新增】" not in text
+
+        # 颜色与删除线断言
+        colors = set()
+        struck = False
+        for p in doc.paragraphs:
+            for r in p.runs:
+                if r.font.color and r.font.color.rgb:
+                    colors.add(str(r.font.color.rgb))
+                if r.font.strike:
+                    struck = True
+        assert "0046C8" in colors, f"缺少蓝色新增标注: {colors}"
+        assert "C80000" in colors, f"缺少红色修改标注: {colors}"
+        assert struck, "缺少删除线标注"
+
+    def test_plain_mode_keeps_markers(self):
+        """use_highlight=False 时原样输出（含标记文本），不加颜色"""
+        from app.services.mail_forwarder import _generate_revision_docx
+        out = _generate_revision_docx(
+            revision_text="第一条 价款。【新增】补充。【/新增】",
+            doc_type="合同协议",
+            original_subject="测试主题",
+            use_highlight=False,
+        )
+        assert out and os.path.exists(out)
+        from docx import Document
+        doc = Document(out)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "【新增】" in text
+
+    def test_color_path_does_not_use_native_marks(self):
+        """颜色方式产物中不得含原生修订标记（两条路径互斥）"""
+        import zipfile as _zip
+        from app.services.mail_forwarder import _generate_revision_docx
+        out = _generate_revision_docx(
+            revision_text="第一条 价款。【新增】补充。【/新增】",
+            doc_type="合同协议",
+            original_subject="测试主题",
+            use_highlight=True,
+        )
+        with _zip.ZipFile(out) as z:
+            xml = z.read("word/document.xml").decode("utf-8")
+        assert "<w:ins" not in xml
+        assert "<w:del" not in xml
 
 
 class TestDedupeSmtpCfgs:

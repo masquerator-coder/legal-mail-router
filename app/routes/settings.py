@@ -69,6 +69,7 @@ SETTING_DEFAULTS = {
     "llm_max_retries": "3",      # LLM 分析最大重试次数
     "analysis_output_mode": "content",  # AI解读输出模式: content=邮件正文, attachment=Word附件（权威默认值，scheduler.py / logs.py / mail_forwarder.py 兜底需与此一致）
     "revision_enabled": "false",        # 是否生成修改版文书
+    "revision_native": "true",          # 用 Word 原生修订（w:ins/w:del）注入原文书底版；false=退回颜色标记方式
     "revision_highlight": "true",       # 色彩标注改动（蓝色新增/红色修改/删除线建议删除）
     "context_window_tokens": "0",       # 上下文窗口大小(0=自动探测)
     "review_template_enabled": "false", # 启用审查意见模板
@@ -161,6 +162,7 @@ async def save_settings(
     llm_max_retries: int = Form(3),
     analysis_output_mode: str = Form("content"),
     revision_enabled: str = Form("false"),
+    revision_native: str = Form("true"),
     revision_highlight: str = Form("true"),
     context_window_tokens: str = Form("0"),
     review_template_enabled: str = Form("false"),
@@ -209,6 +211,7 @@ async def save_settings(
     _save_setting(db, "llm_max_retries", str(llm_max_retries))
     _save_setting(db, "analysis_output_mode", analysis_output_mode)
     _save_setting(db, "revision_enabled", "true" if revision_enabled.lower() in ("true", "on", "1") else "false")
+    _save_setting(db, "revision_native", "true" if revision_native.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "revision_highlight", "true" if revision_highlight.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "context_window_tokens", context_window_tokens.strip())
     _save_setting(db, "review_template_enabled", "true" if review_template_enabled.lower() in ("true", "on", "1") else "false")
