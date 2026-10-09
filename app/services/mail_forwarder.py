@@ -784,28 +784,32 @@ def _generate_revision_docx(revision_text: str, doc_type: str,
     return tmp.name
 
 
-def _extract_doc_title(filenames: list[str] | None) -> str | None:
-    """从附件文件名中提取文书标题，如 'XX项目-咨询合同.doc' → 'XX项目-咨询合同'"""
-    if not filenames:
+# ════════════════════════════════════════════
+# 审查意见模板：按文书类型名约定式查找
+# ════════════════════════════════════════════
+# 模板文件名与文书类型名**逐字一致**：templates/<文书类型>审核意见模板.docx
+# （如「合同协议」→ templates/合同协议审核意见模板.docx）。
+# 无对应模板文件的类型不生成审查意见，只出分析报告。
+_REVIEW_TEMPLATE_DIR = "templates"
+_REVIEW_TEMPLATE_SUFFIX = "审核意见模板.docx"
+
+# 占位符缺值时的填充文本
+_MISSING_VALUE = "（待确认）"
+
+
+def _review_template_path(doc_type: str | None) -> Optional[Path]:
+    """按文书类型名解析模板路径；无对应模板文件时返回 None。
+
+    约定：templates/<文书类型>审核意见模板.docx。不设别名表——
+    文件名与类型名不一致即视为该类型未配备模板（记 WARNING，跳过生成）。
+    """
+    from app.config import BASE_DIR
+
+    name = (doc_type or "").strip()
+    if not name:
         return None
-    for fn in filenames:
-        if not fn:
-            continue
-        # 去掉扩展名
-        name = fn.rsplit(".", 1)[0] if "." in fn else fn
-        # 跳过太短或无意义的名字
-        if len(name) < 4:
-            continue
-        # 跳过常见非文书名
-        skip_words = ["unnamed", "attachment", "附件", "image", "未命名"]
-        if any(kw in name.lower() for kw in skip_words):
-            continue
-        return name
-    # 所有文件名都不合适，返回第一个去掉扩展名的
-    for fn in filenames:
-        if fn:
-            return fn.rsplit(".", 1)[0] if "." in fn else fn
-    return None
+    p = BASE_DIR / _REVIEW_TEMPLATE_DIR / f"{name}{_REVIEW_TEMPLATE_SUFFIX}"
+    return p if p.exists() else None
 
 
 def _fill_review_template(template_path: str, analysis: dict,
@@ -813,16 +817,19 @@ def _fill_review_template(template_path: str, analysis: dict,
                           body_text: str = "",
                           attachment_filenames: list[str] = None) -> Optional[str]:
     """
-    使用审核意见模板 DOCX，替换其中的 xxx 占位符生成审核意见。
+    使用审核意见模板 DOCX，替换其中的**命名占位符**生成审核意见。
 
     **以模板为主**：模板的抬头、措辞、落款格式与页眉图章全部原样保留，
-    只做占位符填充，不插入任何 LLM 生成的正文：
+    只做占位符填充，不插入任何 LLM 生成的正文。实质分析结论仍由
+    邮件正文/AI分析报告承载，不写入本意见书。
 
-    - P1 中所有 xxx → 实际信息
-    - 末段日期 → 当前日期
+    占位符（按名称替换，与所在段落、出现次序无关）：
+    - 【收到邮件日期】/ `xxxx年x月x日` → 生成当天日期
+    - 其余【…】占位符 → 由 `analysis` 中的同义字段填充（见 `_placeholder_values`）
+    - 末段日期 → 生成当天日期
 
-    其余内容（含标题抬头）保持模板原文不动。
-    实质分析结论仍由邮件正文/AI分析报告承载，不写入本意见书。
+    三份模板的段落布局不同（信访件在 P1、政府信息公开在 P2），故填充
+    **不依赖段落序号**，仅按占位符名称定位。
     """
     try:
         from docx import Document
@@ -830,7 +837,6 @@ def _fill_review_template(template_path: str, analysis: dict,
         logger.warning("python-docx 未安装，无法生成审核意见 docx")
         return None
 
-    from datetime import datetime
     from pathlib import Path
 
     tp = Path(template_path)
@@ -839,148 +845,169 @@ def _fill_review_template(template_path: str, analysis: dict,
         return None
 
     doc = Document(str(tp))
+    values = _placeholder_values(analysis, original_subject, sender, body_text)
 
-    # ── 从分析结果中提取占位符填充值 ──
-    involved = analysis.get("involved_parties", "") or ""
-    parties = [p.strip() for p in involved.split(",") if p.strip()]
-    party_a = parties[0] if len(parties) >= 1 else "（待确认）"
-    party_b = parties[1] if len(parties) >= 2 else "（待确认）"
-    case_summary = analysis.get("case_summary", "") or "（待确认）"
-    # 从摘要中剥离金额表述，避免与模板自带的"合同价款xxx元"重复
-    case_summary_clean = _strip_amount_phrases(case_summary)
+    # ── 正文：按名称替换【…】占位符与 xxxx年x月x日 ──
+    filled = set()
+    for para in doc.paragraphs:
+        filled |= _fill_placeholders_in_paragraph(para, values)
 
-    # 从附件文件名提取文书标题，兜底用邮件主题
-    contract_name = _extract_doc_title(attachment_filenames) or original_subject or "（待确认）"
+    # ── 落款日期：按日期样式定位（不依赖段序）──
+    _fill_signature_date(doc, values["收到邮件日期"])
 
-    # 尝试从正文/摘要中提取金额
-    amount = _extract_amount(body_text or case_summary)
-
-    # ── 解析发件人：提取名称，兜底用邮箱 ──
-    import re
-    sender_email_match = re.search(r'<([^>]+)>', sender)
-    if sender_email_match:
-        sender_name = sender[:sender_email_match.start()].strip().strip('"').strip("'").strip()
-        sender_email = sender_email_match.group(1).strip()
-    else:
-        sender_name = ""
-        sender_email = sender.strip()
-    sender_display = sender_name or sender_email
-
-    # ── P1: 替换 xxx ──
-    if len(doc.paragraphs) > 1:
-        p1 = doc.paragraphs[1]
-        now = datetime.now()
-        replacements = [
-            (str(now.year),),           # 第1个xxx → 年份
-            (str(now.month),),           # 第2个xxx → 月份
-            (sender_display,),           # 第3个xxx → 发来方名称
-            (party_b,),                  # 第4个xxx → 拟与...签订方
-            (contract_name,),            # 第5个xxx → 合同名称
-            (case_summary_clean,),       # 第6个xxx → 合同内容（已剥离金额）
-            (amount,),                   # 第7个xxx → 价款
-        ]
-        _replace_xxx_in_paragraph(p1, replacements)
-
-    # ── 模板自带的律所措辞与抬头，保持不动 ──
-
-    # ── 落款日期：替换模板的示例日期 ──
-    if doc.paragraphs:
-        p_date = datetime.now().strftime("%Y年%m月%d日")
-        _replace_paragraph_text(doc.paragraphs[-1], p_date)
+    # 占位符残留检查：模板与填充值不匹配时留痕，避免静默生成半成品
+    leftover = _find_leftover_placeholders(doc)
+    if leftover:
+        logger.warning(
+            f"审核意见模板 {tp.name} 存在未填充占位符: {sorted(leftover)}"
+        )
 
     # 写入临时文件
     tmp = tempfile.NamedTemporaryFile(
         suffix=".docx", prefix="审核意见_", delete=False
     )
     doc.save(tmp.name)
-    logger.info(f"审核意见已生成: {tmp.name} (模板: {tp.name})")
+    logger.info(
+        f"审核意见已生成: {tmp.name} (模板: {tp.name}, 填充 {len(filled)} 个占位符)"
+    )
     return tmp.name
 
 
-def _extract_amount(text: str) -> str:
-    """从文本中提取金额，返回**纯数值串**（去掉货币符号与末尾「元」）或默认值。
+def _placeholder_values(analysis: dict, original_subject: str = "",
+                        sender: str = "", body_text: str = "") -> dict:
+    """构建占位符名 → 填充值 的映射（缺失值统一为「（待确认）」）。
 
-    模板自带「合同价款xxx元」的「元」字，故返回值不再带单位；
-    `￥`/`¥`/`人民币` 等前缀同样由模板承担，不重复带入。
-    注意字符类里**不能**包含 `,` 与 `.` 以外的贪婪写法：也不要写成
-    `\\d+[\\d,.]*`——那会在 `人民币12000元` 上从第二个数字起匹配，
-    把「人民币」留成残渣。
+    取值全部来自 LLM 对**送审文书正文**的分析字段，**不使用邮件标题**，
+    也不使用附件文件名——这两者常与文书正文标题/当事人不一致。
+    """
+    a = analysis or {}
+
+    def pick(*keys) -> str:
+        for k in keys:
+            v = a.get(k)
+            if v is None:
+                continue
+            s = str(v).strip()
+            # 模型未提取到时可能返回这些字面量，一律视为缺失
+            if s and s.lower() not in ("null", "none", "无", "未知"):
+                return s
+        return _MISSING_VALUE
+
+    today = datetime.now()
+    date_str = today.strftime("%Y年%m月%d日")
+
+    return {
+        "收到邮件日期": date_str,
+        "合同甲方": pick("contract_party_a"),
+        "合同相对方": pick("contract_party_b"),
+        "合同正文名称": pick("contract_name"),
+        "合同内容": pick("contract_content"),
+        "合同价款": pick("contract_amount", "contract_price"),
+        "行政机关": pick("agency_name"),
+        "被申请人": pick("agency_name"),
+        "申请文件名称及文号": pick("document_title_no"),
+    }
+
+
+def _fill_placeholders_in_paragraph(paragraph, values: dict) -> set:
+    """在单个段落内按名称替换所有占位符，返回本次实际填充的占位符名集合。
+
+    模板把文字拆成多个 run（字体/修订标记所致），故先合并出整段文本，
+    再一次性写回**首个 run**（沿用仓库既有的「首 run 承载全文」手法），
+    以保留原字体与段落格式。
     """
     import re
-    # 匹配模式：XXX万元 / XXX元 / 人民币XXX元 / ￥XXX 等
-    patterns = [
-        r'(?:人民币\s*)?\d[\d,]*\.?\d*\s*万?\s*元',
-        r'[¥￥]\s*\d[\d,]*\.?\d*\s*万?',
-    ]
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            val = m.group(0).strip()
-            val = re.sub(r'^人民币\s*', '', val)                # 去掉「人民币」前缀
-            val = re.sub(r'^[¥￥]\s*', '', val)                 # 去掉货币符号
-            val = re.sub(r'\s*万\s*$', '万', val.strip())       # 归一化「30 万」→「30万」
-            if val.endswith("元"):                              # 模板自带「元」，避免重复
-                val = val[:-1]
-            val = val.strip()
-            if val:
-                return val
-    return "（待确认）"
 
-
-def _strip_amount_phrases(text: str) -> str:
-    """从文本中剥离金额相关表述，避免与模板自带的价款字段重复"""
-    import re
-    # 匹配模式：金额表述 + 可选的前后标点/空格
-    patterns = [
-        r'，?\s*合同总?金额[约共]?(人民币\s*)?(\d[\d,]*\.?\d*\s*万?\s*元)[。，]?\s*',  # "，合同总金额30万元。"
-        r'，?\s*总?金额[约共]?(人民币\s*)?(\d[\d,]*\.?\d*\s*万?\s*元)[。，]?\s*',     # "，总金额30万元。"
-        r'，?\s*价款[约共]?(人民币\s*)?(\d[\d,]*\.?\d*\s*万?\s*元)[。，]?\s*',         # "，价款30万元。"
-        r'，?\s*(¥|￥)\s*(\d[\d,]*\.?\d*\s*万?)[。，]?\s*',                           # "，¥30万。"
-    ]
-    result = text
-    for pat in patterns:
-        result = re.sub(pat, '', result)
-    return result.strip().rstrip('，。').strip()
-
-
-def _replace_xxx_in_paragraph(paragraph, replacements: list[tuple]):
-    """
-    按顺序替换段落中的 xxx 占位符。
-
-    replacements: [(val1, fallback1), (val2,), ...]
-    每个xxx依次被对应值替换；None/空值使用fallback或"（待确认）"。
-    """
     if not paragraph.runs:
-        return
+        return set()
 
-    # 收集所有 run 的文本，构建完整段落文本
-    full_text = paragraph.text
-    for repl in replacements:
-        if isinstance(repl, tuple):
-            val = repl[0] or ""
-            if not val and len(repl) > 1:
-                val = repl[1] or ""
-        else:
-            val = str(repl) if repl else ""
-        if not val:
-            val = "（待确认）"
-        # 替换第一个 xxx
-        full_text = full_text.replace("xxx", str(val), 1)
+    text = paragraph.text
+    if not text:
+        return set()
 
-    # 写回段落：保留第一个 run 格式，设置全部文本
-    if paragraph.runs:
-        for run in paragraph.runs[1:]:
-            run.text = ""
-        paragraph.runs[0].text = full_text
+    filled = set()
 
+    # 1) 命名占位符：【xxx】
+    def _sub(m):
+        name = m.group(1)
+        val = values.get(name)
+        if val is None:
+            return m.group(0)          # 未知占位符原样保留，由残留检查报告
+        filled.add(name)
+        return val
 
-def _replace_paragraph_text(paragraph, new_text: str):
-    """替换段落的文本内容，保留第一个 run 的格式"""
-    if not paragraph.runs:
-        # 无 runs → 直接设 text 可能丢格式，追加一个 run
-        paragraph.add_run(new_text)
-        return
-    # 清空所有 run 的文本，仅保留第一个 run 并设置新文本
+    text = re.sub(r"【([^】]{1,30})】", _sub, text)
+
+    # 2) 日期占位符：xxxx年x月x日 / xxx年xxx月（兼容旧写法）
+    if re.search(r"x{2,}年x{1,2}月x{1,2}日", text):
+        text = re.sub(r"x{2,}年x{1,2}月x{1,2}日", values["收到邮件日期"], text)
+        filled.add("收到邮件日期")
+    elif re.search(r"x{2,}年x{2,}月", text):
+        text = re.sub(r"x{2,}年x{2,}月", values["收到邮件日期"], text)
+        filled.add("收到邮件日期")
+
+    if not filled:
+        return set()
+
     for run in paragraph.runs[1:]:
         run.text = ""
-    paragraph.runs[0].text = new_text
+    paragraph.runs[0].text = text
+    return filled
+
+
+def _fill_signature_date(doc, date_str: str):
+    """写入落款日期：按**段落形态**定位，不依赖固定段序。
+
+    定位顺序（只认「空段」或「纯日期段」，绝不改写正文）：
+    1. 正文中已含日期文字的段落（旧模板的 `2023年1月16日`）；
+    2. 文档**尾部**的空段落——优先右对齐（落款惯例），否则取最后一个空段。
+
+    三份模板的落款位形态不一（合同协议有右对齐空段、信访件全是普通空段），
+    故不能用 alignment 是否为 None 来筛（该属性常为继承值）。
+    找不到可用段落时跳过并记日志，**不误伤正文**。
+    """
+    import re
+
+    date_re = re.compile(r"^\s*\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*$")
+
+    def _write(p) -> None:
+        for run in p.runs[1:]:
+            run.text = ""
+        if p.runs:
+            p.runs[0].text = date_str
+        else:
+            p.add_run(date_str)
+
+    paras = list(doc.paragraphs)
+
+    # 1) 已含「纯日期」文字的段落
+    for p in paras:
+        if date_re.match(p.text or ""):
+            _write(p)
+            return True
+
+    # 2) 尾部空段落：先找右对齐的，再退化为最后一个空段
+    blanks = [p for p in paras if not (p.text or "").strip()]
+    right_blanks = [p for p in blanks if p.alignment is not None and str(p.alignment).startswith("RIGHT")]
+    target = right_blanks[-1] if right_blanks else (blanks[-1] if blanks else None)
+    if target is not None:
+        _write(target)
+        return True
+
+    logger.warning("审核意见模板未找到落款日期段落，已跳过日期填充")
+    return False
+
+
+def _find_leftover_placeholders(doc) -> set:
+    """扫描生成结果中残留的占位符（【…】或 `xxx`），用于填充异常留痕。"""
+    import re
+
+    leftover = set()
+    for p in doc.paragraphs:
+        t = p.text or ""
+        leftover |= set(re.findall(r"【([^】]{1,30})】", t))
+        if re.search(r"x{2,}年x{1,2}月", t):
+            leftover.add("xxxx年x月x日")
+        if "xxx" in t:
+            leftover.add("xxx")
+    return leftover

@@ -286,37 +286,24 @@
                     <span style="margin-left:6px;font-size:14px;">用 DOCX 模板生成审核意见</span>
                 </div>
                 <div class="form-hint">
-                    启用后，系统将使用指定的 DOCX 模板替换 xxx 占位符，
-                    生成「审核意见.docx」作为附件转发。
+                    启用后，系统按**文书类型名**自动查找模板
+                    <code>templates/&lt;文书类型&gt;审核意见模板.docx</code>，
+                    替换其中的【】占位符生成「审查意见.docx」作为附件转发。
+                    未配备模板的文书类型（如起诉状、律师函）不生成审查意见，仅出分析报告。
                 </div>
             </div>
 
             <div id="review-template-path-group" style="margin-top:16px;display:none;">
-                <label for="review_template_path">合同类文书模板路径</label>
-                <input type="text" id="review_template_path" name="review_template_path"
-                       value="{{ settings.review_template_path }}"
-                       class="form-control" style="width:480px;"
-                       placeholder="templates/合同审核意见模板.docx">
                 <div class="form-hint">
-                    相对于项目根目录的路径。适用于在「分析提示词」目录下该类型的 .md 文件头部声明了 <code>caps: 合同</code> 的文书类型。
-                    模板需为 .docx 格式，其中的 xxx 将被替换为实际信息。
-                    模板示例：<br>
-                    P1: "...收到<b>xxx</b>发来的拟与<b>xxx</b>签订的《<b>xxx</b>》。合同内容为<b>xxx</b>事宜。合同价款<b>xxx</b>元。"<br>
-                    P6: 日期自动替换为当前日期
-                </div>
-            </div>
-
-            <div id="review-template-civil-path-group" style="margin-top:16px;display:none;">
-                <label for="review_template_path_civil">其他文书模板路径（律师审查意见）</label>
-                <input type="text" id="review_template_path_civil" name="review_template_path_civil"
-                       value="{{ settings.review_template_path_civil }}"
-                       class="form-control" style="width:480px;"
-                       placeholder="templates/律师审核意见模板.docx">
-                <div class="form-hint">
-                    适用于在「分析提示词」目录下该类型的 .md 文件头部声明了 <code>caps: 审查</code>、
-                    但未声明 <code>合同</code> 的文书类型
-                    （起诉状、律师函、政府信息公开、信访件等）。
-                    模板文件不存在时该类型跳过生成并记录日志，不影响其他类型。
+                    <b>模板命名约定</b>：模板文件名必须与「分析提示词」目录下的文书类型名<b>逐字一致</b>，
+                    即 <code>templates/&lt;文书类型&gt;审核意见模板.docx</code>。<br>
+                    当前已配备模板的类型：<br>
+                    　合同协议 → <code>templates/合同协议审核意见模板.docx</code><br>
+                    　信访件 → <code>templates/信访件审核意见模板.docx</code><br>
+                    　政府信息公开 → <code>templates/政府信息公开审核意见模板.docx</code><br>
+                    模板中的 <code>【占位符】</code> 与 <code>xxxx年x月x日</code> 会被替换为实际信息，
+                    具体取值来自文书正文（不取邮件标题）；正文中未记载的字段显示为「（待确认）」。
+                    新增文书类型时，只需把同名的 <code>.docx</code> 放入 <code>templates/</code> 目录即可，无需改配置。
                 </div>
             </div>
         </div>
@@ -620,8 +607,6 @@ document.addEventListener('DOMContentLoaded', function() {
 function toggleReviewTemplateFields(enabled) {
     var group = document.getElementById('review-template-path-group');
     if (group) group.style.display = enabled ? '' : 'none';
-    var civilGroup = document.getElementById('review-template-civil-path-group');
-    if (civilGroup) civilGroup.style.display = enabled ? '' : 'none';
 }
 
 // ── MCP 工具 ──

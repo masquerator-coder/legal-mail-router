@@ -1021,6 +1021,14 @@ async def analyze_email_two_stage(
             "confidence": classifier_confidence,
             "revised_document": None,
             "classify_failed": classify_failed,
+            # 审查意见模板填充字段（非法律文书不出具审查意见，留空）
+            "contract_party_a": "",
+            "contract_party_b": "",
+            "contract_name": "",
+            "contract_content": "",
+            "contract_amount": "",
+            "agency_name": "",
+            "document_title_no": "",
         }
 
     # ── 第二阶段：按类型完整分析 ──
@@ -1131,6 +1139,14 @@ def _validate_llm_output(result: dict) -> dict:
         "involved_parties": str(result.get("involved_parties", "") or ""),
         "confidence": confidence,
         "revised_document": str(result.get("revised_document")) if result.get("revised_document") else None,
+        # 审查意见模板填充字段：均取自**送审文书正文**，不取邮件标题/附件文件名
+        "contract_party_a": str(result.get("contract_party_a", "") or ""),
+        "contract_party_b": str(result.get("contract_party_b", "") or ""),
+        "contract_name": str(result.get("contract_name", "") or ""),
+        "contract_content": str(result.get("contract_content", "") or ""),
+        "contract_amount": str(result.get("contract_amount", "") or ""),
+        "agency_name": str(result.get("agency_name", "") or ""),
+        "document_title_no": str(result.get("document_title_no", "") or ""),
     }
 
 
@@ -1138,6 +1154,9 @@ _LLM_ANALYSIS_SCHEMA = frozenset({
     "doc_type", "case_summary", "ai_interpretation", "urgency",
     "key_date", "case_number", "involved_parties", "confidence",
     "revised_document",
+    "contract_party_a", "contract_party_b", "contract_name",
+    "contract_content", "contract_amount", "agency_name",
+    "document_title_no",
 })
 
 
@@ -1158,6 +1177,14 @@ def _fallback_analysis(reason: str = "") -> dict:
         "involved_parties": "",
         "confidence": 0.5,  # 非 0.0，避免被垃圾邮件过滤器误杀
         "revised_document": None,
+        # 审查意见模板填充字段（兜底为空，填充时统一显示「（待确认）」）
+        "contract_party_a": "",
+        "contract_party_b": "",
+        "contract_name": "",
+        "contract_content": "",
+        "contract_amount": "",
+        "agency_name": "",
+        "document_title_no": "",
     }
 
 

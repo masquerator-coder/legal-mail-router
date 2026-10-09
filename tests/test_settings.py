@@ -25,11 +25,20 @@ class TestSettingsDefaults:
             "log_retention_days", "llm_retry_interval", "llm_max_retries",
             "analysis_output_mode", "revision_enabled",
             "revision_native", "revision_highlight", "context_window_tokens",
-            "review_template_enabled", "review_template_path",
+            "review_template_enabled",
             "admin_email", "daily_report_enabled", "daily_report_time",
         ]
         for key in required:
             assert key in defaults, f"Missing key: {key}"
+
+    def test_no_review_template_path_keys(self, defaults):
+        """模板改为按文书类型名约定式查找，不应再有模板路径配置项。
+
+        回归：残留的路径配置会让界面显示无效输入框，并让「模板从哪来」
+        出现两个相互矛盾的事实来源。
+        """
+        for key in ("review_template_path", "review_template_path_civil"):
+            assert key not in defaults, f"应已移除的模板路径配置: {key}"
 
     def test_port_default_is_8020(self, defaults):
         assert defaults["system_port"] == "8020"

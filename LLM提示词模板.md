@@ -46,8 +46,20 @@
   "case_number": "案号或null",
   "involved_parties": "涉及方名称（逗号分隔）",
   "confidence": 0.0-1.0之间的置信度,
-  "revised_document": "{revision_field_desc}"
+  "revised_document": "{revision_field_desc}",
+  "contract_party_a": "合同甲方全称（非合同类填null）",
+  "contract_party_b": "合同相对方（乙方）全称（非合同类填null）",
+  "contract_name": "合同正文标题（非合同类填null）",
+  "contract_content": "合同标的与主要内容，一句话（非合同类填null）",
+  "contract_amount": "合同价款金额，仅数值不含「元」与货币符号，如 1,041,748（非合同类或无金额填null）",
+  "agency_name": "作出或与案涉具体行政行为的行政机关全称（合同类填null）",
+  "document_title_no": "送审文书的标题及发文字号，如《关于XX的申请书》（津X信〔2026〕12号）（无文号则只写标题；非行政类填null）"
 }
+
+关于审查意见模板字段（contract_*／agency_name／document_title_no）的说明：
+- **必须取自送审文书正文**，不得用邮件标题或附件文件名代替；正文中确实没有的填 `null`，**不要猜测或编造**。
+- 合同类文书的甲乙方以合同**正文首部「甲方／乙方」栏**记载的全称为准，不要按发件人或邮件落款推断。
+- 非合同类文书的 contract_* 一律填 `null`；合同类文书的 agency_name／document_title_no 填 `null`。
 
 关于 revised_document 的说明：
 - 该字段是否必须生成，**由 文书类型.conf 中该类型的 #修订 标记决定**（见上方「步骤三」）。

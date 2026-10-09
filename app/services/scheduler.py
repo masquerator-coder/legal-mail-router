@@ -229,8 +229,6 @@ def _load_context(account_id: int) -> dict | None:
             "revision_highlight": _read_setting("revision_highlight", "true") == "true",
             "context_window_tokens": _read_setting("context_window_tokens", "0"),
             "review_template_enabled": _read_setting("review_template_enabled", "false") == "true",
-            "review_template_path": _read_setting("review_template_path", "templates/合同审核意见模板.docx"),
-            "review_template_path_civil": _read_setting("review_template_path_civil", "templates/律师审核意见模板.docx"),
             "llm_timeout": int(_read_setting("llm_timeout", "180")),
             # ── 多附件分组分析 ──
             "attachment_grouping": _read_setting("attachment_grouping", "false") == "true",
@@ -779,24 +777,25 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
 
         # 审查意见模板生成（逐组）
         # 是否出具由提示词文件头部的 caps: 审查 决定；
-        # 模板按 #合同 标记分派：合同类用「合同审核意见模板」，其余用「律师审查意见模板」。
-        from app.services.llm_analyzer import should_generate_review, is_contract_type
+        # 模板按**文书类型名约定式查找**：templates/<文书类型>审核意见模板.docx，
+        # 未配备模板的类型跳过生成（记 WARNING），不影响其他类型。
+        from app.services.llm_analyzer import should_generate_review
         if (ctx.get("review_template_enabled")
                 and not g_failed
                 and g_analysis
                 and should_generate_review(g_analysis.get("doc_type"))):
             try:
-                from app.services.mail_forwarder import _fill_review_template
-                from app.config import BASE_DIR
+                from app.services.mail_forwarder import (
+                    _fill_review_template, _review_template_path,
+                )
 
-                _is_contract = is_contract_type(g_analysis.get("doc_type"))
-                _cfg_key = "review_template_path" if _is_contract else "review_template_path_civil"
-                _rel_path = ctx.get(_cfg_key) or ctx.get("review_template_path")
-                template_full_path = BASE_DIR / _rel_path
-                if not template_full_path.exists():
+                _doc_type = g_analysis.get("doc_type")
+                template_full_path = _review_template_path(_doc_type)
+                if not template_full_path:
                     logger.warning(
-                        f"{'合同' if _is_contract else '律师'}审查意见模板不存在，跳过生成"
-                        f"({group_label}): {_rel_path}"
+                        f"文书类型「{_doc_type}」未配备审查意见模板"
+                        f"(templates/{_doc_type}审核意见模板.docx)，跳过生成"
+                        f"({group_label})"
                     )
                 else:
                     _update_progress(step="analyzing", step_label=f"正在生成审查意见({group_label})...")

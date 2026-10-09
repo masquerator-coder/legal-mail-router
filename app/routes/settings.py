@@ -73,8 +73,7 @@ SETTING_DEFAULTS = {
     "revision_highlight": "true",       # 色彩标注改动（蓝色新增/红色修改/删除线建议删除）
     "context_window_tokens": "0",       # 上下文窗口大小(0=自动探测)
     "review_template_enabled": "false", # 启用审查意见模板
-    "review_template_path": "templates/合同审核意见模板.docx",  # 合同类文书模板路径
-    "review_template_path_civil": "templates/律师审核意见模板.docx",  # 非合同文书模板路径
+    # 模板按文书类型名约定式查找：templates/<文书类型>审核意见模板.docx（无后台配置项）
     "admin_email": "",              # 日报接收邮箱（空=不发送）
     "daily_report_enabled": "true", # 日报开关
     "daily_report_time": "09:00",   # 日报发送时间 (HH:MM, 24小时制)
@@ -166,8 +165,6 @@ async def save_settings(
     revision_highlight: str = Form("true"),
     context_window_tokens: str = Form("0"),
     review_template_enabled: str = Form("false"),
-    review_template_path: str = Form(""),
-    review_template_path_civil: str = Form(""),
     admin_email: str = Form(""),
     daily_report_enabled: str = Form("true"),
     daily_report_time: str = Form("09:00"),
@@ -215,8 +212,6 @@ async def save_settings(
     _save_setting(db, "revision_highlight", "true" if revision_highlight.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "context_window_tokens", context_window_tokens.strip())
     _save_setting(db, "review_template_enabled", "true" if review_template_enabled.lower() in ("true", "on", "1") else "false")
-    _save_setting(db, "review_template_path", review_template_path.strip())
-    _save_setting(db, "review_template_path_civil", review_template_path_civil.strip())
     _save_setting(db, "admin_email", admin_email.strip())
     _save_setting(db, "daily_report_enabled", "true" if daily_report_enabled.lower() in ("true", "on", "1") else "false")
     _save_setting(db, "daily_report_time", daily_report_time.strip())
