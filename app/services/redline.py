@@ -13,6 +13,17 @@ OWORD 修订结构铁律（来自 docx skill，违反会导致 Word 显示 0 处
 2. 整段替换 run，绝不做字符区间切分 —— 否则标记会落进文本节点内部。
 3. 锚点必须落在单个 run 内；跨 run 拼接会把不同位置的 run 搅乱成乱码。
 另外必须在 word/settings.xml 写入 <w:trackChanges/>，否则标记只当普通格式显示。
+
+段落结构铁律（违反会导致「格式混乱、修订看不清」）：
+4. **新增内容必须用真实 <w:p> 分段，不得用 <w:br/> 软换行。**
+   软换行不产生新段落，段落级格式（居中/缩进/间距/编号）会作用于整块，
+   版式与原文不符，修订标记也连成一大片无法逐项辨认。
+   `_set_run_text` 的换行分支只服务于「删除原文本来就有的软换行」。
+5. **标记块内的单个换行要按行文形态判断是否拆段**（见 `_split_target_paragraphs`）。
+   LLM 用单个换行分隔段落是常态；若一律当成软换行，目标段数与原文段数对不上，
+   段落级对齐只能退化为「整段删除 + 整段新增」，表现为封面被整块划掉后又重复插入。
+6. **段落对齐失败必须有兜底**（见 `_deleted_ratio` 与 `_MAX_DELETED_RATIO`）：
+   宁可放弃生成修订版，也不产出整篇带删除线的文书。
 """
 import copy
 import logging
@@ -190,6 +201,12 @@ def _set_run_text(run, text: str, as_del_text: bool = False, tabs: int = 0, brs:
 
     tabs / brs 为该 run 中 <w:tab/> 与 <w:br/> 的数量：它们不是文本节点，
     删除整段时若不补回，段落标记删除后残留的制表位/换行会串到合并后的相邻段落。
+
+    ⚠️ 文本中的 ``\\n`` 一律渲染为 <w:br/>（段内软换行）。**新增内容不得走
+    这条路径** —— 新增段落必须用真实 <w:p> 分段（见 `_make_paragraphs_like`），
+    否则软换行不产生新段落，段落级 pPr（居中/缩进/间距/编号）会作用于整块，
+    版式与原文不一致，且修订标记会连成一大片无法逐项辨认。
+    本函数的换行分支只服务于「删除原文中本来就存在的软换行」。
     """
     from lxml import etree
     # 清掉可能已存在的文本节点
@@ -346,6 +363,18 @@ def build_redlined_docx(original_path: str, revised_text: str,
 
         logger.info(f"原生修订：应用 {applied} 处改动")
 
+        # ── 兜底自检：修订比例异常时放弃，避免产出「整篇被划掉」的文书 ──
+        # 段落对齐一旦失败，会把大量原文判成删除 + 新增，生成的文书在 Word 里
+        # 几乎全文带删除线，既无法审阅也比不发更糟。此处检测删除字符占比，
+        # 超阈值即判定生成失败（调用方回退为普通副本 / 纯文本重建）。
+        deleted_chars, ratio = _deleted_ratio(body)
+        if deleted_chars >= _MIN_DELETED_CHARS and ratio > _MAX_DELETED_RATIO:
+            logger.error(
+                f"修订比例异常（删除 {deleted_chars} 字，占比 {ratio:.0%} > "
+                f"{_MAX_DELETED_RATIO:.0%}），判定段落对齐失败，放弃生成修订版"
+            )
+            return None
+
         tree.write(doc_xml, xml_declaration=True, encoding="UTF-8", standalone=True)
 
         # ── 开启修订模式 ──
@@ -367,6 +396,36 @@ def build_redlined_docx(original_path: str, revised_text: str,
         shutil.rmtree(work, ignore_errors=True)
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# 删除字符占比超过该阈值即判定段落对齐失败，放弃生成修订版。
+# 正常文书即便大幅改写，删除占比也远低于此；只有对齐彻底失败
+# （整篇被判成删除 + 新增）时才会逼近 1.0。
+#
+# 同时要求**绝对删除量**超过 `_MIN_DELETED_CHARS` 才触发：
+# 短文书（几百字的测试样例、便签式协议）里「改掉大半内容」是正常需求，
+# 仅凭比例会把合法的大幅修订误判为对齐失败。
+_MAX_DELETED_RATIO = 0.60
+_MIN_DELETED_CHARS = 800
+
+
+def _deleted_ratio(body) -> tuple:
+    """统计 <w:del> 覆盖的字符数，返回 (删除字符数, 删除占比)。
+
+    占比的分母为「原文可见字符总量」= 仍在正文中的字符 + 被删除的字符。
+    返回 (0, 0.0) 表示全文无文字，调用方应跳过自检。
+    """
+    deleted = 0
+    kept = 0
+    for node in body.iter():
+        if node.tag == _qn("w:delText"):
+            deleted += len(node.text or "")
+        elif node.tag == _qn("w:t"):
+            kept += len(node.text or "")
+    total = deleted + kept
+    if total <= 0:
+        return (0, 0.0)
+    return (deleted, deleted / total)
 
 
 def _enable_track_changes(work_dir: str):
@@ -472,8 +531,8 @@ def _apply_segments_to_body(body, segments, author, date_str, rev_ids) -> int:
     if not entries:
         return 0
 
-    # 构造目标段落序列：按行拆分，但保留行内换行的语义
-    # （标记块内若含空行，视为段落分隔；单换行视为段内软换行）
+    # 构造目标段落序列：空行必定拆段；单换行则按行文形态判断
+    # （见 `_split_target_paragraphs` / `_looks_like_standalone_paragraph`）
     target = []
     for kind, content in segments:
         for raw in _split_target_paragraphs(content):
@@ -488,19 +547,109 @@ def _apply_segments_to_body(body, segments, author, date_str, rev_ids) -> int:
     return _diff_apply(entries, orig_texts, target, author, date_str, rev_ids)
 
 
+# 行首形态：命中则视为「独立段落」，单个换行也要拆段。
+# 背景：LLM 输出的标记块里，换行绝大多数是单个 \n，而不是空行。
+# 若一律当成段内软换行，会把「天津市 / 小型建设工程施工合同 /（JF-2001-015）」
+# 三行压成一个段落 —— 与原文的三个独立段落对不上，段落级 LCS 只能判成
+# 整段删除 + 整段新增，表现为封面被整块划掉后又重复插入一份。
+_PARA_HEAD_RE = re.compile(
+    r"^\s*(?:"
+    r"第[一二三四五六七八九十百零〇\d]+[条章节款项目]"      # 第X条 / 第X章
+    r"|[一二三四五六七八九十]+[、．.]"                      # 一、 / 十、
+    r"|[（(]\s*\d+\s*[）)]"                                # （1） / (2)
+    r"|\d+\s*[、．.]\s*(?=\S)"                             # 1. / 2、
+    r"|[^\n：:]{1,12}[：:]"                                # 「工程名称：」「甲方：」等短标签
+    r")"
+)
+
+# 行尾为「逗号/顿号/冒号/开括号」等**非终结**标点时，该行几乎肯定是续行
+# （句子还没说完就换行了），此时不拆段。
+_CONT_RE = re.compile(r"[，,、：:（(「『【]\s*$")
+
+
+def _looks_like_standalone_paragraph(line: str) -> bool:
+    """判断一行是否「看起来是一个独立的段落」。
+
+    仅用于决定**标记块内**单个换行该拆段还是该保留为软换行。
+
+    判据：
+    1. 行首是条款/编号/短标签（「第三条」「一、」「（1）」「工程名称：」）→ 独立段；
+    2. 行尾是逗号/顿号/冒号等**非终结**标点 → 续行（句子没说完就换行了），不独立；
+    3. 短行（≤20 字且不含句中标点）→ 独立段，覆盖封面「天津市」这类标题行；
+    4. 其余 → 不独立（普通长句）。
+
+    ⚠️ 判据里**不能**把「行尾是句号」当作独立段落的充分条件：
+    长正文几乎每句都以句号收尾，那样会把每一句都拆成一段，
+    把「一段一句话」的排版彻底打散。句末标点只在**短行**上才有指示意义，
+    已由判据 3 覆盖。
+    """
+    s = (line or "").strip()
+    if not s:
+        return False
+    # 续行优先：句子未结束就换行
+    if _CONT_RE.search(s):
+        return False
+    # 条款/编号/短标签开头 → 明确的新段落
+    if _PARA_HEAD_RE.match(s):
+        return True
+    # 短行且无句中标点 → 标题/字段行
+    if len(s) <= 20 and not re.search(r"[，,。；;：:]", s):
+        return True
+    return False
+
+
 def _split_target_paragraphs(content: str) -> list[str]:
     """把一段标记内容拆成目标段落。
 
-    仅按**空行**（连续两个及以上换行）拆分段落；单个换行保留为
-    段内软换行（与原文书常见的 ``甲方：…\\n乙方：…`` 结构一致）。
+    拆段规则（按优先级）：
+    1. **空行**（连续两个及以上换行）一定拆段；
+    2. 单个换行：两侧任一行「看起来是独立段落」（见
+       `_looks_like_standalone_paragraph`）时拆段；
+    3. 否则保留为段内软换行 —— 用于原文书常见的
+       ``甲方：…\\n乙方：…`` 这类本来就写在同一段里的结构。
+
+    第 2 条是修复「封面被整块划掉后重复插入」的关键：LLM 用单个换行
+    表示段落分隔是常态，全部当成软换行会让目标段数与原文段数对不上，
+    段落级对齐只能退化为整段删除 + 整段新增。
     """
     if content is None:
         return []
     # 统一换行符
     text = content.replace("\r\n", "\n").replace("\r", "\n")
-    # 用空行拆段
-    parts = re.split(r"\n[ \t\u3000]*\n+", text)
-    return [p for p in parts]
+
+    out = []
+    # 先用空行切成「块」，再在块内按语义决定是否拆行
+    for block in re.split(r"\n[ \t\u3000]*\n+", text):
+        if not block.strip():
+            continue
+        lines = block.split("\n")
+        # 单行块：原样保留
+        if len(lines) == 1:
+            out.append(block)
+            continue
+
+        # 逐行判断是否在「上一行末与当前行首之间」断开。
+        # 判据以**上一行**为主：
+        #   - 上一行以逗号/顿号等非终结标点收尾 → 句子没说完，是续行，不断开；
+        #   - 否则看当前行的行首是否像新段落的开头（条款号/短标签/句末标点）。
+        cur = [lines[0]]
+        for prev, ln in zip(lines, lines[1:]):
+            if _CONT_RE.search(prev.strip()):
+                # 上一行结尾是「未完结」标点 → 必定是同一段的续行
+                cur.append(ln)
+                continue
+            if _looks_like_standalone_paragraph(prev):
+                out.append("\n".join(cur))
+                cur = [ln]
+                continue
+            if _looks_like_standalone_paragraph(ln):
+                out.append("\n".join(cur))
+                cur = [ln]
+                continue
+            cur.append(ln)
+        out.append("\n".join(cur))
+
+    return out
 
 
 # ── 段落内字符级对齐 ──
@@ -509,6 +658,10 @@ def _split_target_paragraphs(content: str) -> list[str]:
 # 目的：整句重写时逐词对齐会产出大量碎片化的 del/ins 片段，可读性反而更差；
 # 此时整段替换更接近人工审阅的阅读习惯。
 _INLINE_FALLBACK_RATIO = 0.6
+
+# 「1 个原文段落 ↔ 最多几个目标段落」的细化上限。
+# 用于处理「原文一段被拆成多段」的形态；设小值避免把大段无关内容糊成一条修订。
+_MAX_MERGE_SPAN = 3
 
 
 def _inline_diff_runs(old_text: str, new_text: str):
@@ -561,10 +714,148 @@ def _inline_diff_runs(old_text: str, new_text: str):
         else:
             merged.append((kind, seg))
 
+    merged = _coalesce_short_fragments(merged)
+
     # 全是 equal（理论上不会到这里）或无任何改动 → 不做细粒度
     if not any(k != "equal" for k, _ in merged):
         return None
     return merged
+
+
+def _coalesce_short_fragments(pieces: list) -> list:
+    """合并相邻同类的修订片段，减少 Word 里的碎片标记。
+
+    ⚠️ 设计约束（重要）：**绝不能改变片段的先后顺序，也不能跨 equal 片段
+    搬运文本**。`del`/`ins` 片段交织的顺序就是原文/新文的字符顺序，一旦为了
+    「看起来整齐」把删除文本与新增文本各自归拢，接受或拒绝修订后得到的
+    文本就会错位（实测会把「于2026年12月31日前」还原成「于20261231年月日前」）。
+    因此这里只做**安全的就地合并**：
+
+    1. 相邻且同类的片段直接拼接（`ins"A" ins"B"` → `ins"AB"`）；
+    2. 只隔一个**空** equal 片段的同类片段也合并（空片段不承载任何文字）。
+
+    被短 equal 隔开的 del/ins 交替序列（如「空格填数字」）保持原样：
+    语序正确性优先于观感，碎片多但每处修订都忠实对应原文与新文。
+    """
+    if len(pieces) < 3:
+        # 仍然做一次相邻同类合并
+        pass
+
+    out = []
+    for kind, text in pieces:
+        if not text:
+            continue
+        out.append((kind, text))
+
+    # 反复扫描，直到不再变化（处理 "A" eq"" "A" 这类情况）
+    changed = True
+    while changed:
+        changed = False
+        merged = []
+        for kind, text in out:
+            if merged and merged[-1][0] == kind:
+                merged[-1] = (kind, merged[-1][1] + text)
+                changed = True
+            else:
+                merged.append((kind, text))
+        # 吸收空 equal
+        out = [(k, t) for k, t in merged if not (k == "equal" and not t)]
+        if out != merged:
+            changed = True
+    return out
+
+
+def _split_paragraph_with_pieces(p, pieces, author, date_str, rev_ids) -> bool:
+    """把含换行的 ins 片段拆成多个真实段落（而非段内软换行）。
+
+    `_replace_paragraph_inline` 在 ins 片段里发现 ``\\n`` 时转交本函数。
+    场景：原段落只有一行，修订后在中间另起一段（如「…第 2 种方式解决：」
+    后面新增两行列举）。若不处理，这两行会以 <w:br/> 挤在同一段里。
+
+    做法：按 ins 片段中的 ``\\n`` 把整个片段序列切成若干「行组」；
+    第一行组留在原段落，其余行组各建一个新段落。删除片段（del）只在
+    它所属的那一行组里生效，保证接受修订后文本正确。
+
+    要求原段落是纯 run 结构（由调用方保证）。
+    """
+    from lxml import etree
+
+    if not pieces:
+        return False
+
+    runs = [r for r in p if r.tag == _qn("w:r")]
+    src_run = runs[0] if runs else _first_run(p)
+    ref_rpr = src_run.find(_qn("w:rPr")) if src_run is not None else None
+    src_ppr = p.find(_qn("w:pPr"))
+
+    # 按 ins 内部的换行，把片段序列切成「行组」。
+    # del/equal 片段本身不含换行（换行只可能来自目标文本），归入当前行组。
+    groups = [[]]                       # [ [(kind,text), ...] ]
+    for kind, text in pieces:
+        if not text:
+            continue
+        if kind == "ins" and "\n" in text:
+            parts = text.split("\n")
+            for i, seg in enumerate(parts):
+                if i:
+                    groups.append([])
+                if seg:
+                    groups[-1].append(("ins", seg))
+        else:
+            groups[-1].append((kind, text))
+
+    # 去掉尾部空组
+    while groups and not any(t for _, t in groups[-1]):
+        groups.pop()
+    if len(groups) <= 1:
+        return False
+
+    def _build_nodes(grp):
+        """把一组片段渲染成 w:p 的直接子节点"""
+        nodes = []
+        for kind, text in grp:
+            if not text:
+                continue
+            if kind == "equal":
+                r = etree.Element(_qn("w:r"))
+                if ref_rpr is not None:
+                    r.append(copy.deepcopy(ref_rpr))
+                _set_run_text(r, text)
+                nodes.append(r)
+            elif kind == "del":
+                d = _make_del(author, date_str, rev_ids.next())
+                r = etree.Element(_qn("w:r"))
+                if ref_rpr is not None:
+                    r.append(copy.deepcopy(ref_rpr))
+                _set_run_text(r, text, as_del_text=True)
+                d.append(r)
+                nodes.append(d)
+            else:
+                i_el = _make_ins(author, date_str, rev_ids.next())
+                r = etree.Element(_qn("w:r"))
+                if ref_rpr is not None:
+                    r.append(copy.deepcopy(ref_rpr))
+                _set_run_text(r, text)
+                i_el.append(r)
+                nodes.append(i_el)
+        return nodes
+
+    # 第一组：就地替换原段落内容
+    _strip_paragraph_content(p)
+    for node in _build_nodes(groups[0]):
+        p.append(node)
+
+    # 其余组：各自建新段落，插在原段落之后
+    anchor = p
+    for grp in groups[1:]:
+        new_p = etree.Element(_qn("w:p"))
+        if src_ppr is not None:
+            new_p.append(copy.deepcopy(src_ppr))
+        for node in _build_nodes(grp):
+            new_p.append(node)
+        anchor.addnext(new_p)
+        anchor = new_p
+    return True
 
 
 def _replace_paragraph_inline(p, pieces, author, date_str, rev_ids) -> bool:
@@ -589,6 +880,14 @@ def _replace_paragraph_inline(p, pieces, author, date_str, rev_ids) -> bool:
             r.append(copy.deepcopy(ref_rpr))
         _set_run_text(r, text, as_del_text=as_del)
         return r
+
+    # ⚠️ 新增内容里绝不能出现 `\n` → `_set_run_text` 会把它渲染成 <w:br/>
+    # 软换行，段落级格式（居中/缩进/行距）就会作用于整块，版式与原文不一致，
+    # 修订标记也连成一大片无法逐项辨认。
+    # 出现在 ins 片段里的换行，说明该段落被拆成了多段 → 转交 `_split_paragraph_with_pieces`
+    # 处理（真正的 <w:p> 分段）。
+    if any("\n" in t for k, t in pieces if k == "ins"):
+        return _split_paragraph_with_pieces(p, pieces, author, date_str, rev_ids)
 
     # 先构造全部替换节点，再统一替换，避免边遍历边改动
     new_nodes = []
@@ -671,7 +970,7 @@ def _try_inline_replace(entries, target, i1, i2, j1, j2,
         return False
 
     def _pair_is_inlinable(oi: int, tj: int):
-        """返回 (原文段, 片段列表) 或 None"""
+        """返回 (原文段, 片段列表) 或 None（1 对 1）"""
         p = entries[oi][0]
         old_text = _paragraph_text(p)
         new_text = target[tj][1]
@@ -684,17 +983,73 @@ def _try_inline_replace(entries, target, i1, i2, j1, j2,
             return None
         return (p, pieces)
 
+    def _pair_is_inlinable_1n(oi: int, tj: int, max_span: int):
+        """1 对多：把一个原文段落与**连续多个**目标段落比对。
+
+        处理「一段被拆成多段」的形态：原文里靠软换行写在一段的若干条目，
+        改写后被拆成多个独立段落。1 对 1 配对必然失败，只能回退整段替换，
+        Word 里就显示为「整段删掉 + 整段重加」。
+
+        做法：把连续 k 个目标段落的文本用 ``\\n`` 拼接，与原段落做字符级比对。
+        返回 (原文段, 片段, 消耗的目标段数) 或 None。
+
+        ⚠️ 只接受 ``k >= 2`` 的匹配，**不返回 k=1**：
+        k=1 是普通的一对一情形，由 `_pair_is_inlinable` 负责；若这里也接受
+        k=1，朴素实现会在 k=1 就命中（例如把后几行当作「被删除」），
+        真正的「一段拆多段」永远没机会被识别。因此这里显式从 k=2 起找。
+
+        k >= 2 且原段落文本恰好等于拼接结果时，属于**纯结构拆分**（文字没变，
+        只是段落数变了），返回全 equal 片段，交由 `_split_paragraph_into` 处理。
+        """
+        p = entries[oi][0]
+        old_text = _paragraph_text(p)
+        if not old_text.strip():
+            return None
+        if any(child.tag != _qn("w:pPr") and child.tag != _qn("w:r") for child in p):
+            return None
+        if target[tj][0] == "delete":
+            return None
+        for k in range(2, max_span + 1):
+            if tj + k > j2:
+                break
+            # 目标侧含显式【删除】标记时不参与（那是明确的删除意图）
+            if any(target[tj + m][0] == "delete" for m in range(k)):
+                break
+            merged = "\n".join(target[tj + m][1] for m in range(k))
+            if not merged.strip():
+                continue
+            pieces = _inline_diff_runs(old_text, merged)
+            if pieces is not None:
+                return (p, pieces, k)
+            # 文本完全相同、但目标段数 > 1 → 纯结构拆分
+            if old_text == merged:
+                return (p, [("equal", old_text)], k)
+        return None
+
     # ── 头部逐段配对 ──
-    head = []          # [(原文下标, 目标下标, 原文段, 片段)]
+    # 先试 1 对 1；失败再试 1 对多（一段拆成多段）。
+    # `_MAX_MERGE_SPAN` 限制一次最多吞并几段，避免把大段无关内容糊成一条修订。
+    head = []          # [(原文下标, [目标下标...], 原文段, 片段)]
     n = min(n_old, n_new)
     k = 0
     while k < n:
         oi, tj = i1 + k, j1 + k
+        # 先试 1 对多：当一个原文段落的文本恰好等于**连续多个**目标段落的
+        # 拼接时，说明是「原文一段被拆成多段」，优先按拆分处理。
+        # 若先试 1 对 1，会把后面几行判成「被删除」（文本少了，但差异占比
+        # 未必超阈值），于是拆分被误当成删减，后面几段又被当成纯新增。
+        got1n = _pair_is_inlinable_1n(oi, tj, _MAX_MERGE_SPAN)
+        if got1n is not None:
+            p, pieces, consumed = got1n
+            head.append((oi, list(range(tj, tj + consumed)), p, pieces))
+            k += consumed
+            continue
         got = _pair_is_inlinable(oi, tj)
-        if got is None:
-            break
-        head.append((oi, tj) + got)
-        k += 1
+        if got is not None:
+            head.append((oi, [tj], got[0], got[1]))
+            k += 1
+            continue
+        break
 
     # ── 尾部逐段配对（不与头部重叠）──
     tail = []
@@ -704,13 +1059,36 @@ def _try_inline_replace(entries, target, i1, i2, j1, j2,
         got = _pair_is_inlinable(oi, tj)
         if got is None:
             break
-        tail.append((oi, tj) + got)
+        tail.append((oi, [tj], got[0], got[1]))
     tail.reverse()
     plans = head + tail
 
     handled = []
-    for oi, tj, p, pieces in plans:
-        if _replace_paragraph_inline(p, pieces, author, date_str, rev_ids):
+    for oi, tjs, p, pieces in plans:
+        # 「纯结构拆分」：文本未变（片段全是 equal），只是原文一段要拆成多段。
+        # 此时不能走 `_replace_paragraph_inline`（它会把整段替换成同样的文本，
+        # 产生一堆无意义的修订），而应把原段落按目标行拆开。
+        if len(tjs) > 1 and all(k == "equal" for k, _ in pieces):
+            if _split_paragraph_into(p, target, tjs, author, date_str, rev_ids):
+                for tj in tjs:
+                    handled.append((oi, tj))
+            continue
+        if not _replace_paragraph_inline(p, pieces, author, date_str, rev_ids):
+            continue
+        if len(tjs) == 1:
+            handled.append((oi, tjs[0]))
+            continue
+        # 1 对多：承载细化的是原文段落本身；多出来的目标段落需要**追加新增段落**，
+        # 否则接受修订后这些内容会丢失。
+        newps = _make_paragraphs_from_template(
+            p, target, tjs[1:], author, date_str, rev_ids
+        )
+        anchor = p
+        for np in newps:
+            anchor.addnext(np)
+            anchor = np
+        # 覆盖到的下标全部登记，调用方据此从剩余区间里剔除
+        for tj in tjs:
             handled.append((oi, tj))
     # 返回**已细化的下标对**，调用方据此精确跳过这些段落，
     # 只把剩余部分交给整段替换（头部与尾部都可能命中，不能用「前 n 段」近似）。
@@ -808,11 +1186,13 @@ def _diff_apply(entries, orig_texts, target, author, date_str, rev_ids) -> int:
                 # 目标中显式标为 delete 的段落，不产生新增内容
                 if target[j][0] == "delete":
                     continue
-                newp = _make_paragraph_with_style(
+                newps = _make_paragraph_with_style(
                     target[j][1], style_p, style_ppr, style_rpr,
                     author, date_str, rev_ids
                 )
-                if newp is not None and insert_after is not None:
+                if not newps or insert_after is None:
+                    continue
+                for newp in newps:
                     insert_after.addnext(newp)
                     insert_after = newp
                     changes += 1
@@ -831,22 +1211,24 @@ def _diff_apply(entries, orig_texts, target, author, date_str, rev_ids) -> int:
             # 文首插入没有「前一段」，但仍需要一个格式模板 → 借用原第一段。
             style_anchor = anchor_p if anchor_p is not None else (entries[0][0] if entries else None)
             for j in range(j1, j2):
-                newp = _make_paragraph_like(
+                newps = _make_paragraph_like(
                     style_anchor, target[j][1], kind, author, date_str, rev_ids
                 )
-                if newp is None:
+                if not newps:
                     continue
-                if insert_after is not None:
-                    insert_after.addnext(newp)
-                    insert_after = newp
-                    changes += 1
-                elif entries:
-                    # 插入点在文档最前面：此时没有「前一段」可用作锚点。
-                    # 原先在这种情况直接跳过（insert_after 为 None），会导致
-                    # 「在正文开头新增一段」的修订被静默丢弃；退化为「插到第一段
-                    # 之后」则会把前置条款挪到错误位置。正确做法是插到第一段之前。
-                    entries[0][0].addprevious(newp)
-                    changes += 1
+                for newp in newps:
+                    if insert_after is not None:
+                        insert_after.addnext(newp)
+                        insert_after = newp
+                        changes += 1
+                    elif entries:
+                        # 插入点在文档最前面：此时没有「前一段」可用作锚点。
+                        # 原先在这种情况直接跳过（insert_after 为 None），会导致
+                        # 「在正文开头新增一段」的修订被静默丢弃；退化为「插到第一段
+                        # 之后」则会把前置条款挪到错误位置。正确做法是插到第一段之前。
+                        entries[0][0].addprevious(newp)
+                        insert_after = newp
+                        changes += 1
     return changes
 
 
@@ -973,51 +1355,193 @@ def _delete_paragraph(p, author, date_str, rev_ids) -> bool:
 
 def _make_paragraph_with_style(text, style_p, style_ppr, style_rpr,
                                author, date_str, rev_ids):
-    """用预先取好的格式（pPr/rPr 深拷贝）构造新增段落。
+    """用预先取好的格式（pPr/rPr 深拷贝）构造新增段落，**返回段落列表**。
 
     与 _make_paragraph_like 的区别：格式在删除操作**之前**就已捕获，
     因此即使原段落已被包进 <w:del>，新增内容仍能继承正确的字体。
+
+    text 中的 ``\\n`` 会拆成**多个真实 <w:p>**，而不是一个段落里的软换行：
+    每个新段落各自克隆一份 pPr，从而保持居中/缩进/行距等段落格式。
     """
     from lxml import etree
 
-    new_p = etree.Element(_qn("w:p"))
-    if style_ppr is not None:
-        new_p.append(copy.deepcopy(style_ppr))
-    elif style_p is not None:
-        ppr = style_p.find(_qn("w:pPr"))
-        if ppr is not None:
-            new_p.append(copy.deepcopy(ppr))
+    out = []
+    for line in _split_insert_lines(text):
+        new_p = etree.Element(_qn("w:p"))
+        if style_ppr is not None:
+            new_p.append(copy.deepcopy(style_ppr))
+        elif style_p is not None:
+            ppr = style_p.find(_qn("w:pPr"))
+            if ppr is not None:
+                new_p.append(copy.deepcopy(ppr))
 
-    new_run = etree.Element(_qn("w:r"))
-    if style_rpr is not None:
-        new_run.append(copy.deepcopy(style_rpr))
-    _set_run_text(new_run, text)
+        new_run = etree.Element(_qn("w:r"))
+        if style_rpr is not None:
+            new_run.append(copy.deepcopy(style_rpr))
+        _set_run_text(new_run, line)
 
-    ins = _make_ins(author, date_str, rev_ids.next())
-    ins.append(new_run)
-    new_p.append(ins)   # ⚠️ w:ins 是 w:p 的直接子节点（铁律 1）
-    return new_p
+        ins = _make_ins(author, date_str, rev_ids.next())
+        ins.append(new_run)
+        new_p.append(ins)   # ⚠️ w:ins 是 w:p 的直接子节点（铁律 1）
+        out.append(new_p)
+    return out
+
+
+def _split_paragraph_into(p, target, tjs, author, date_str, rev_ids) -> bool:
+    """把原文一个段落（含软换行）拆成多个真实段落。
+
+    用于「纯结构拆分」：原文把若干行写在同一段里（以 <w:br/> 软换行分隔），
+    改写后这些行变成独立段落，文字本身没有变化。
+
+    做法：
+    - 第一个目标行保留在**原段落**里（内容不变，不产生修订）；
+    - 其余目标行各建一个新段落，内容包在 <w:ins> 中；
+    - 原段落中对应的 <w:br/> 与后续文字搬进新段落，
+      原段落只保留第一行 —— 这样「段落数变化」本身就是可见的修订。
+
+    要求原段落是纯 run 结构（由调用方保证）。
+    """
+    from lxml import etree
+
+    if not tjs:
+        return False
+
+    src_ppr = p.find(_qn("w:pPr"))
+    src_run = _first_run(p)
+    src_rpr = src_run.find(_qn("w:rPr")) if src_run is not None else None
+
+    # 目标行文本（跳过显式删除）
+    lines = []
+    for tj in tjs:
+        kind, text = target[tj]
+        if kind == "delete":
+            return False
+        for ln in _split_insert_lines(text):
+            lines.append(ln)
+    if len(lines) < 2:
+        return False
+
+    # 校验：各目标行拼起来必须与原段落文本一致（本函数只处理纯结构拆分）
+    if "\n".join(lines) != _paragraph_text(p):
+        return False
+
+    # 原段落重建为「只含第一行」：保留原有 run，删掉第一个 <w:br/> 之后的内容
+    seen_first_break = False
+    for child in list(p):
+        if child.tag == _qn("w:pPr"):
+            continue
+        if not seen_first_break:
+            # 该 run 内可能含 <w:br/>：截断到第一个 break 之前
+            brs = [c for c in child if c.tag == _qn("w:br")]
+            if brs:
+                first_br = brs[0]
+                # 删掉 break 及其后所有同级子节点
+                drop = False
+                for c in list(child):
+                    if c is first_br:
+                        drop = True
+                    if drop:
+                        child.remove(c)
+                seen_first_break = True
+            continue
+        # 第一个 break 之后的同级节点全部删除
+        p.remove(child)
+
+    # 为其余各行建新段落，插在原段落之后
+    anchor = p
+    for line in lines[1:]:
+        new_p = etree.Element(_qn("w:p"))
+        if src_ppr is not None:
+            new_p.append(copy.deepcopy(src_ppr))
+        new_run = etree.Element(_qn("w:r"))
+        if src_rpr is not None:
+            new_run.append(copy.deepcopy(src_rpr))
+        _set_run_text(new_run, line)
+        ins = _make_ins(author, date_str, rev_ids.next())
+        ins.append(new_run)
+        new_p.append(ins)   # ⚠️ w:ins 是 w:p 的直接子节点（铁律 1）
+        anchor.addnext(new_p)
+        anchor = new_p
+    return True
+
+
+def _make_paragraphs_from_template(template_p, target, tjs, author, date_str, rev_ids):
+    """按模板段落格式，为**多出来的目标段落**构造新增段落。
+
+    用于 `_try_inline_replace` 的「1 对多」场景：原文一段被拆成多段时，
+    第一段的内容已由 `_replace_paragraph_inline` 就地细化，剩余目标段落
+    必须作为**新增段落**补上，否则接受修订后这些内容会丢失。
+
+    格式取自 template_p（即承载细化的那个原文段落），保证字体/缩进一致。
+    """
+    from lxml import etree
+
+    src_ppr = template_p.find(_qn("w:pPr"))
+    src_run = _first_run(template_p)
+    src_rpr = src_run.find(_qn("w:rPr")) if src_run is not None else None
+
+    out = []
+    for tj in tjs:
+        kind, text = target[tj]
+        if kind == "delete":
+            continue
+        for line in _split_insert_lines(text):
+            new_p = etree.Element(_qn("w:p"))
+            if src_ppr is not None:
+                new_p.append(copy.deepcopy(src_ppr))
+            new_run = etree.Element(_qn("w:r"))
+            if src_rpr is not None:
+                new_run.append(copy.deepcopy(src_rpr))
+            _set_run_text(new_run, line)
+            ins = _make_ins(author, date_str, rev_ids.next())
+            ins.append(new_run)
+            new_p.append(ins)   # ⚠️ w:ins 是 w:p 的直接子节点（铁律 1）
+            out.append(new_p)
+    return out
+
+
+def _split_insert_lines(text: str) -> list[str]:
+    """把待新增的文本按行拆开（供新增段落使用）。
+
+    换行一律视为**段落分隔**：新增内容本来就该是独立段落，不存在
+    「新增一段却要在段内软换行」的语义。空行跳过。
+    """
+    if text is None:
+        return []
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return [ln for ln in lines if ln.strip()]
 
 
 def _make_paragraph_like(anchor_p, text, kind, author, date_str, rev_ids):
-    """基于锚点段落克隆出格式一致的新段落，内容包在 <w:ins> 中。"""
+    """基于锚点段落克隆出格式一致的新段落，内容包在 <w:ins> 中。
+
+    **返回段落列表**：text 中的 ``\\n`` 拆成多个真实 <w:p>（见
+    `_make_paragraph_with_style` 的说明）。
+    """
     from lxml import etree
     if anchor_p is None:
-        return None
-
-    new_p = etree.Element(_qn("w:p"))
-    # 复制段落格式 pPr
-    ppr = anchor_p.find(_qn("w:pPr"))
-    if ppr is not None:
-        new_p.append(copy.deepcopy(ppr))
+        return []
 
     # 取格式模板 run；锚点段落没有直接 run 时（如仅含书签/域），
     # 退化为不带头格式的 run，避免整个新增段落丢失。
     src_run = _first_run(anchor_p)
-    new_run = _clone_run_shell(src_run) if src_run is not None else etree.Element(_qn("w:r"))
-    _set_run_text(new_run, text)
+    src_rpr = src_run.find(_qn("w:rPr")) if src_run is not None else None
+    src_ppr = anchor_p.find(_qn("w:pPr"))
 
-    ins = _make_ins(author, date_str, rev_ids.next())
-    ins.append(new_run)
-    new_p.append(ins)   # ⚠️ w:ins 是 w:p 的直接子节点（铁律 1）
-    return new_p
+    out = []
+    for line in _split_insert_lines(text):
+        new_p = etree.Element(_qn("w:p"))
+        # 复制段落格式 pPr
+        if src_ppr is not None:
+            new_p.append(copy.deepcopy(src_ppr))
+
+        new_run = _clone_run_shell(src_run) if src_run is not None else etree.Element(_qn("w:r"))
+        if new_run.find(_qn("w:rPr")) is None and src_rpr is not None:
+            new_run.append(copy.deepcopy(src_rpr))
+        _set_run_text(new_run, line)
+
+        ins = _make_ins(author, date_str, rev_ids.next())
+        ins.append(new_run)
+        new_p.append(ins)   # ⚠️ w:ins 是 w:p 的直接子节点（铁律 1）
+        out.append(new_p)
+    return out

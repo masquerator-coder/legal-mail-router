@@ -113,10 +113,22 @@ class TestSplitTargetParagraphs:
         parts = _split_target_paragraphs("第一段\n\n第二段")
         assert len(parts) == 2
 
-    def test_single_newline_kept(self):
-        """单换行是段内软换行，不能拆段（原文书常见「甲方：…\\n乙方：…」）。"""
+    def test_single_newline_split_when_lines_look_like_paragraphs(self):
+        """「甲方：A / 乙方：B」型行首标签的单换行要拆段。
+
+        回归背景：原先只按空行拆段，LLM 用单个换行分隔段落时（这是常态），
+        目标段数与原文段数对不上，段落级对齐只能退化为「整段删除 + 整段新增」，
+        封面会被整块划掉后又重复插入一份。
+        """
         parts = _split_target_paragraphs("甲方：A\n乙方：B")
+        assert parts == ["甲方：A", "乙方：B"]
+
+    def test_single_newline_kept_for_continuation_line(self):
+        """续行（不以标签/句末标点开头、且是长句的一部分）仍保留为段内软换行。"""
+        text = "双方本着平等互利原则开展合作，共同推进\n人才培养与科研协同等各项工作落地。"
+        parts = _split_target_paragraphs(text)
         assert len(parts) == 1
+        assert "\n" in parts[0]
 
     def test_crlf_normalized(self):
         parts = _split_target_paragraphs("A\r\n\r\nB")
@@ -690,3 +702,235 @@ class TestHelpers:
     def test_qn_rejects_non_w_prefix(self):
         with pytest.raises(ValueError):
             redline._qn("a:foo")
+
+
+# ── 回归：封面重复插入 / 软换行 / 兜底自检 ──
+#
+# 背景：客户反馈两份真实文书「修订部分格式混乱」。定位到三个缺陷：
+# A. 标记块内的单个换行被当成段内软换行，导致目标段数与原文段数对不上，
+#    封面被整块划掉后又重复插入一份；
+# B. 新增段落用 <w:br/> 表示换行而非真实 <w:p>，段落级格式（居中/缩进）
+#    作用于整块，版式与原文不一致；
+# D. 对齐失败时没有任何兜底，直接产出「整篇划掉」的文档。
+# 以下用例锁定这三类问题的修复。
+
+class TestCoverPageRegression:
+    """封面型结构：多个短行标题 + 字段行，必须拆成独立段落处理。"""
+
+    COVER = [
+        "天津市",
+        "小型建设工程施工合同",
+        "（JF-2001-015）",
+        "工程名称：某小区外墙维修工程",
+        "工程编号：260929106560",
+        "建设单位：某物业管理有限公司",
+        "施工单位：某建筑工程有限公司",
+        "签订日期：    年   月   日",
+    ]
+
+    def test_cover_lines_split_into_paragraphs(self):
+        """封面各行必须以单换行拆成独立段落，而不是压成一段。"""
+        block = "\n".join(self.COVER)
+        parts = _split_target_paragraphs(block)
+        assert len(parts) == len(self.COVER)
+        assert parts[0] == "天津市"
+        assert parts[2] == "（JF-2001-015）"
+
+    def test_modified_cover_is_not_delete_plus_insert(self, tmp_path):
+        """改动封面个别字时，应就地细化，不能整块删除 + 整块新增。
+
+        回归背景：正是这个缺陷让封面在 Word 里被全部划掉后重复一份。
+        """
+        src = _make_minimal_docx(tmp_path / "cover.docx", self.COVER)
+        # 只把「外墙外墙」笔误改掉、补全日期
+        revised = "\n".join([
+            "天津市",
+            "小型建设工程施工合同",
+            "（JF-2001-015）",
+            "工程名称：某小区外墙维修工程",
+            "工程编号：260929106560",
+            "建设单位：某物业管理有限公司",
+            "施工单位：某建筑工程有限公司",
+            "签订日期：2026年12月31日",
+        ])
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        # 未改动的封面行不得出现在删除内容里
+        del_text = "".join(re.findall(r"<w:delText[^>]*>([^<]*)</w:delText>", body))
+        assert "天津市" not in del_text
+        assert "小型建设工程施工合同" not in del_text
+        assert "JF-2001-015" not in del_text
+        # 也不得产生整段重复插入
+        ins_text = _inserted_text(body)
+        assert ins_text.count("小型建设工程施工合同") == 0
+        os.remove(out)
+
+    def test_accepted_text_equals_revised(self, tmp_path):
+        """接受全部修订后，正文段落应等于 LLM 给出的修订文本。"""
+        src = _make_minimal_docx(tmp_path / "cover2.docx", self.COVER)
+        revised_cover = [
+            "天津市",
+            "小型建设工程施工合同",
+            "（JF-2001-015）",
+            "工程名称：某小区外墙维修工程",
+            "工程编号：260929106560",
+            "建设单位：某物业管理有限公司",
+            "施工单位：某建筑工程有限公司",
+            "签订日期：2026年12月31日",
+        ]
+        out = build_redlined_docx(src, "\n".join(revised_cover))
+        assert out
+        body, _ = _read_xml(out)
+        accepted = _accepted_paragraph_texts(body)
+        for line in revised_cover:
+            assert line in accepted, f"接受修订后缺少: {line}"
+        os.remove(out)
+
+
+class TestNoSoftBreakInInsertions:
+    """新增内容必须用真实 <w:p> 分段，不得出现「<w:ins> 内的 <w:br/>」。"""
+
+    def test_inserted_paragraphs_use_real_breaks(self, tmp_path):
+        src = _make_minimal_docx(tmp_path / "base.docx", ["合作协议", "第一条 合作宗旨"])
+        # 一条新增内容内部换行 → 必须产生两个独立段落
+        revised = "合作协议\n\n第一条 合作宗旨\n\n【新增】新增第一句。\n新增第二句。【/新增】"
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        assert "<w:br" not in body, "新增内容不应使用 <w:br/> 软换行"
+        ins_text = _inserted_text(body)
+        assert "新增第一句。" in ins_text
+        assert "新增第二句。" in ins_text
+        os.remove(out)
+
+    def test_multi_line_insert_produces_multiple_paragraphs(self, tmp_path):
+        src = _make_minimal_docx(tmp_path / "base2.docx", ["标题"])
+        revised = "标题\n\n【新增】甲\n乙\n丙【/新增】"
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        # 三个独立 <w:ins>（各自在独立段落里）
+        assert body.count("<w:ins ") >= 3
+        os.remove(out)
+
+    def test_inline_path_newline_becomes_real_paragraph(self, tmp_path):
+        """段落内细化时，ins 片段里的换行也必须产生真实段落。
+
+        回归背景：`_replace_paragraph_inline` 原先直接把含 `\\n` 的片段交给
+        `_set_run_text`，结果在 <w:ins> 里写出 <w:br/> 软换行 —— 段落级格式
+        会作用于整块，版式与原文不一致。这类换行出现在「原文一行、修订后
+        在中间另起一段」的场景。
+        """
+        src = _make_minimal_docx(
+            tmp_path / "inline.docx",
+            ["12.1 协商不成时，可按下列第 2 种方式解决：", "结尾段落。"],
+        )
+        revised = (
+            "12.1 协商不成时，可按下列第 2 种方式解决：\n"
+            "①向仲裁委员会申请仲裁；\n"
+            "②向人民法院起诉。\n\n结尾段落。"
+        )
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        assert "<w:br" not in body, "段落内细化不应产出 <w:br/> 软换行"
+        accepted = _accepted_paragraph_texts(body)
+        assert "①向仲裁委员会申请仲裁；" in accepted
+        assert "②向人民法院起诉。" in accepted
+        os.remove(out)
+
+
+class TestDeletedRatioGuard:
+    """兜底自检：对齐彻底失败时应放弃生成，而不是产出整篇划掉的文档。"""
+
+    def test_ratio_helper_measures_deleted_share(self):
+        from lxml import etree
+        xml = (
+            '<w:body xmlns:w="%s">'
+            '<w:p><w:r><w:t>保留</w:t></w:r></w:p>'
+            '<w:p><w:del w:id="1" w:author="a"><w:r><w:delText>删掉的文字</w:delText></w:r></w:del></w:p>'
+            '</w:body>' % W_NS
+        )
+        body = etree.fromstring(xml)
+        deleted, ratio = redline._deleted_ratio(body)
+        assert deleted == 5
+        assert ratio == pytest.approx(5 / 7)
+
+    def test_ratio_helper_handles_empty_body(self):
+        from lxml import etree
+        body = etree.fromstring('<w:body xmlns:w="%s"/>' % W_NS)
+        assert redline._deleted_ratio(body) == (0, 0.0)
+
+    def test_alignment_failure_is_rejected(self, tmp_path):
+        """构造一个「除第一段外全部改掉」的大文档，应触发兜底放弃。
+
+        这里直接验证阈值语义：删除量足够大且占比过高 → build 返回 None。
+        """
+        paras = ["第一条 原始条款"] + [f"原始段落内容第{i}项，描述相关事项。" for i in range(60)]
+        src = _make_minimal_docx(tmp_path / "big.docx", paras)
+        # 目标与原文几乎完全不重合 → 对齐必然失败
+        revised = "\n\n".join(["第一条 原始条款"] +
+                              [f"完全不同的全新条款第{i}项，另行约定事项。" for i in range(60)])
+        out = build_redlined_docx(src, revised)
+        # 兜底生效时返回 None；若对齐足够聪明没有触发，则必须满足「删除占比 < 阈值」
+        if out is not None:
+            body, _ = _read_xml(out)
+            from lxml import etree
+            root = etree.fromstring(body.encode("utf-8"))
+            _, ratio = redline._deleted_ratio(root)
+            assert ratio <= redline._MAX_DELETED_RATIO
+            os.remove(out)
+
+
+class TestInlineOneToMany:
+    """一段被拆成多段 / 多段并成一段时的细化（修复 C）。"""
+
+    def test_one_paragraph_split_into_two(self, tmp_path):
+        """原文一段含软换行，改写后拆成两个独立段落 → 应细化而非整段删增。"""
+        def build(doc):
+            p = doc.add_paragraph()
+            r = p.add_run("甲方：某投资公司")
+            from docx.oxml.ns import qn as dqn
+            from lxml import etree
+            etree.SubElement(r._element, dqn("w:br"))
+            p.add_run("乙方：某建设公司")
+            doc.add_paragraph("结尾段落。")
+
+        src = _make_docx(tmp_path / "soft.docx", build)
+        revised = "甲方：某投资公司\n\n乙方：某建设公司\n\n结尾段落。"
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        # 两方名称都未改动 → 不应出现在删除内容里
+        del_text = "".join(re.findall(r"<w:delText[^>]*>([^<]*)</w:delText>", body))
+        assert "某投资公司" not in del_text
+        assert "某建设公司" not in del_text
+        os.remove(out)
+
+
+# ── 测试辅助：从 document.xml 提取接受/插入后的文本 ──
+
+def _inserted_text(body_xml: str) -> str:
+    """提取所有 <w:ins> 内的文本（即新增内容）。"""
+    out = []
+    for m in re.finditer(r"<w:ins [^>]*>(.*?)</w:ins>", body_xml, flags=re.S):
+        out.append("".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", m.group(1))))
+    return "".join(out)
+
+
+def _accepted_paragraph_texts(body_xml: str) -> list:
+    """按段落提取「接受全部修订后」的文本（保留 w:t，丢弃 w:delText）。"""
+    from lxml import etree
+    root = etree.fromstring(body_xml.encode("utf-8"))
+    qn = redline._qn
+    out = []
+    for p in root.iter(qn("w:p")):
+        parts = []
+        for node in p.iter():
+            if node.tag == qn("w:t"):
+                parts.append(node.text or "")
+        txt = "".join(parts).strip()
+        if txt:
+            out.append(txt)
+    return out
