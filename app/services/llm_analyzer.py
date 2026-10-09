@@ -344,6 +344,74 @@ def _build_revision_field_desc(doc_type: str | None) -> str:
     return "固定为null（本类型无需修订）"
 
 
+# 审查意见模板字段：按文书类型分派
+# 实测教训（2026-10，email_logs id=114/115/116）：把两类字段同时列进 schema 并用
+# 「非合同类填null」这种**否定式**说明时，模型会把它泛化成「这些字段都空着」，
+# 于是合同类文书的 contract_* 也返回空串，模板只能填「（待确认）」。
+# 因此这里改为**按类型只列出该类型需要的字段**，并给出**正向示例值**。
+_CONTRACT_TEMPLATE_FIELDS = """  "contract_party_a": "合同甲方全称",
+  "contract_party_b": "合同相对方（乙方）全称",
+  "contract_name": "合同正文标题",
+  "contract_content": "合同标的与主要内容，一句话",
+  "contract_amount": "合同价款金额，仅数值不含「元」与货币符号",
+"""
+
+_NON_CONTRACT_TEMPLATE_FIELDS = """  "agency_name": "作出或与案涉具体行政行为的机关全称（如 天津市津南区八里台镇人民政府）",
+  "document_title_no": "送审文书的标题及发文字号（如《关于XX事项的申请书》（津南信〔2026〕12号）；无文号则只写标题）",
+"""
+
+
+def _build_template_fields(doc_type: str | None) -> str:
+    """生成 Output JSON schema 中审查意见模板专用字段的声明（按类型分派）。
+
+    **未配备审查意见模板的文书类型不声明任何模板字段**——这些字段无人消费，
+    声明它们只会浪费输出预算，并给模型制造「填不填」的歧义（实测中正是这种
+    歧义导致合同类文书的字段被写成空串）。模板是否存在是唯一事实来源。
+
+    ⚠️ 返回值会被插入 JSON 对象字面量内部，**只能包含字段行**（每行以逗号结尾），
+    不得夹带说明文字，否则 JSON 结构被破坏、模型看到的是非法 JSON。
+    """
+    from app.services.mail_forwarder import _review_template_path
+
+    if _review_template_path(doc_type) is None:
+        return ""
+    if is_contract_type(doc_type):
+        return _CONTRACT_TEMPLATE_FIELDS
+    return _NON_CONTRACT_TEMPLATE_FIELDS
+
+
+def _build_template_fields_guide(doc_type: str | None) -> str:
+    """生成审查意见模板字段的取值说明（放在 JSON 之外，作为正文指引）。
+
+    实测教训（2026-10，email_logs id=114/115/116）：把两类字段同时列进 schema
+    并用「非合同类填null」这种**否定式**说明时，模型会把它泛化成「这些字段都空着」，
+    于是合同类文书的 contract_* 也返回空串，模板只能填「（待确认）」。
+    改为**按类型只列该类型需要的字段** + **正向示例值**后消除该歧义。
+    """
+    from app.services.mail_forwarder import _review_template_path
+
+    if _review_template_path(doc_type) is None:
+        return ""
+    if is_contract_type(doc_type):
+        return """**字段取值要求（务必逐字取自合同正文）：**
+- 甲乙方以合同**正文首部「甲方：」「乙方：」栏**记载的全称为准；不要按发件人、邮件落款或代理机构推断。
+- 合同名称取**正文标题**（首行标题，或「签订《XXX》」书名号内的内容），**不是**邮件标题，**也不是**附件文件名。
+- 合同价款只填**数值**、保留千分位，不带「元」与「￥」（如 `1,041,748`）。
+- 示例：正文载「甲方：天津市宏徽投资发展有限公司」「乙方：山东首正建设有限公司」，
+  标题为《小站镇黄台工业园区路灯照明系统整体维修工程结算协议》，价款 ￥1041748 时，
+  应输出 `"contract_party_a": "天津市宏徽投资发展有限公司"`、
+  `"contract_party_b": "山东首正建设有限公司"`、
+  `"contract_name": "小站镇黄台工业园区路灯照明系统整体维修工程结算协议"`、
+  `"contract_amount": "1,041,748"`。
+- 正文中确实没有的字段填空字符串 `""`；**不要编造**。"""
+    return """**字段取值要求（务必逐字取自送审文书正文）：**
+- `agency_name` 填**作出或与案涉具体行政行为**的机关/单位全称，取正文落款或抬头处的全称。
+- `document_title_no` 填送审文书**自身的标题**及发文字号；有文号时连同文号一并给出，无文号则只写标题。
+- 示例：正文标题为《关于XX事项的申请书》、文号为「津南信〔2026〕12号」时，
+  应输出 `"document_title_no": "《关于XX事项的申请书》（津南信〔2026〕12号）"`。
+- 正文中确实没有的字段填空字符串 `""`；**不要编造**。"""
+
+
 def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
                   body_max_chars: int = 8000,
                   today_str: str = "",
@@ -365,6 +433,7 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
     # 模板是否引用占位符（在哨兵替换前检查）
     template_has_analysis_placeholder = "{analysis_instructions}" in template
     template_has_revision_placeholder = "{revision_instructions}" in template
+    template_has_template_fields_placeholder = "{template_fields}" in template
 
     # 截断过长的正文
     if body_max_chars > 0 and len(body) > body_max_chars:
@@ -378,6 +447,8 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
 
     revision_instructions = _build_revision_section(doc_type)
     revision_field_desc = _build_revision_field_desc(doc_type)
+    template_fields = _build_template_fields(doc_type)
+    template_fields_guide = _build_template_fields_guide(doc_type)
 
     # 分析流程提示词中可引用 {today}，此处单独替换（format 不递归处理参数值）
     if analysis_instructions and "{today}" in analysis_instructions:
@@ -387,7 +458,8 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
     # 需要先保护已知占位符，转义其余花括号，再恢复占位符后调用 .format()
     KNOWN_PLACEHOLDERS = {"{subject}", "{sender}", "{body}", "{today}",
                           "{analysis_instructions}", "{revision_instructions}",
-                          "{revision_field_desc}"}
+                          "{revision_field_desc}", "{template_fields}",
+                          "{template_fields_guide}"}
     # 保护阶段：替换已知占位符为唯一哨兵
     sentinel_map = {}
     for i, ph in enumerate(KNOWN_PLACEHOLDERS):
@@ -404,7 +476,9 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
     format_args = dict(subject=subject, sender=sender, body=body_truncated,
                        today=today_str, analysis_instructions=analysis_instructions,
                        revision_instructions=revision_instructions,
-                       revision_field_desc=revision_field_desc)
+                       revision_field_desc=revision_field_desc,
+                       template_fields=template_fields,
+                       template_fields_guide=template_fields_guide)
     prompt = template.format(**format_args)
     # 自定义模板若未引用 {revision_instructions} 占位符，把修订要求追加到末尾，
     # 避免「模板未含占位符 → 模型仍被要求输出 revised_document」的静默不一致。
@@ -414,6 +488,13 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
     if analysis_instructions and not template_has_analysis_placeholder:
         logger.warning("提示词模板未包含 {analysis_instructions} 占位符，已将文书分析流程提示词追加到提示词末尾")
         prompt += "\n\n" + analysis_instructions
+    # 自定义模板若未声明模板字段，则连字段本身都进不了 schema，模型不会输出，
+    # 审查意见只能填「（待确认）」——必须显式追加，避免静默降级。
+    if template_fields and not template_has_template_fields_placeholder:
+        logger.warning("提示词模板未包含 {template_fields} 占位符，已将审查意见模板字段追加到提示词末尾")
+        prompt += ("\n\n## Output 补充字段（审查意见模板用）\n"
+                   "请在上方 JSON 中一并返回以下字段：\n" + template_fields
+                   + "\n\n" + template_fields_guide)
     return prompt
 
 

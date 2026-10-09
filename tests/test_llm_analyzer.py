@@ -1027,6 +1027,106 @@ class TestRevisionSectionByType:
             assert t in prompt
 
 
+class TestReviewTemplateFieldsInPrompt:
+    """审查意见模板字段：按类型分派，且必须落在 JSON 结构内、位于长字段之前。
+
+    回归（2026-10，email_logs id=114/115/116）：两类字段同时声明并用
+    「非合同类填null」的否定式说明，被模型泛化成「全填空」，导致合同类
+    文书的 contract_* 返回空串，审查意见只能填「（待确认）」。
+    """
+
+    @staticmethod
+    def _schema(text: str) -> str:
+        """截取 Output JSON 对象字面量部分"""
+        i = text.find("## Output")
+        assert i >= 0
+        j = text.find("关于 revised_document", i)
+        return text[i:j if j > 0 else len(text)]
+
+    def test_contract_type_gets_contract_fields_only(self):
+        p = build_prompt("s", "a@b.c", "body", doc_type="合同协议")
+        schema = self._schema(p)
+        for f in ("contract_party_a", "contract_party_b", "contract_name",
+                  "contract_content", "contract_amount"):
+            assert f'"{f}"' in schema, f
+        # 非本合同类字段不得出现（避免模型对无用字段输出空串）
+        assert '"agency_name"' not in schema
+        assert '"document_title_no"' not in schema
+
+    def test_non_contract_type_gets_agency_fields_only(self):
+        p = build_prompt("s", "a@b.c", "body", doc_type="信访件")
+        schema = self._schema(p)
+        assert '"agency_name"' in schema
+        assert '"document_title_no"' in schema
+        for f in ("contract_party_a", "contract_party_b", "contract_name",
+                  "contract_content", "contract_amount"):
+            assert f'"{f}"' not in schema, f
+
+    def test_no_template_type_gets_no_fields(self):
+        """未配备模板的类型（判决书/起诉状）不声明任何模板字段。"""
+        for dt in ("判决书", "起诉状", "履职申请"):
+            p = build_prompt("s", "a@b.c", "body", doc_type=dt)
+            schema = self._schema(p)
+            for f in ("contract_party_a", "agency_name", "document_title_no"):
+                assert f'"{f}"' not in schema, f"{dt} 不应声明 {f}"
+
+    def test_no_negative_null_instruction(self):
+        """不得再用「非合同类填null」这类否定式说明（会诱发全填空）。"""
+        for dt in ("合同协议", "信访件"):
+            p = build_prompt("s", "a@b.c", "body", doc_type=dt)
+            assert "填null" not in p, dt
+
+    def test_short_fields_precede_long_fields(self):
+        """短字段须排在 ai_interpretation / revised_document 之前。
+
+        长字段（revised_document 常达数千字）会把短字段挤出注意力，
+        这是实测中字段返回空串的另一诱因。
+        """
+        p = build_prompt("s", "a@b.c", "body", doc_type="合同协议")
+        schema = self._schema(p)
+        assert schema.index('"contract_party_a"') < schema.index('"ai_interpretation"')
+        assert schema.index('"contract_party_a"') < schema.index('"revised_document"')
+        assert schema.index('"contract_amount"') < schema.index('"revised_document"')
+
+    def test_guide_rendered_outside_json_braces(self):
+        """取值说明必须落在 JSON 之外，否则破坏 JSON 结构。"""
+        p = build_prompt("s", "a@b.c", "body", doc_type="合同协议")
+        schema = self._schema(p)
+        close = schema.rindex("}")
+        assert schema.index("字段取值要求") > close, "说明文字混进了 JSON 对象内部"
+        # JSON 对象体内不得出现 markdown 粗体等说明性文字
+        body = schema[:close]
+        assert "**" not in body, "JSON 对象体内混入说明文字"
+
+    def test_positive_example_present(self):
+        """必须给出正向示例值，而非只给字段名。"""
+        p = build_prompt("s", "a@b.c", "body", doc_type="合同协议")
+        assert "天津市宏徽投资发展有限公司" in p
+        assert "山东首正建设有限公司" in p
+
+    def test_no_placeholder_residue(self):
+        for dt in ("合同协议", "信访件", "判决书", None):
+            p = build_prompt("s", "a@b.c", "body", doc_type=dt)
+            assert "{template_fields}" not in p, dt
+            assert "{template_fields_guide}" not in p, dt
+
+    def test_custom_prompt_without_placeholder_gets_appended(self):
+        """自定义模板未含 {template_fields} 时，字段与说明追加到末尾。"""
+        p = build_prompt(
+            "s", "a@b.c", "body",
+            custom_prompt="自定义模板 {subject} {body}",
+            doc_type="合同协议",
+        )
+        assert "contract_party_a" in p
+        assert "字段取值要求" in p
+
+    def test_none_doc_type_declares_no_fields(self):
+        """不传 doc_type 时保守处理：不声明模板字段，也不抛异常。"""
+        p = build_prompt("s", "a@b.c", "body")
+        assert "contract_party_a" not in p
+        assert "agency_name" not in p
+
+
 class TestTwoStageForwardsDocType:
     """回归：第二阶段必须收到第一阶段识别出的 doc_type（否则提示词无法按类型渲染）"""
 
