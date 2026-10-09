@@ -400,6 +400,257 @@ class TestInsertPosition:
         os.remove(out)
 
 
+# ── 修订颗粒度（段落内字符级对齐） ──
+
+class TestInlineGranularity:
+    """回归背景：旧实现是**纯段落级** diff，整段只要有一个字不同就整段
+    `<w:del>` + 整段 `<w:ins>`，审阅者看不出到底改了哪个词。
+    现在段落内做字符级对齐，只标注真正改动的词句。
+    """
+
+    def _revision_fragments(self, docx_path):
+        """返回 [(kind, text)]，kind ∈ {ins, del}，按文档顺序"""
+        body, _ = _read_xml(docx_path)
+        frags = []
+        for m in re.finditer(r"<w:(ins|del)\b.*?</w:\1>", body, re.S):
+            text = "".join(re.findall(r"<w:(?:t|delText)[^>]*>([^<]*)</w:", m.group(0)))
+            frags.append((m.group(1), text))
+        return frags
+
+    def test_word_level_change_marks_only_the_word(self, tmp_path):
+        """只改一个日期词：标记应只圈住该词，其余原文保持未标记。"""
+        src = _make_minimal_docx(
+            tmp_path / "gran.docx",
+            ["第一条 甲方应在30日内支付全部价款。", "第二条 乙方应交付货物。"],
+        )
+        revised = "第一条 甲方应在60日内支付全部价款。\n\n第二条 乙方应交付货物。"
+        out = build_redlined_docx(src, revised)
+        assert out
+        frags = self._revision_fragments(out)
+        combined = "".join(t for _, t in frags)
+        # 整个段落不应被标为修订
+        assert "甲方应在30日内支付全部价款" not in combined
+        # 只有变化的那几个字符
+        assert any(t == "3" for k, t in frags if k == "del"), frags
+        assert any(t == "6" for k, t in frags if k == "ins"), frags
+        os.remove(out)
+
+    def test_unchanged_paragraph_not_marked(self, tmp_path):
+        """未改动的段落不得出现任何修订标记。"""
+        src = _make_minimal_docx(
+            tmp_path / "gran2.docx",
+            ["第一条 甲方应在30日内支付全部价款。", "第二条 乙方应交付货物。"],
+        )
+        revised = "第一条 甲方应在60日内支付全部价款。\n\n第二条 乙方应交付货物。"
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        for text, dels, has_del, has_ins in _paragraph_kinds(body):
+            if "乙方应交付货物" in text:
+                assert not has_del and not has_ins, \
+                    f"未改动段落被误标修订：{text!r}"
+        os.remove(out)
+
+    def test_paragraph_count_unchanged_for_inline_edit(self, tmp_path):
+        """段落内细化不增删段落（区别于整段替换会多出一段）。"""
+        src = _make_minimal_docx(
+            tmp_path / "gran3.docx",
+            ["第一条 甲方应在30日内支付全部价款。", "第二条 乙方应交付货物。"],
+        )
+        revised = "第一条 甲方应在60日内支付全部价款。\n\n第二条 乙方应交付货物。"
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        texts = [t for t, d, hd, hi in _paragraph_kinds(body) if t or d]
+        assert len(texts) == 2, f"段落数应保持不变，实际 {texts!r}"
+        os.remove(out)
+
+    def test_symmetric_text_has_no_false_change(self, tmp_path):
+        """提交前修订（调换字序）也不应把整段标红。"""
+        src = _make_minimal_docx(
+            tmp_path / "gran4.docx", ["甲方应于收到货物后支付价款。"]
+        )
+        revised = "甲方应于支付货物后收到价款。"
+        out = build_redlined_docx(src, revised)
+        assert out
+        frags = self._revision_fragments(out)
+        combined = "".join(t for _, t in frags)
+        assert len(combined) < 12, f"改动占比不大，不应大段标记：{frags!r}"
+        os.remove(out)
+
+    def test_large_rewrite_falls_back_to_whole_paragraph(self, tmp_path):
+        """差异超阈值时回退为整段替换（避免碎片化标记）。"""
+        src = _make_minimal_docx(
+            tmp_path / "gran5.docx", ["第一条 甲方应在30日内支付全部价款。"]
+        )
+        revised = "第一条 乙方有权单方解除本协议并要求甲方承担全部损失。"
+        out = build_redlined_docx(src, revised)
+        assert out
+        frags = self._revision_fragments(out)
+        del_text = "".join(t for k, t in frags if k == "del")
+        # 回退路径 → 原文整段进 w:del
+        assert "甲方应在30日内支付全部价款" in del_text, frags
+        os.remove(out)
+
+    def test_inline_keeps_no_nested_revision_elements(self, tmp_path):
+        """铁律回归：细粒度标记仍不得嵌套进 w:r / w:t。"""
+        src = _make_minimal_docx(
+            tmp_path / "gran6.docx", ["第一条 甲方应在30日内支付全部价款。"]
+        )
+        out = build_redlined_docx(src, "第一条 甲方应在60日内支付全部价款。")
+        assert out
+        body, _ = _read_xml(out)
+        assert re.findall(r"<w:r\b[^>]*>(?:(?!</w:r>).)*?<w:(?:ins|del)\b", body, re.S) == []
+        assert re.findall(r"<w:t\b[^>]*>[^<]*<w:(?:ins|del)\b", body) == []
+        os.remove(out)
+
+    def test_inline_inserted_run_inherits_font(self, tmp_path):
+        """细粒度新增的 run 必须继承原文字体。"""
+        src = _make_minimal_docx(
+            tmp_path / "gran7.docx", ["第一条 甲方应在30日内支付全部价款。"]
+        )
+        out = build_redlined_docx(src, "第一条 甲方应在60日内支付全部价款。")
+        assert out
+        body, _ = _read_xml(out)
+        ins_blocks = re.findall(r"<w:ins\b.*?</w:ins>", body, re.S)
+        assert ins_blocks
+        for b in ins_blocks:
+            assert "eastAsia" in b, f"细粒度新增未继承字体: {b[:200]}"
+        os.remove(out)
+
+    def test_inline_diff_pieces_are_ordered(self, tmp_path):
+        """del/ins 片段顺序必须能正确重建新文（插入在删除之后）。"""
+        src = _make_minimal_docx(
+            tmp_path / "gran8.docx", ["第一条 甲方应在30日内支付全部价款。"]
+        )
+        out = build_redlined_docx(src, "第一条 甲方应在60日内支付全部价款。")
+        assert out
+        body, _ = _read_xml(out)
+        # 定位目标段落，按子节点顺序还原「接受全部修订后」的文本
+        from lxml import etree
+        xml = etree.fromstring(body.encode("utf-8"))
+        for p in xml.iter("{%s}p" % W_NS):
+            text = "".join(t.text or "" for t in p.iter("{%s}t" % W_NS))
+            if "甲方应在" in text:
+                # 接受修订后的文本 = 保留 w:t（含 ins 内），去掉 delText
+                accepted = "".join(
+                    t.text or "" for t in p.iter("{%s}t" % W_NS)
+                )
+                assert accepted == "第一条 甲方应在60日内支付全部价款。", accepted
+                deltext = "".join(
+                    t.text or "" for t in p.iter("{%s}delText" % W_NS)
+                )
+                assert deltext == "3", deltext
+                break
+        else:
+            pytest.fail("未找到目标段落")
+        os.remove(out)
+
+
+    def test_mixed_span_inlines_edits_and_appends_new_paragraph(self, tmp_path):
+        """回归：区间内「改动段落 + 末尾新增段落」混合时，改动部分仍须词级细化。
+
+        回归背景：LCS 会把「末尾追加一段」与它前面的几处改动合并成同一个
+        replace 区间（原文 3 段 ↔ 目标 4 段）。早期实现要求两侧段数严格相等，
+        于是一处追加就把前面所有段落的词级细化全部放弃，退化成整段删+整段加。
+        """
+        src = _make_minimal_docx(
+            tmp_path / "mixed.docx",
+            ["第一条 甲方应在30日内支付价款。", "第二条 乙方应交付货物。"],
+        )
+        revised = (
+            "第一条 甲方应在60日内支付价款。\n\n"
+            "第二条 乙方应交付货物。\n\n"
+            "【新增】第三条 逾期付款应按日计息。【/新增】"
+        )
+        out = build_redlined_docx(src, revised)
+        assert out
+        frags = self._revision_fragments(out)
+        del_text = "".join(t for k, t in frags if k == "del")
+        # 改动段落只应标记变化的那一个字，而不是整段
+        assert del_text.strip() == "3", f"改动段落未被词级细化：{frags!r}"
+        # 新增段落仍作为独立的插入段落出现
+        ins_text = "".join(t for k, t in frags if k == "ins")
+        assert "第三条 逾期付款应按日计息。" in ins_text, frags
+        os.remove(out)
+
+    def test_no_duplicate_paragraph_when_inlining(self, tmp_path):
+        """回归：词级细化后不得把同一段落再作为整段新增插入（重复内容）。"""
+        src = _make_minimal_docx(
+            tmp_path / "dup.docx",
+            ["第七条 争议由本院管辖。", "第八条 未尽事宜另行协商。"],
+        )
+        revised = (
+            "第七条 争议由工程所在地法院管辖。\n\n"
+            "第八条 未尽事宜另行协商。"
+        )
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        from lxml import etree
+        accepted = "".join(
+            t.text or ""
+            for t in etree.fromstring(body.encode("utf-8")).iter("{%s}t" % W_NS)
+        )
+        assert accepted.count("第八条 未尽事宜另行协商。") == 1, \
+            f"段落被重复插入：{accepted!r}"
+        os.remove(out)
+
+
+class TestInlineDiffRuns:
+    """`_inline_diff_runs` 单元行为"""
+
+    def test_equal_returns_none(self):
+        assert redline._inline_diff_runs("同样文本", "同样文本") is None
+
+    def test_empty_side_returns_none(self):
+        assert redline._inline_diff_runs("", "新文") is None
+        assert redline._inline_diff_runs("旧文", "") is None
+
+    def test_small_change_yields_pieces(self):
+        pieces = redline._inline_diff_runs("甲方应在30日内支付。", "甲方应在60日内支付。")
+        assert pieces is not None
+        kinds = [k for k, _ in pieces]
+        assert "del" in kinds and "ins" in kinds
+        assert "".join(t for k, t in pieces if k != "del") == "甲方应在60日内支付。"
+
+    def test_large_rewrite_returns_none(self):
+        """差异超阈值 → 回退整段（返回 None）。"""
+        old = "第一条 甲方应在30日内支付全部价款。"
+        new = "第一条 乙方有权单方解除本协议并要求甲方承担全部损失。"
+        assert redline._inline_diff_runs(old, new) is None
+
+    def test_pieces_merge_adjacent_kinds(self):
+        """相邻同类片段应合并，避免产生过多修订条目。"""
+        pieces = redline._inline_diff_runs("abcdef", "abXYef")
+        kinds = [k for k, _ in pieces]
+        assert kinds == ["equal", "del", "ins", "equal"], pieces
+        assert "".join(t for k, t in pieces if k != "del") == "abXYef"
+        assert "".join(t for k, t in pieces if k != "ins") == "abcdef"
+
+
+class TestInlineFallbackGuards:
+    """细化路径的守卫：结构不匹配时必须回退，不得误改原文。"""
+
+    def test_paragraph_with_hyperlink_not_inlined(self, tmp_path):
+        """段落含超链接等嵌套结构时回退整段替换，避免连带删掉链接。"""
+        def build(doc):
+            p = doc.add_paragraph()
+            p.add_run("详见")
+            _add_hyperlink(p, "https://example.com/a", "此处链接")
+            p.add_run("说明。")
+
+        src = _make_docx(tmp_path / "guard.docx", build)
+        out = build_redlined_docx(src, "详见此处链接说明（修订）。")
+        assert out
+        body, _ = _read_xml(out)
+        # 不得出现「链接被静默移除」：原文段落整体进 del 或保持可追溯
+        assert "此处链接" in "".join(
+            re.findall(r"<w:(?:t|delText)[^>]*>([^<]*)</w:", body)
+        )
+        os.remove(out)
+
+
 # ── 降级路径 ──
 
 class TestFallbackPaths:

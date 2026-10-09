@@ -503,8 +503,229 @@ def _split_target_paragraphs(content: str) -> list[str]:
     return [p for p in parts]
 
 
+# ── 段落内字符级对齐 ──
+
+# 差异占比超过该阈值时，放弃细粒度对齐，回退为「整段删除 + 整段新增」。
+# 目的：整句重写时逐词对齐会产出大量碎片化的 del/ins 片段，可读性反而更差；
+# 此时整段替换更接近人工审阅的阅读习惯。
+_INLINE_FALLBACK_RATIO = 0.6
+
+
+def _inline_diff_runs(old_text: str, new_text: str):
+    """把段落内的「原文 → 新文」比对成字符级修订片段。
+
+    返回 [(kind, text)]，kind ∈ {"equal", "del", "ins"}，按顺序拼回即为新文
+    （equal + ins 部分）与原文（equal + del 部分）。
+
+    仅在**差异占比 ≤ _INLINE_FALLBACK_RATIO** 时启用细粒度；
+    差异过大（接近整句重写）时返回 None，由调用方回退为整段替换。
+
+    注意：比对基于 `_normalize` 之外的**原始文本**——空白差异也算改动，
+    否则会出现「标记的位置与实际文字对不上」的错位标注。
+    """
+    import difflib
+
+    if old_text == new_text:
+        return None
+    if not old_text or not new_text:
+        return None
+
+    sm = difflib.SequenceMatcher(None, old_text, new_text, autojunk=False)
+    ops = sm.get_opcodes()
+
+    # 差异占比：改动字符数 / 较长一侧长度
+    changed = sum(max(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in ops if tag != "equal")
+    ratio = changed / max(len(old_text), len(new_text))
+    if ratio > _INLINE_FALLBACK_RATIO:
+        return None
+
+    pieces = []
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "equal":
+            pieces.append(("equal", new_text[j1:j2]))
+        elif tag == "delete":
+            pieces.append(("del", old_text[i1:i2]))
+        elif tag == "insert":
+            pieces.append(("ins", new_text[j1:j2]))
+        else:  # replace
+            pieces.append(("del", old_text[i1:i2]))
+            pieces.append(("ins", new_text[j1:j2]))
+
+    # 合并相邻同类片段，减少 Word 修订条数
+    merged = []
+    for kind, seg in pieces:
+        if not seg:
+            continue
+        if merged and merged[-1][0] == kind:
+            merged[-1] = (kind, merged[-1][1] + seg)
+        else:
+            merged.append((kind, seg))
+
+    # 全是 equal（理论上不会到这里）或无任何改动 → 不做细粒度
+    if not any(k != "equal" for k, _ in merged):
+        return None
+    return merged
+
+
+def _replace_paragraph_inline(p, pieces, author, date_str, rev_ids) -> bool:
+    """按字符级片段重写段落内容，产出细粒度的原生修订标记。
+
+    铁律遵守（见模块头）：
+    - `<w:ins>` / `<w:del>` 必须是 `<w:p>` 的**直接子节点**（`<w:r>` 的兄弟）；
+    - 每个标记包一个完整的 `<w:r>`，绝不在 `<w:t>` 内部做字符切分；
+    - 格式统一取自原段落首个 run 的 rPr，保证与原文书字体一致。
+
+    段落的 pPr 与段落标记保持不变（段落仍然存在，只是内容被逐词修订）。
+    """
+    from lxml import etree
+
+    runs = [r for r in p if r.tag == _qn("w:r")]
+    src_run = runs[0] if runs else _first_run(p)
+    ref_rpr = src_run.find(_qn("w:rPr")) if src_run is not None else None
+
+    def _new_run(text: str, as_del: bool):
+        r = etree.Element(_qn("w:r"))
+        if ref_rpr is not None:
+            r.append(copy.deepcopy(ref_rpr))
+        _set_run_text(r, text, as_del_text=as_del)
+        return r
+
+    # 先构造全部替换节点，再统一替换，避免边遍历边改动
+    new_nodes = []
+    for kind, text in pieces:
+        if kind == "equal":
+            new_nodes.append(_new_run(text, as_del=False))
+        elif kind == "del":
+            d = _make_del(author, date_str, rev_ids.next())
+            d.append(_new_run(text, as_del=True))
+            new_nodes.append(d)
+        else:  # ins
+            i = _make_ins(author, date_str, rev_ids.next())
+            i.append(_new_run(text, as_del=False))
+            new_nodes.append(i)
+
+    if not new_nodes:
+        return False
+
+    # 找到第一个非 pPr 子节点的位置，把旧内容整段替换掉
+    anchor = None
+    for child in list(p):
+        if child.tag != _qn("w:pPr"):
+            anchor = child
+            break
+
+    if anchor is None:
+        # 段落原本无内容（只有 pPr）→ 直接追加
+        for node in new_nodes:
+            p.append(node)
+        return True
+
+    anchor.addprevious(new_nodes[0])
+    prev = new_nodes[0]
+    for node in new_nodes[1:]:
+        prev.addnext(node)
+        prev = node
+
+    # 删除旧的内容节点（anchor 及其后所有非 pPr 子节点）
+    for child in list(p):
+        if child.tag == _qn("w:pPr"):
+            continue
+        if child in new_nodes:
+            continue
+        p.remove(child)
+
+    return True
+
+
+def _try_inline_replace(entries, target, i1, i2, j1, j2,
+                        author, date_str, rev_ids) -> list:
+    """尝试把 [i1,i2) 的原文段落与 [j1,j2) 的目标段落做**段落内**细粒度修订。
+
+    返回**已细化的 (原文下标, 目标下标) 列表**（可能为空）。
+    调用方据此精确跳过这些段落，把剩余部分交给整段替换。
+
+    一个 `replace` 区间里往往混着两类内容：真正被改动的段落，以及纯新增/纯删除
+    的段落（例如末尾追加一条新条款，会把前面几段也一起卷进同一个 replace）。
+    因此这里只对区间**首尾能一一对应的部分**做细化：
+
+    - 从区间头部开始，逐段配对，直到某一段不再满足细化条件；
+    - 从区间尾部继续逐段配对（处理「前面插了段落、后面才是改动」的情形）；
+    - 每次配对失败即停止，不做跳跃式配对，保证被细化的段落总是连续的。
+
+    单段满足以下全部条件才细化：
+    1. 原文段落必须是「纯 run 结构」——含书签/域/超链接等嵌套容器时，
+       重写段落内容会连带删掉这些结构，回退整段替换更稳妥；
+    2. 段落文本非空；
+    3. 字符级差异算得出来且未超 `_INLINE_FALLBACK_RATIO`。
+
+    比对以**段落全文**为单位：原段落文本 = 该段所有 run 的可见文本拼接；
+    段落内的 `<w:br/>`（软换行）会被 `_paragraph_text` 还原为 `\\n`，
+    因此带软换行的段落也能正确对齐。
+    """
+    n_old = i2 - i1
+    n_new = j2 - j1
+    if n_old <= 0 or n_new <= 0:
+        return False
+    # 显式整段删除不参与细化（那是明确的整段删除意图）
+    if any(target[j][0] == "delete" for j in range(j1, j2)):
+        return False
+
+    def _pair_is_inlinable(oi: int, tj: int):
+        """返回 (原文段, 片段列表) 或 None"""
+        p = entries[oi][0]
+        old_text = _paragraph_text(p)
+        new_text = target[tj][1]
+        if not old_text.strip() or not new_text.strip():
+            return None
+        if any(child.tag != _qn("w:pPr") and child.tag != _qn("w:r") for child in p):
+            return None
+        pieces = _inline_diff_runs(old_text, new_text)
+        if pieces is None:
+            return None
+        return (p, pieces)
+
+    # ── 头部逐段配对 ──
+    head = []          # [(原文下标, 目标下标, 原文段, 片段)]
+    n = min(n_old, n_new)
+    k = 0
+    while k < n:
+        oi, tj = i1 + k, j1 + k
+        got = _pair_is_inlinable(oi, tj)
+        if got is None:
+            break
+        head.append((oi, tj) + got)
+        k += 1
+
+    # ── 尾部逐段配对（不与头部重叠）──
+    tail = []
+    while k + len(tail) < n:
+        off = len(tail)
+        oi, tj = i2 - 1 - off, j2 - 1 - off
+        got = _pair_is_inlinable(oi, tj)
+        if got is None:
+            break
+        tail.append((oi, tj) + got)
+    tail.reverse()
+    plans = head + tail
+
+    handled = []
+    for oi, tj, p, pieces in plans:
+        if _replace_paragraph_inline(p, pieces, author, date_str, rev_ids):
+            handled.append((oi, tj))
+    # 返回**已细化的下标对**，调用方据此精确跳过这些段落，
+    # 只把剩余部分交给整段替换（头部与尾部都可能命中，不能用「前 n 段」近似）。
+    return handled
+
+
 def _diff_apply(entries, orig_texts, target, author, date_str, rev_ids) -> int:
-    """基于 LCS 的段落级差异应用（保证格式继承自相邻原文段落）"""
+    """基于 LCS 的差异应用：段落级对齐 + 段落内字符级细化。
+
+    段落级：用 difflib 对齐原文段落与目标段落，判定 equal/replace/insert/delete。
+    段落内：replace 区间内若**原文段数与目标段数一一对应**，则对每对段落做
+    字符级对齐，只标注真正改动的词句（`_replace_paragraph_inline`）；
+    对不上（整段新增/删除/行数变化）或差异过大时，回退为原有的
+    「整段删除 + 整段新增」，保证语义与既有行为一致。
+    """
     import difflib
 
     target_texts = [_normalize(t[1]) for t in target]
@@ -527,7 +748,40 @@ def _diff_apply(entries, orig_texts, target, author, date_str, rev_ids) -> int:
         if tag == "equal":
             continue
         if tag in ("replace", "delete_marked"):
-            # 原文段落删除 + 新段落插入。
+            # ── 优先尝试段落内字符级细化 ──
+            # 只标注真正改动的词句，段落本身保持不动。
+            # 区间首尾能一一对应的段落会就地细化；返回细化成功的段数 n_inlined，
+            # 这些段落已处理完毕，剩余部分（纯新增/纯删除/差异过大）继续走
+            # 下面的「整段删除 + 整段新增」回退路径。
+            n_inlined = _try_inline_replace(entries, target, i1, i2, j1, j2,
+                                            author, date_str, rev_ids)
+            if n_inlined:
+                changes += len(n_inlined)
+                # 已细化的段落就地改好了，从剩余区间里剔除；
+                # 头部与尾部都可能命中，逐个排除比「收缩前缀」更精确。
+                done_old = {oi for oi, _ in n_inlined}
+                done_new = {tj for _, tj in n_inlined}
+                rest_old = [k for k in range(i1, i2) if k not in done_old]
+                rest_new = [k for k in range(j1, j2) if k not in done_new]
+                if not rest_old and not rest_new:
+                    continue
+                # 剩余部分必须仍是连续区间才走整段替换；否则放弃（保守）。
+                if (rest_old and rest_old != list(range(rest_old[0], rest_old[-1] + 1))) or \
+                   (rest_new and rest_new != list(range(rest_new[0], rest_new[-1] + 1))):
+                    logger.warning("细化后剩余段落不连续，跳过回退处理（保守）")
+                    continue
+                if rest_old:
+                    i1, i2 = rest_old[0], rest_old[-1] + 1
+                else:
+                    i1 = i2
+                if rest_new:
+                    j1, j2 = rest_new[0], rest_new[-1] + 1
+                else:
+                    j1 = j2
+                if i1 >= i2 and j1 >= j2:
+                    continue
+
+            # ── 回退：整段删除 + 整段新增 ──
             # 注意：格式模板必须取自**被替换的原文段落**，而不是其前一段，
             # 否则新增内容会继承错误的字体/缩进（例如把正文格式套到标题上）。
             kind = _kind_of(target, j1, j2)
