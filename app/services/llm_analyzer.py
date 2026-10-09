@@ -16,29 +16,32 @@ logger = logging.getLogger(__name__)
 # 优先从项目根目录的 LLM提示词模板.md 读取，不存在时使用内嵌模板
 _PROMPT_FILE = None  # 缓存文件路径
 
-# ── 文书类型清单（文件驱动） ──
-# 从项目根目录的 文书类型.conf 读取；文件缺失时回退内置默认清单
-_DOC_TYPES_FILE = None  # 缓存文件路径
+# ── 文书类型清单（文件驱动：以 分析提示词/ 下的文件种类为准） ──
+# 目录下每个 `.md` 文件即一个文书类型，**文件名（去扩展名）即类型名**：
+# 增删提示词文件即增删文书类型，代码中不维护任何文书类型清单
+# （避免清单多处维护、新增类型漏同步）。
+_PROMPT_DIR = None  # 缓存目录路径
 
-# 内置默认文书类型（仅当 文书类型.conf 缺失或为空时使用）
-_DEFAULT_DOC_TYPES = [
-    "合同协议", "起诉状", "判决书", "裁定书", "传票",
-    "律师函", "证据材料", "通知书", "其他法律文书", "非法律文书",
-]
-
-# 系统兜底类型：无论配置文件如何，均强制包含
+# 系统固定类型：不受提示词文件增删影响，始终存在
+# - 其他法律文书：未匹配到专属流程时的兜底提示词锚点
+# - 非法律文书：识别后跳过分析阶段的控制值，不需要提示词文件
 _FALLBACK_DOC_TYPES = ("其他法律文书", "非法律文书")
 
-# ── 类型能力标记（在 文书类型.conf 的类型行行尾以 `#标记` 声明）──
-# 是否生成修改版文书 / 审查意见，**只由 文书类型.conf 决定**，
-# 代码中不再维护任何文书类型清单（避免清单多处维护、新增类型漏同步）。
+# ── 类型能力标记（在提示词文件头部的 `caps:` 行声明，见 _split_prompt_header）──
+# 是否生成修改版文书 / 审查意见，**只由提示词文件头部决定**。
 CAP_REVISION = "修订"   # 生成「修改版文书.docx」
 CAP_REVIEW = "审查"     # 生成审查意见.docx
 CAP_CONTRACT = "合同"   # 审查意见使用「合同审核意见模板」（合同专用字段），否则用律师审查意见模板
 
 _CAPABILITY_MARKERS = frozenset({CAP_REVISION, CAP_REVIEW, CAP_CONTRACT})
 
-# 类型 → 能力集合 的缓存（key 为 conf 文件的 mtime+size，文件变更自动失效）
+# 头部块分隔行
+_PROMPT_HEADER_DELIM = "---"
+
+# 类型 → 能力集合 的缓存。
+# ⚠️ 缓存键必须覆盖**每个提示词文件的内容指纹**（名 + mtime + size）：
+# 能力声明在文件内容里，而目录自身的 mtime 只在增删文件时才变，
+# 仅凭目录 mtime 会导致「编辑 caps 后不生效」的静默问题。
 _doc_type_caps_cache: tuple | None = None
 
 # 第一阶段类型识别的输出预算下限。
@@ -57,88 +60,145 @@ _MCP_USAGE_INSTRUCTION = """## 法律检索工具（MCP）
 """
 
 
-def _parse_doc_type_line(raw: str) -> tuple[str, frozenset]:
-    """解析 文书类型.conf 的一行，返回 (类型名, 能力集合)。
+def _split_prompt_header(text: str) -> tuple[str, str]:
+    """拆分提示词文件的头部元数据与正文，返回 (caps 原文, 正文)。
 
-    行格式：``类型名 [#标记 ...]``。标记可紧跟类型名（无空格），也可是多个。
-    以 ``#`` 开头的整行是注释，由调用方过滤。
-    未识别的标记会被忽略（不报错），避免因笔误导致类型丢失。
+    头部格式（可选，须位于文件开头）::
+
+        ---
+        caps: 修订, 审查
+        ---
+        ### 某类文书专属分析流程
+        ...
+
+    头部用于声明该文书类型的能力（修订/审查/合同）；无头部时 caps 为空串。
+    返回的正文**不含头部**——提示词会被原样嵌入 LLM 请求，元数据不得泄漏进去。
+    未闭合的头部（缺结尾 ``---``）视为无头部，避免误吞正文。
     """
-    line = (raw or "").strip()
-    if not line or line.startswith("#"):
-        return "", frozenset()
+    lines = text.split("\n")
+    # 跳过前置空行，头部必须以 --- 行开头
+    idx = 0
+    while idx < len(lines) and not lines[idx].strip():
+        idx += 1
+    if idx >= len(lines) or lines[idx].strip() != _PROMPT_HEADER_DELIM:
+        return "", text
 
-    name, _, marker_part = line.partition("#")
-    name = name.strip()
-    if not name:
-        return "", frozenset()
+    j = idx + 1
+    header_lines: list[str] = []
+    while j < len(lines) and lines[j].strip() != _PROMPT_HEADER_DELIM:
+        header_lines.append(lines[j])
+        j += 1
+    if j >= len(lines):
+        return "", text  # 头部未闭合，按无头部处理
 
+    caps_raw = ""
+    for line in header_lines:
+        key, sep, value = line.partition(":")
+        if sep and key.strip().lower() == "caps":
+            caps_raw = value.strip()
+            break
+    return caps_raw, "\n".join(lines[j + 1:])
+
+
+def _parse_caps(raw: str, doc_type: str = "") -> frozenset:
+    """解析头部 caps 值，返回能力集合（CAP_REVISION / CAP_REVIEW / CAP_CONTRACT 的子集）。
+
+    分隔符支持中英文逗号、顿号、分号与空白；未识别的标记记 WARNING 后忽略，
+    以免笔误（如「修仃」）导致能力静默丢失。
+    """
     caps = set()
-    for token in re.split(r"[\s#]+", marker_part.strip()):
+    for token in re.split(r"[\s,，、;；#]+", (raw or "").strip()):
         token = token.strip()
+        if not token:
+            continue
         if token in _CAPABILITY_MARKERS:
             caps.add(token)
-    return name, frozenset(caps)
+        else:
+            logger.warning(
+                f"文书类型「{doc_type or '未知'}」的 caps 含未识别标记「{token}」，已忽略"
+            )
+    return frozenset(caps)
+
+
+def _prompt_files() -> list:
+    """返回 分析提示词/ 下的 `.md` 文件路径列表（按文件名排序，保证类型顺序可复现）。"""
+    from app.config import BASE_DIR
+    global _PROMPT_DIR
+    if _PROMPT_DIR is None:
+        _PROMPT_DIR = BASE_DIR / "分析提示词"
+    if not _PROMPT_DIR.is_dir():
+        return []
+    try:
+        return sorted(_PROMPT_DIR.glob("*.md"), key=lambda p: p.name)
+    except OSError as e:
+        logger.error(f"扫描 分析提示词/ 目录失败: [{type(e).__name__}] {e}")
+        return []
 
 
 def _load_doc_type_caps() -> dict[str, frozenset]:
-    """读取 文书类型.conf，返回 {类型名: 能力集合}（保持文件中的顺序）。
+    """扫描 分析提示词/*.md，返回 {类型名: 能力集合}。
 
-    内置兜底类型（其他法律文书/非法律文书）无论文件是否包含都会补齐。
-    文件读取失败或为空时回退内置清单，此时所有类型均无能力标记。
-    结果按文件 mtime+size 缓存，修改 conf 后无需重启即生效。
+    类型名 = 文件名去扩展名；能力 = 文件头部 caps 声明（无头部即无能力）。
+    顺序：非系统类型按文件名排序在前，系统固定类型（_FALLBACK_DOC_TYPES）置尾，
+    保证候选清单顺序稳定可复现（不随文件系统枚举顺序变化）。
+    目录缺失或没有 .md 文件时仅返回系统固定类型并记录错误——此时提示词也不存在，
+    主模板的通用兜底说明会接管（见 LLM提示词模板.md 步骤一）。
+    结果按各提示词文件的 (名, mtime_ns, size) 缓存：增删文件或修改内容均自动失效。
     """
-    global _DOC_TYPES_FILE, _doc_type_caps_cache
-    if _DOC_TYPES_FILE is None:
-        from app.config import BASE_DIR
-        _DOC_TYPES_FILE = BASE_DIR / "文书类型.conf"
+    global _doc_type_caps_cache
 
-    # 缓存键：文件 mtime + size（文件不存在时为 None）
-    try:
-        st = _DOC_TYPES_FILE.stat()
-        cache_key = (str(_DOC_TYPES_FILE), st.st_mtime_ns, st.st_size)
-    except OSError:
-        cache_key = (str(_DOC_TYPES_FILE), None, None)
+    files = _prompt_files()
+    key_parts = []
+    for p in files:
+        try:
+            st = p.stat()
+            key_parts.append((p.name, st.st_mtime_ns, st.st_size))
+        except OSError:
+            key_parts.append((p.name, None, None))
+    cache_key = (str(_PROMPT_DIR), tuple(key_parts))
 
     if _doc_type_caps_cache and _doc_type_caps_cache[0] == cache_key:
         return _doc_type_caps_cache[1]
 
-    caps_map: dict[str, frozenset] = {}
-    try:
-        if _DOC_TYPES_FILE.exists():
-            text = _DOC_TYPES_FILE.read_text(encoding="utf-8")
-            for line in text.splitlines():
-                name, caps = _parse_doc_type_line(line)
-                if name and name not in caps_map:
-                    caps_map[name] = caps
-    except Exception as e:
-        logger.error(f"读取 文书类型.conf 失败: [{type(e).__name__}] {e}")
+    scanned: dict[str, frozenset] = {}
+    for p in files:
+        name = p.stem
+        try:
+            text = p.read_text(encoding="utf-8").lstrip("\ufeff")
+        except Exception as e:
+            logger.error(f"读取分析提示词 {p.name} 失败: [{type(e).__name__}] {e}")
+            scanned.setdefault(name, frozenset())
+            continue
+        caps_raw, _body = _split_prompt_header(text)
+        scanned[name] = _parse_caps(caps_raw, name)
 
-    if not caps_map:
-        logger.error("文书类型.conf 不存在或为空，使用内置默认文书类型清单")
-        caps_map = {name: frozenset() for name in _DEFAULT_DOC_TYPES}
+    if not scanned:
+        logger.error("分析提示词/ 目录不存在或没有 .md 文件，文书类型清单仅含系统固定类型")
+        caps_map: dict[str, frozenset] = {}
     else:
-        # 自动补齐系统兜底类型
-        for fb in _FALLBACK_DOC_TYPES:
-            caps_map.setdefault(fb, frozenset())
+        caps_map = {name: scanned[name] for name in sorted(scanned)
+                    if name not in _FALLBACK_DOC_TYPES}
+    # 系统固定类型始终可用（补齐缺失者）
+    for fb in _FALLBACK_DOC_TYPES:
+        caps_map[fb] = scanned.get(fb, frozenset())
 
     _doc_type_caps_cache = (cache_key, caps_map)
     return caps_map
 
 
 def _get_doc_types() -> list:
-    """获取文书类型清单：从 文书类型.conf 读取（每行一个类型），缺失时回退内置默认。
+    """获取文书类型清单：以 分析提示词/ 下的 .md 文件种类为准。
 
-    系统兜底类型（其他法律文书/非法律文书）无论配置文件是否包含都会自动补齐。
+    系统固定类型（其他法律文书/非法律文书）无论目录如何都会补齐。
     """
     return list(_load_doc_type_caps().keys())
 
 
 def get_doc_type_capabilities(doc_type: str | None) -> frozenset:
-    """获取某文书类型的能力集合（来自 文书类型.conf 的行尾标记）。
+    """获取某文书类型的能力集合（来自该类型提示词文件头部的 caps 声明）。
 
     返回值是 CAP_REVISION / CAP_REVIEW / CAP_CONTRACT 的子集。
-    未知类型（不在 conf 中）返回空集合——即不生成修改版，也不生成审查意见。
+    未知类型（无对应提示词文件）返回空集合——即不生成修改版，也不生成审查意见。
     """
     name = (doc_type or "").strip()
     if not name:
@@ -147,23 +207,24 @@ def get_doc_type_capabilities(doc_type: str | None) -> frozenset:
 
 
 def should_generate_revision(doc_type: str | None) -> bool:
-    """该类型是否应生成修改版文书（由 文书类型.conf 的 #修订 标记决定）"""
+    """该类型是否应生成修改版文书（由提示词文件头部的 caps: 修订 决定）"""
     return CAP_REVISION in get_doc_type_capabilities(doc_type)
 
 
 def should_generate_review(doc_type: str | None) -> bool:
-    """该类型是否应生成审查意见（由 文书类型.conf 的 #审查 标记决定）"""
+    """该类型是否应生成审查意见（由提示词文件头部的 caps: 审查 决定）"""
     return CAP_REVIEW in get_doc_type_capabilities(doc_type)
 
 
 def is_contract_type(doc_type: str | None) -> bool:
-    """该类型是否使用合同审核意见模板（由 文书类型.conf 的 #合同 标记决定）"""
+    """该类型是否使用合同审核意见模板（由提示词文件头部的 caps: 合同 决定）"""
     return CAP_CONTRACT in get_doc_type_capabilities(doc_type)
 
 
 def _get_doc_analysis_prompt(doc_type: str) -> str:
     """获取指定文书类型的分析流程提示词：读取 分析提示词/<类型>.md。
 
+    返回**已剥离头部元数据**的正文（头部仅用于声明能力，不得进入 LLM 请求）。
     文件不存在时回退到「其他法律文书」的提示词；目录缺失或读取失败返回空串。
     """
     from app.config import BASE_DIR
@@ -180,9 +241,10 @@ def _get_doc_analysis_prompt(doc_type: str) -> str:
         p = base / f"{candidate}.md"
         try:
             if p.exists():
-                text = p.read_text(encoding="utf-8")
-                if text.strip():
-                    return text
+                text = p.read_text(encoding="utf-8").lstrip("\ufeff")
+                _caps, body = _split_prompt_header(text)
+                if body.strip():
+                    return body
         except Exception as e:
             logger.error(f"读取分析提示词 {candidate}.md 失败: [{type(e).__name__}] {e}")
     logger.warning(f"文书类型「{name}」无对应分析提示词且无兜底文件")
@@ -273,7 +335,7 @@ def build_prompt(subject: str, sender: str, body: str, custom_prompt: str = "",
     analysis_instructions 为按文书类型读取的分析流程提示词，嵌入主模板的
     {analysis_instructions} 占位符位置；为空时占位符被替换为空串。
 
-    doc_type 决定该类型是否输出修订内容（由 文书类型.conf 的 #修订 标记决定）：
+    doc_type 决定该类型是否输出修订内容（由提示词文件头部的 caps: 修订 决定）：
     可修订类型渲染「生成修改版文书」章节，其余类型渲染为「无需修订」的说明，
     避免提示词要求模型输出代码随后会丢弃的字段。
     """
@@ -365,7 +427,7 @@ async def analyze_email(
     analysis_instructions: 按文书类型读取的分析流程提示词，嵌入主模板 {analysis_instructions} 占位符。
 
     doc_type: 第一阶段识别出的文书类型，决定是否要求模型输出 revised_document
-              （由 文书类型.conf 的 #修订 标记决定）。
+              （由提示词文件头部的 caps: 修订 决定）。
 
     mcp_servers: MCP 服务器配置（list of {name,url,headers} 或兼容形态）。非空时启用 MCP 工具
                  调用循环（如北大法宝法规检索），模型可实时查法规并在报告/修改版文书末尾附引用链接。
@@ -657,7 +719,7 @@ def build_classify_prompt(subject: str, sender: str, body: str,
                           custom_prompt: str = "") -> str:
     """构建文书类型识别 prompt（第一阶段）。
 
-    候选类型来自 文书类型.conf 配置清单；仅要求 LLM 返回类型与置信度。
+    候选类型来自 分析提示词/ 目录下的文件清单；仅要求 LLM 返回类型与置信度。
     custom_prompt 为空时使用默认分类模板，支持 {subject}/{sender}/{body}/{doc_types}/{today} 占位符。
     """
     if not today_str:

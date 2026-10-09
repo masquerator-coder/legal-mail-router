@@ -39,8 +39,9 @@ _check_progress = {
     "started_at": None,   # 开始时间 ISO
 }
 
-# 文书类型能力（#修订 / #审查 / #合同）统一由 文书类型.conf 声明，
-# 代码中不再维护任何文书类型清单 —— 见 app/services/llm_analyzer.py 的
+# 文书类型能力（修订 / 审查 / 合同）统一由 分析提示词/<类型>.md 的文件头部声明，
+# 文书类型清单也以该目录下的文件种类为准，代码中不维护任何文书类型清单 ——
+# 见 app/services/llm_analyzer.py 的
 # should_generate_revision / should_generate_review / is_contract_type。
 
 
@@ -680,7 +681,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
             all_llm_failed = True
 
         # 修改版文书生成（逐组）——使用单阶段 LLM 输出的 revised_document
-        # 是否可修订由 文书类型.conf 的 #修订 标记决定
+        # 是否可修订由提示词文件头部的 caps: 修订 决定
         from app.services.llm_analyzer import should_generate_revision
         if (ctx.get("revision_enabled")
                 and not g_failed
@@ -764,7 +765,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
                 logger.error(f"修改版文书生成失败({group_label}): [{type(e).__name__}] {e}")
 
         # 审查意见模板生成（逐组）
-        # 是否出具由 文书类型.conf 的 #审查 标记决定；
+        # 是否出具由提示词文件头部的 caps: 审查 决定；
         # 模板按 #合同 标记分派：合同类用「合同审核意见模板」，其余用「律师审查意见模板」。
         from app.services.llm_analyzer import should_generate_review, is_contract_type
         if (ctx.get("review_template_enabled")

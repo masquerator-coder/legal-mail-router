@@ -12,6 +12,10 @@ services:
       # 注意：容器以非 root 用户 (uid 10001) 运行，宿主 data/ 需可写：
       #   chown -R 10001:10001 data/
       - ./data:/app/data
+      # 提示词目录挂载为只读：宿主增删 分析提示词/*.md 即增删文书类型，
+      # 无需重建镜像（容器内仅读取该目录）。
+      # 注意：若宿主该目录为空，文书类型清单将只剩系统固定类型。
+      - ./分析提示词:/app/分析提示词:ro
     environment:
       - TZ=Asia/Shanghai
       - PORT=${PORT:-8020}

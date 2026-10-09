@@ -41,7 +41,6 @@ COPY app/ ./app/
 COPY templates/ ./templates/
 COPY static/ ./static/
 COPY LLM提示词模板.md ./
-COPY 文书类型.conf ./
 COPY 分析提示词/ ./分析提示词/
 
 # 创建数据目录并以非 root 用户运行（降低容器被攻破后的影响面）

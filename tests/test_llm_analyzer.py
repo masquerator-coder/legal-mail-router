@@ -782,59 +782,78 @@ class TestTwoStageClassifyFailure:
         assert captured["max_tokens"] == 2048
 
 
-class TestDocTypeCapabilities:
-    """类型能力标记解析（文书类型.conf 是唯一事实来源）"""
+class TestPromptHeaderParsing:
+    """提示词文件头部解析（caps 声明是能力的唯一事实来源）"""
 
-    def test_parse_plain_type(self):
-        """无标记的行 → 类型名 + 空能力集合"""
-        assert m._parse_doc_type_line("判决书") == ("判决书", frozenset())
+    def test_no_header_returns_whole_text(self):
+        """无头部 → caps 为空，正文原样返回"""
+        caps, body = m._split_prompt_header("### 标题\n正文")
+        assert caps == ""
+        assert body == "### 标题\n正文"
 
-    def test_parse_single_marker(self):
-        name, caps = m._parse_doc_type_line("合同协议  #修订")
-        assert name == "合同协议"
-        assert caps == frozenset({m.CAP_REVISION})
+    def test_header_split(self):
+        caps, body = m._split_prompt_header("---\ncaps: 修订, 审查\n---\n### 标题\n正文")
+        assert caps == "修订, 审查"
+        assert body == "### 标题\n正文"
+        assert "caps" not in body and "---" not in body
 
-    def test_parse_multiple_markers(self):
-        name, caps = m._parse_doc_type_line("合同协议   #修订 #审查 #合同")
-        assert name == "合同协议"
-        assert caps == frozenset({m.CAP_REVISION, m.CAP_REVIEW, m.CAP_CONTRACT})
+    def test_header_allows_leading_blank_lines(self):
+        caps, body = m._split_prompt_header("\n\n---\ncaps: 审查\n---\n正文")
+        assert caps == "审查"
+        assert body == "正文"
 
-    def test_parse_marker_without_space(self):
-        """# 紧跟类型名也应识别"""
-        name, caps = m._parse_doc_type_line("合同协议#修订")
-        assert name == "合同协议"
-        assert caps == frozenset({m.CAP_REVISION})
+    def test_unclosed_header_treated_as_no_header(self):
+        """未闭合的头部不得吞掉正文"""
+        text = "---\ncaps: 修订\n### 标题\n正文"
+        caps, body = m._split_prompt_header(text)
+        assert caps == ""
+        assert body == text
 
-    def test_parse_comment_line(self):
-        """整行注释 → 空类型"""
-        assert m._parse_doc_type_line("# 这是注释 #修订") == ("", frozenset())
+    def test_internal_delimiter_not_header(self):
+        """正文中间的 --- 不构成头部（头部须在文件开头）"""
+        text = "### 标题\n---\ncaps: 修订\n---\n正文"
+        caps, body = m._split_prompt_header(text)
+        assert caps == ""
+        assert body == text
 
-    def test_parse_blank_line(self):
-        assert m._parse_doc_type_line("   ") == ("", frozenset())
-        assert m._parse_doc_type_line("") == ("", frozenset())
+    def test_header_without_caps_key(self):
+        caps, body = m._split_prompt_header("---\nfoo: bar\n---\n正文")
+        assert caps == ""
+        assert body == "正文"
 
-    def test_parse_unknown_marker_ignored(self):
-        """未识别的标记被忽略，但类型名仍保留（笔误不导致类型丢失）"""
-        name, caps = m._parse_doc_type_line("起诉状  #修订 #拼错的标记")
-        assert name == "起诉状"
-        assert caps == frozenset({m.CAP_REVISION})
+    def test_parse_caps_various_separators(self):
+        for raw in ("修订, 审查", "修订，审查", "修订、审查", "修订 审查", "修订;审查"):
+            assert m._parse_caps(raw) == frozenset({m.CAP_REVISION, m.CAP_REVIEW}), raw
+
+    def test_parse_caps_empty(self):
+        assert m._parse_caps("") == frozenset()
+        assert m._parse_caps("   ") == frozenset()
+
+    def test_parse_caps_unknown_marker_ignored(self):
+        """未识别标记被忽略（笔误不导致已识别能力丢失）"""
+        caps = m._parse_caps("修订, 拼错的标记, 合同")
+        assert caps == frozenset({m.CAP_REVISION, m.CAP_CONTRACT})
+
+    def test_parse_caps_all_three(self):
+        assert m._parse_caps("修订, 审查, 合同") == frozenset(
+            {m.CAP_REVISION, m.CAP_REVIEW, m.CAP_CONTRACT})
 
     def test_unknown_doc_type_has_no_capabilities(self):
-        """不在 conf 中的类型 → 无任何能力（保守：不生成修改版与审查意见）"""
+        """无对应提示词文件的类型 → 无任何能力（保守：不生成修改版与审查意见）"""
         assert m.get_doc_type_capabilities("不存在的类型") == frozenset()
         assert m.get_doc_type_capabilities(None) == frozenset()
         assert m.get_doc_type_capabilities("") == frozenset()
 
     def test_fallback_types_always_present(self):
-        """兜底类型无论 conf 是否包含都会补齐"""
+        """系统固定类型无论目录如何都会补齐"""
         types = m._get_doc_types()
         for fb in m._FALLBACK_DOC_TYPES:
             assert fb in types
         assert "其他法律文书" in types,"兜底类型应始终可用"
 
 
-class TestRealConfCapabilities:
-    """针对当前仓库 文书类型.conf 的回归（防止新增类型漏配标记）"""
+class TestRealPromptDirCapabilities:
+    """针对当前仓库 分析提示词/ 目录的回归（防止新增类型漏配 caps 声明）"""
 
     def test_contract_is_revisable_and_contract_review(self):
         assert m.should_generate_revision("合同协议") is True
@@ -854,7 +873,7 @@ class TestRealConfCapabilities:
             assert m.should_generate_review(t) is True, t
 
     def test_non_contract_review_uses_civil_template(self):
-        """非合同类型有 #审查 但无 #合同 → 用律师审查意见模板"""
+        """非合同类型有 caps: 审查 但无 合同 → 用律师审查意见模板"""
         for t in ("起诉状", "律师函", "政府信息公开", "履职申请", "信访件",
                   "咨询", "投诉举报", "其他法律文书", "通知书"):
             assert m.should_generate_review(t) is True, t
@@ -865,6 +884,92 @@ class TestRealConfCapabilities:
         import app.services.scheduler as sched
         assert not hasattr(sched, "REVISION_CANDIDATE_TYPES")
         assert not hasattr(sched, "_should_generate_revision")
+
+    def test_type_list_equals_prompt_files_plus_system_types(self):
+        """类型清单 = 分析提示词/*.md 文件名 ∪ 系统固定类型（目录即事实来源）"""
+        from app.config import BASE_DIR
+        from_dir = {p.stem for p in (BASE_DIR / "分析提示词").glob("*.md")}
+        expected = from_dir | set(m._FALLBACK_DOC_TYPES)
+        assert set(m._get_doc_types()) == expected
+        # 目录中的每个类型都必须有自己的专属提示词（不回退兜底）
+        for name in from_dir - {"其他法律文书"}:
+            prompt = _get_doc_analysis_prompt(name)
+            assert prompt and "专属分析流程(兜底)" not in prompt, name
+
+    def test_header_never_leaks_into_prompt(self):
+        """头部 caps 元数据不得进入送交 LLM 的提示词"""
+        for name in m._get_doc_types():
+            prompt = _get_doc_analysis_prompt(name)
+            assert prompt, name
+            assert "caps:" not in prompt, name
+            assert not prompt.lstrip().startswith("---"), name
+
+    def test_system_types_ordered_last(self):
+        """系统固定类型置尾，候选清单顺序稳定可复现"""
+        types = m._get_doc_types()
+        tail = types[-len(m._FALLBACK_DOC_TYPES):]
+        assert tail == list(m._FALLBACK_DOC_TYPES)
+
+
+class TestPromptDirDrivenTypes:
+    """类型清单随 分析提示词/ 目录变化（增删文件即增删类型、caps 改动即时生效）"""
+
+    @pytest.fixture
+    def temp_prompt_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(m, "_PROMPT_DIR", tmp_path)
+        monkeypatch.setattr(m, "_doc_type_caps_cache", None)
+        return tmp_path
+
+    def _write(self, d, name, caps=None, body="### 正文"):
+        text = (f"---\ncaps: {caps}\n---\n{body}" if caps is not None else body)
+        (d / f"{name}.md").write_text(text, encoding="utf-8")
+
+    def test_new_file_adds_type(self, temp_prompt_dir):
+        self._write(temp_prompt_dir, "测试类型", caps="修订")
+        assert "测试类型" in m._get_doc_types()
+        assert m.should_generate_revision("测试类型") is True
+        assert m.should_generate_review("测试类型") is False
+
+    def test_removed_file_removes_type(self, temp_prompt_dir):
+        self._write(temp_prompt_dir, "临时类型", caps="审查")
+        assert "临时类型" in m._get_doc_types()
+        (temp_prompt_dir / "临时类型.md").unlink()
+        assert "临时类型" not in m._get_doc_types()
+        assert m.get_doc_type_capabilities("临时类型") == frozenset()
+
+    def test_caps_edit_takes_effect_without_file_count_change(self, temp_prompt_dir):
+        """⚠️ 关键回归：仅改内容（增删文件数不变）也必须让缓存失效。
+
+        目录 mtime 只在增删文件时变化，若缓存键只看目录 mtime，
+        编辑 caps 将静默不生效。
+        """
+        self._write(temp_prompt_dir, "改能力", caps="审查")
+        assert m.should_generate_revision("改能力") is False
+        # 同一文件改写内容，文件数量不变
+        self._write(temp_prompt_dir, "改能力", caps="修订, 审查")
+        assert m.should_generate_revision("改能力") is True
+        assert m.should_generate_review("改能力") is True
+
+    def test_empty_dir_yields_system_types_only(self, temp_prompt_dir):
+        assert m._get_doc_types() == list(m._FALLBACK_DOC_TYPES)
+
+    def test_missing_dir_yields_system_types_only(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(m, "_PROMPT_DIR", tmp_path / "不存在")
+        monkeypatch.setattr(m, "_doc_type_caps_cache", None)
+        assert m._get_doc_types() == list(m._FALLBACK_DOC_TYPES)
+
+    def test_no_header_means_no_capabilities(self, temp_prompt_dir):
+        self._write(temp_prompt_dir, "无头部")
+        assert "无头部" in m._get_doc_types()
+        assert m.get_doc_type_capabilities("无头部") == frozenset()
+
+    def test_non_md_files_ignored(self, temp_prompt_dir):
+        self._write(temp_prompt_dir, "正式")
+        (temp_prompt_dir / "笔记.txt").write_text("caps: 修订", encoding="utf-8")
+        (temp_prompt_dir / "备份.md.bak").write_text("caps: 修订", encoding="utf-8")
+        assert "正式" in m._get_doc_types()
+        assert "笔记" not in m._get_doc_types()
+        assert "备份" not in m._get_doc_types()
 
 
 class TestRevisionSectionByType:
@@ -912,9 +1017,10 @@ class TestRevisionSectionByType:
         assert "自定义模板" in prompt
         assert "生成修改版文书" in prompt
 
-    def test_classify_prompt_unaffected_by_markers(self):
-        """类型识别候选清单：标记不应进入 {doc_types} 列表"""
+    def test_classify_prompt_unaffected_by_caps(self):
+        """类型识别候选清单：caps 能力声明不应进入 {doc_types} 列表"""
         prompt = build_classify_prompt(subject="s", sender="a@b.c", body="b")
+        assert "caps:" not in prompt
         assert "#修订" not in prompt
         assert "#审查" not in prompt
         for t in ("合同协议", "判决书", "政府信息公开", "信访件"):

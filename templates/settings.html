@@ -275,7 +275,7 @@
                        class="form-control" style="width:480px;"
                        placeholder="templates/合同审核意见模板.docx">
                 <div class="form-hint">
-                    相对于项目根目录的路径。适用于在 <code>文书类型.conf</code> 中标记了 <code>#合同</code> 的文书类型。
+                    相对于项目根目录的路径。适用于在「分析提示词」目录下该类型的 .md 文件头部声明了 <code>caps: 合同</code> 的文书类型。
                     模板需为 .docx 格式，其中的 xxx 将被替换为实际信息。
                     模板示例：<br>
                     P1: "...收到<b>xxx</b>发来的拟与<b>xxx</b>签订的《<b>xxx</b>》。合同内容为<b>xxx</b>事宜。合同价款<b>xxx</b>元。"<br>
@@ -290,7 +290,8 @@
                        class="form-control" style="width:480px;"
                        placeholder="templates/律师审核意见模板.docx">
                 <div class="form-hint">
-                    适用于标记了 <code>#审查</code> 但未标记 <code>#合同</code> 的文书类型
+                    适用于在「分析提示词」目录下该类型的 .md 文件头部声明了 <code>caps: 审查</code>、
+                    但未声明 <code>合同</code> 的文书类型
                     （起诉状、律师函、政府信息公开、信访件等）。
                     模板文件不存在时该类型跳过生成并记录日志，不影响其他类型。
                 </div>
