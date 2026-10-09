@@ -185,8 +185,12 @@ def _clone_run_shell(run):
     return new_run
 
 
-def _set_run_text(run, text: str, as_del_text: bool = False):
-    """设置 run 的文本（整段设置，不做字符切分）"""
+def _set_run_text(run, text: str, as_del_text: bool = False, tabs: int = 0, brs: int = 0):
+    """设置 run 的文本（整段设置，不做字符切分）。
+
+    tabs / brs 为该 run 中 <w:tab/> 与 <w:br/> 的数量：它们不是文本节点，
+    删除整段时若不补回，段落标记删除后残留的制表位/换行会串到合并后的相邻段落。
+    """
     from lxml import etree
     # 清掉可能已存在的文本节点
     for t in run.findall(_qn("w:t")):
@@ -214,13 +218,52 @@ def _set_run_text(run, text: str, as_del_text: bool = False):
     else:
         t.text = text
 
+    for _ in range(max(0, int(tabs or 0))):
+        etree.SubElement(run, _qn("w:tab"))
+    for _ in range(max(0, int(brs or 0))):
+        etree.SubElement(run, _qn("w:br"))
+
+
+def _iter_paragraph_runs(p):
+    """按文档顺序取出段落内所有 run，包含嵌套在 w:hyperlink / w:smartTag /
+    w:sdt 等容器里的 run。
+
+    只取 <w:p> 的直接子节点会漏掉超链接内的文本 —— 那部分内容不会被包进
+    <w:del>，表现为「模型要求删除该段，但链接文字仍留在正文且无修订标记」。
+    """
+    return [el for el in p.iter() if el.tag == _qn("w:r")]
+
+
+def _run_visible_text(r) -> str:
+    """run 的可见文本（w:t 与 w:delText）"""
+    parts = []
+    for t in r:
+        if t.tag in (_qn("w:t"), _qn("w:delText")):
+            parts.append(t.text or "")
+    return "".join(parts)
+
+
+def _run_tab_count(r) -> int:
+    """run 内 <w:tab/> 的数量（制表位不是文本节点，需单独搬移）"""
+    return sum(1 for c in r if c.tag == _qn("w:tab"))
+
+
+def _run_br_count(r) -> int:
+    """run 内 <w:br/> 的数量（段内软换行同样不是文本节点）"""
+    return sum(1 for c in r if c.tag == _qn("w:br"))
+
 
 def _first_run(p):
-    """取段落的第一个 run（作为格式模板）"""
+    """取段落的第一个 run（作为格式模板）。
+
+    优先直接子节点；整段都在超链接/内容控件里时回退到嵌套 run，
+    否则新增段落拿不到字体模板（会退化成默认格式）。
+    """
     for child in p:
         if child.tag == _qn("w:r"):
             return child
-    return None
+    nested = _iter_paragraph_runs(p)
+    return nested[0] if nested else None
 
 
 def _strip_paragraph_content(p):
@@ -524,16 +567,31 @@ def _diff_apply(entries, orig_texts, target, author, date_str, rev_ids) -> int:
                 if _delete_paragraph(entries[k][0], author, date_str, rev_ids):
                     changes += 1
         elif tag == "insert":
-            anchor_p = entries[i1 - 1][0] if i1 - 1 >= 0 else (entries[0][0] if entries else None)
+            # 插入锚点：i1 == 0 表示插在文档最前面，此时没有「前一段」可作锚点，
+            # 必须让 anchor_p 为 None，走下面的 addprevious 分支插到第一段之前。
+            # 若沿用旧的钳位写法（退化为 entries[0]），插入点变成「第一段之后」，
+            # 会把新增的前置条款放到错误位置。
+            anchor_p = entries[i1 - 1][0] if i1 >= 1 else None
             kind = _kind_of(target, j1, j2)
             insert_after = anchor_p
+            # 文首插入没有「前一段」，但仍需要一个格式模板 → 借用原第一段。
+            style_anchor = anchor_p if anchor_p is not None else (entries[0][0] if entries else None)
             for j in range(j1, j2):
                 newp = _make_paragraph_like(
-                    anchor_p, target[j][1], kind, author, date_str, rev_ids
+                    style_anchor, target[j][1], kind, author, date_str, rev_ids
                 )
-                if newp is not None and insert_after is not None:
+                if newp is None:
+                    continue
+                if insert_after is not None:
                     insert_after.addnext(newp)
                     insert_after = newp
+                    changes += 1
+                elif entries:
+                    # 插入点在文档最前面：此时没有「前一段」可用作锚点。
+                    # 原先在这种情况直接跳过（insert_after 为 None），会导致
+                    # 「在正文开头新增一段」的修订被静默丢弃；退化为「插到第一段
+                    # 之后」则会把前置条款挪到错误位置。正确做法是插到第一段之前。
+                    entries[0][0].addprevious(newp)
                     changes += 1
     return changes
 
@@ -601,28 +659,47 @@ def _kind_of(target, j1, j2) -> str:
 
 
 def _delete_paragraph(p, author, date_str, rev_ids) -> bool:
-    """把段落所有 run 包进 <w:del>，并标记段落标记删除（等于整段删除）。
+    """把段落内所有 run 包进 <w:del>，并标记段落标记删除（等于整段删除）。
 
     <w:del> 是 <w:r> 的兄弟节点（<w:p> 的直接子节点）—— 铁律 1。
     段落标记删除写在 w:pPr/w:rPr/w:del，使该段与下一段合并。
+
+    覆盖范围：run 可能是 <w:p> 的直接子节点，也可能嵌套在 <w:hyperlink> /
+    <w:smartTag> / <w:sdt> 里（协议链接、内容控件）。只处理直接子节点会漏删，
+    且仍返回 True → 上层以为修订已应用，实际链接文字原样留在正文。
+    <w:tab/> 不是文本节点，删除时需一并搬进 <w:del>，否则残留的制表位会串到
+    合并后的相邻段落。
     """
     from lxml import etree
-    runs = [c for c in p if c.tag == _qn("w:r")]
+    runs = _iter_paragraph_runs(p)
     if not runs:
         return False
 
     del_els = []
     for r in runs:
-        texts = [t.text or "" for t in r.findall(_qn("w:t"))]
-        # 整段替换 run：先取出文本，再把 run 包进 w:del
+        text = _run_visible_text(r)
+        tabs = _run_tab_count(r)
+        brs = _run_br_count(r)
         d = _make_del(author, date_str, rev_ids.next())
-        new_run = _clone_run_shell(r)
-        _set_run_text(new_run, "".join(texts), as_del_text=True)
+        if text or not (tabs or brs):
+            # 有文本：走常规路径（tabs/brs 一并补回）
+            new_run = _clone_run_shell(r)
+            _set_run_text(new_run, text, as_del_text=True, tabs=tabs, brs=brs)
+        else:
+            # 纯制表位/换行 run：只搬这些元素，不产生空文本节点
+            new_run = etree.Element(_qn("w:r"))
+            rpr = r.find(_qn("w:rPr"))
+            if rpr is not None:
+                new_run.append(copy.deepcopy(rpr))
+            for _ in range(tabs):
+                etree.SubElement(new_run, _qn("w:tab"))
+            for _ in range(brs):
+                etree.SubElement(new_run, _qn("w:br"))
         d.append(new_run)
         del_els.append((r, d))
 
     for r, d in del_els:
-        p.replace(r, d)
+        r.getparent().replace(r, d)
 
     # 段落标记删除（合并到下一段）
     ppr = p.find(_qn("w:pPr"))

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 from app.config import decrypt
 from app.config import get_system_name  # noqa: F401  (SYSTEM_NAME 改用函数动态读取)
+from app.services.email_fetcher import FORWARD_COPY_MARKER  # 转发副本标记（纯 ASCII，单一来源）
 
 logger = logging.getLogger(__name__)
 
@@ -384,7 +385,7 @@ def forward_email(
         msg["Subject"] = f"【{doc_type_str}】{clean_subject}"
     else:
         msg["Subject"] = f"【法律文书】{clean_subject}"
-    msg["X-Forwarded-By"] = "邮件智能分析转发系统"
+    msg["X-Forwarded-By"] = FORWARD_COPY_MARKER
     msg["X-Forwarded-For"] = _sanitize_header(from_email)
 
     # ── 构建正文 ──

@@ -465,7 +465,8 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
     llm_cfg = ctx["llm_cfg"]
 
     # 跳过已被转发的副本（检查 X-Forwarded-By 自定义邮件头）
-    if eml.headers.get("x-forwarded-by") == "邮件智能分析转发系统":
+    from app.services.email_fetcher import is_forwarded_copy
+    if is_forwarded_copy(eml.headers):
         logger.info(f"跳过转发副本: {eml.subject}")
         return
 
@@ -874,6 +875,7 @@ def _process_one_email(eml, idx: int, ctx: dict, db):
         account=account,
         db=db,
         log=log,
+        analyses=all_analyses,
     )
     if not forward_targets:
         _cleanup_temp_docx()  # 已生成的临时 docx 需清理（否则此提前返回路径会泄漏）
@@ -1058,12 +1060,26 @@ def _run_llm_analysis(llm_cfg, eml, log, attachment_texts: str, unocr_images: li
     return None, True  # unreachable
 
 
-def _collect_mail_doc_types(analysis, log) -> set:
+def _is_classify_failed(a) -> bool:
+    """该组/该次分析的文书类型识别是否失败（返回的是兜底值而非模型判断）"""
+    return bool(a) and bool(a.get("classify_failed"))
+
+
+def _collect_mail_doc_types(analysis, log, analyses=None) -> set:
     """收集本封邮件涉及的全部文书类型（按类型转发规则的匹配依据）。
 
     优先级：log.doc_types（多文书分组分析时已落库的全部类型）→ analysis["doc_type"]。
     两者都取不到时返回空集合，此时按类型规则一律不命中（不会误转发）。
+
+    analyses 为本次分析的全部分组结果（可选）。多附件分组时 log.doc_types 含
+    每一组的结果，其中**类型识别失败**的组返回的是兜底值「其他法律文书」，
+    它不是模型判断，不得参与规则匹配（否则会误命中该类型的规则转发到错误邮箱）。
+    故此处按分析结果剔除失败组的类型。
     """
+    failed_types = {
+        str(a.get("doc_type", "") or "").strip()
+        for a in (analyses or []) if _is_classify_failed(a)
+    }
     names = set()
     raw = getattr(log, "doc_types", None)
     if raw and str(raw).strip():
@@ -1072,7 +1088,7 @@ def _collect_mail_doc_types(analysis, log) -> set:
         single = str(analysis.get("doc_type", "") or "").strip()
         if single:
             names.add(single)
-    return names
+    return {n for n in names if n not in failed_types}
 
 
 def _match_rule_doc_types(rule, mail_doc_types: set) -> bool:
@@ -1164,7 +1180,8 @@ def _record_forward_result(db, log, target_email: str, target_name: str,
         )
 
 
-def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[dict]:
+def _get_forward_targets(analysis, llm_failed: bool, account, db, log,
+                         analyses=None) -> list[dict]:
     """
     决定转发目标列表（两种匹配方式取并集，同一目标邮箱只转发一次）:
     - 垃圾过滤 → 跳过（返回空列表）
@@ -1173,6 +1190,11 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
 
     两种方式均可通过 account_ids 限定生效的监控邮箱范围（空=所有邮箱）。
     全部规则（两种方式）均未命中时兜底默认邮箱；无默认邮箱则标记失败且不转发。
+
+    analyses: 本次分析的全部分组结果（可选）。多附件分组时 analysis 只是其中
+    **一组**（按 confidence 选出的），若别的组类型识别失败，其兜底值「其他法律
+    文书」会经 log.doc_types 进入类型规则匹配 → 误转发到错误邮箱，故必须按
+    全部分组结果判断识别失败并剔除失败组的类型。
 
     返回 [{"email": str, "smtp_cfgs": [dict, ...]}, ...] 或空列表（跳过）
     """
@@ -1185,10 +1207,16 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
     # ── 类型识别失败：不得据此路由 ──
     # 兜底值「其他法律文书/0.5」与模型真实判断无法区分，若继续走规则匹配，
     # 要么因无规则命中而落到「未配置转发目标」的误导性提示，要么误命中规则转发到错误邮箱。
-    if analysis and analysis.get("classify_failed"):
+    # 多附件分组时任一组的识别失败同样不得放行：该组内容未识别，转发出去只会误导律师。
+    classify_failed_types = sorted({
+        str(a.get("doc_type", "") or "").strip()
+        for a in (analyses or []) if _is_classify_failed(a)
+    })
+    if _is_classify_failed(analysis) or classify_failed_types:
+        failed_desc = "、".join(classify_failed_types) or llm_doc_type
         log.status = "failed"
         log.error_message = (
-            f"文书类型识别失败（「{llm_doc_type}」为兜底值，非模型判断），已跳过转发。"
+            f"文书类型识别失败（「{failed_desc}」为兜底值，非模型判断），已跳过转发。"
             f"请检查类型识别模型配置（尤其是 max_tokens 是否过小导致 JSON 输出被截断）。"
         )
         return []
@@ -1207,7 +1235,7 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log) -> list[d
 
     # ── 非法律文书 → 也走路由规则（与法律文书同逻辑）──
     # ── 法律文书 → 查路由规则 ──
-    mail_doc_types = _collect_mail_doc_types(analysis, log)
+    mail_doc_types = _collect_mail_doc_types(analysis, log, analyses=analyses)
     targets = []
     seen = set()
     target_names = {}  # email → 律师姓名（同一邮箱多条规则时取首个非空）
@@ -1656,7 +1684,8 @@ def send_daily_report():
         msg["From"] = from_email
         msg["To"] = to_email
         msg["Subject"] = report_subject
-        msg["X-Forwarded-By"] = "邮件智能分析转发系统"
+        from app.services.email_fetcher import FORWARD_COPY_HEADER, FORWARD_COPY_MARKER
+        msg[FORWARD_COPY_HEADER] = FORWARD_COPY_MARKER
 
         server = None
         try:
@@ -1742,7 +1771,8 @@ def _send_plain_mail(smtp_cfg: dict, to_email: str, subject: str, body: str) -> 
         msg["From"] = smtp_cfg["username"]
         msg["To"] = to_email
         msg["Subject"] = subject
-        msg["X-Forwarded-By"] = "邮件智能分析转发系统"
+        from app.services.email_fetcher import FORWARD_COPY_HEADER, FORWARD_COPY_MARKER
+        msg[FORWARD_COPY_HEADER] = FORWARD_COPY_MARKER
 
         if smtp_cfg["port"] == 465:
             server = smtplib.SMTP_SSL(smtp_cfg["host"], smtp_cfg["port"], timeout=30)

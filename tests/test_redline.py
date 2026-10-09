@@ -254,6 +254,152 @@ class TestBuildRedlinedDocx:
         os.remove(out)
 
 
+# ── 段落内容的非 run 元素：超链接 / 制表位 ──
+
+def _add_hyperlink(paragraph, url, text):
+    """向段落追加一个真实超链接（w:hyperlink 包裹 w:r）"""
+    from docx.oxml.ns import qn as dqn
+    from lxml import etree
+
+    r_id = paragraph.part.relate_to(
+        url,
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+        is_external=True,
+    )
+    hl = etree.SubElement(paragraph._element, dqn("w:hyperlink"))
+    hl.set(dqn("r:id"), r_id)
+    run = etree.SubElement(hl, dqn("w:r"))
+    t = etree.SubElement(run, dqn("w:t"))
+    t.text = text
+    return hl
+
+
+def _paragraph_kinds(body):
+    """返回 [(顶层段落文本, 是否含 w:del, 是否含 w:ins)]，按文档顺序"""
+    from lxml import etree
+    xml = etree.fromstring(body.encode("utf-8"))
+    out = []
+    for p in xml.iter("{%s}p" % W_NS):
+        texts = "".join(t.text or "" for t in p.iter("{%s}t" % W_NS))
+        dels = "".join(t.text or "" for t in p.iter("{%s}delText" % W_NS))
+        out.append((texts, dels,
+                    p.find("{%s}del" % W_NS) is not None,
+                    p.find("{%s}ins" % W_NS) is not None))
+    return out
+
+
+def _make_docx(path, builder):
+    from docx import Document
+    doc = Document()
+    builder(doc)
+    doc.save(str(path))
+    return str(path)
+
+
+class TestNonRunContentDeletion:
+    """删除段落时必须覆盖嵌套容器内的 run 与制表位
+
+    回归背景：_delete_paragraph 原先只处理 <w:p> 的直接子 <w:r>，
+    超链接（w:hyperlink 内）的文字不会被包进 <w:del>，却仍返回 True，
+    表现为「模型要求删除该段、系统报告已应用，链接文字仍留在正文且无修订标记」。
+    """
+
+    def test_hyperlink_text_wrapped_in_del(self, tmp_path):
+        def build(doc):
+            doc.add_paragraph("前言")
+            p = doc.add_paragraph()
+            p.add_run("第1行：")
+            _add_hyperlink(p, "https://example.com/x", "请以链接内容为准")
+            doc.add_paragraph("结尾")
+
+            from docx.oxml.ns import qn as dqn
+            from lxml import etree
+            run = p.add_run("")
+            etree.SubElement(run._element, dqn("w:br"))
+
+        src = _make_docx(tmp_path / "link.docx", build)
+        out = build_redlined_docx(src, "前言\n\n结尾")
+        assert out
+        body, _ = _read_xml(out)
+
+        # 链接文字必须落在 w:delText 中，且不再出现在 w:t 中
+        assert "请以链接内容为准" in body.split("<w:del")[1] or "请以链接内容为准" in body
+        text_nodes = re.findall(r"<w:t[^>]*>([^<]*)</w:t>", body)
+        assert "请以链接内容为准" not in text_nodes
+        del_text_nodes = re.findall(r"<w:delText[^>]*>([^<]*)</w:delText>", body)
+        assert "请以链接内容为准" in "".join(del_text_nodes)
+        os.remove(out)
+
+    def test_tab_wrapped_in_del(self, tmp_path):
+        def build(doc):
+            doc.add_paragraph("甲方：")
+            p = doc.add_paragraph()
+            r1 = p.add_run("甲方")
+            from docx.oxml.ns import qn as dqn
+            from lxml import etree
+            etree.SubElement(r1._element, dqn("w:tab"))
+            p.add_run("乙方")
+            # 纯换行 run（无文本），删除时同样不能把这些元素留在 w:del 之外
+            r2 = p.add_run("")
+            etree.SubElement(r2._element, dqn("w:br"))
+            doc.add_paragraph("丙方：")
+
+        src = _make_docx(tmp_path / "tab.docx", build)
+        out = build_redlined_docx(src, "甲方：\n\n丙方：")
+        assert out
+        body, _ = _read_xml(out)
+
+        # 残留的 <w:tab/> / <w:br/> 不得出现在任何 w:del 之外
+        outside = re.sub(r"<w:del [^>]*>.*?</w:del>", "", body, flags=re.S)
+        assert "<w:tab/>" not in outside
+        assert "<w:br/>" not in outside
+        del_text_nodes = "".join(re.findall(r"<w:delText[^>]*>([^<]*)</w:delText>", body))
+        assert "甲方" in del_text_nodes and "乙方" in del_text_nodes
+        os.remove(out)
+
+
+# ── 插入位置 ──
+
+class TestInsertPosition:
+    def test_insert_at_document_start_lands_before_first_paragraph(self, base_docx):
+        """在正文最前面新增一段，必须出现在第一段之前
+
+        回归背景：插入点在最前面时没有「前一段」可作锚点，原实现会退化到
+        「插到第一段之后」，把前置条款挪到错误位置。
+        """
+        revised = ("【新增】本补充协议自双方签署之日起生效。【/新增】\n\n"
+                   "合作协议\n\n甲方：示例大学")
+        out = build_redlined_docx(base_docx, revised)
+        assert out
+        body, _ = _read_xml(out)
+        paras = _paragraph_kinds(body)
+        non_empty = [p for p in paras if p[0] or p[1]]
+        assert non_empty, "应至少产出若干段落"
+
+        all_text = "\n".join(p[0] for p in paras)
+        assert "本补充协议自双方签署之日起生效。" in all_text, \
+            f"新增段落被静默丢弃，实际全文：{all_text!r}"
+
+        first_text = non_empty[0][0]
+        assert "本补充协议自双方签署之日起生效。" in first_text, \
+            f"新增段落未落在最前面，实际首段为：{first_text!r}"
+        assert non_empty[0][3] is True, "最前面那段应带 w:ins 标记"
+        os.remove(out)
+
+    def test_insert_in_middle_still_correct(self, tmp_path):
+        """中间插入不受影响（防止修正文首时改坏常规路径）"""
+        paras = ["第一条 甲", "第二条 乙", "第三条 丙"]
+        src = _make_minimal_docx(tmp_path / "mid.docx", paras)
+        revised = ("第一条 甲\n\n【新增】第二条之一 补充约定【/新增】\n\n"
+                   "第二条 乙\n\n第三条 丙")
+        out = build_redlined_docx(src, revised)
+        assert out
+        body, _ = _read_xml(out)
+        texts = [p[0] for p in _paragraph_kinds(body) if p[0]]
+        assert texts.index("第二条之一 补充约定") == texts.index("第一条 甲") + 1
+        os.remove(out)
+
+
 # ── 降级路径 ──
 
 class TestFallbackPaths:

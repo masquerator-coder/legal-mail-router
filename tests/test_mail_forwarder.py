@@ -159,3 +159,70 @@ class TestDedupeSmtpCfgs:
 
         assert dedupe_smtp_cfgs([]) == []
         assert dedupe_smtp_cfgs([None, None]) == []
+
+
+class TestForwardedCopyHeader:
+    """转发邮件必须带 ASCII 的 X-Forwarded-By 标记，且经序列化/解析后仍能识别
+
+    回归背景：标记值原为中文，compat32 序列化成 RFC2047 编码串，
+    接收端（email.message_from_bytes）不解码 → 副本判重恒 False →
+    转发副本被反复重分析、重转发。
+    """
+
+    def _send_and_capture(self, monkeypatch, **overrides):
+        from app.services import mail_forwarder as mf
+
+        captured = {}
+
+        class _FakeSMTP:
+            def __init__(self, *a, **kw):
+                pass
+
+            def starttls(self, *a, **kw):
+                pass
+
+            def login(self, *a, **kw):
+                pass
+
+            def sendmail(self, from_addr, to_addrs, msg_text):
+                captured["from"] = from_addr
+                captured["to"] = to_addrs
+                captured["raw"] = msg_text
+
+            def quit(self):
+                pass
+
+        monkeypatch.setattr(mf.smtplib, "SMTP", _FakeSMTP)
+        monkeypatch.setattr(mf.smtplib, "SMTP_SSL", _FakeSMTP)
+        monkeypatch.setattr(mf, "decrypt", lambda v: "smtp-password", raising=False)
+
+        kwargs = dict(
+            smtp_host="smtp.example.com", smtp_port=587, smtp_username="m@x.com",
+            smtp_password_encrypted="enc", from_email="m@x.com",
+            to_email="lawyer@example.com", to_name="张律师",
+            original_subject="关于合同的通知", original_body="正文",
+            analyses_results=[{"doc_type": "合同协议", "confidence": 0.9}],
+            retry_count=0,
+        )
+        kwargs.update(overrides)
+        success, err = mf.forward_email(**kwargs)
+        assert success is True, f"转发失败: {err}"
+        return captured["raw"]
+
+    def test_header_is_ascii_marker(self, monkeypatch):
+        from app.services.email_fetcher import (
+            FORWARD_COPY_MARKER, is_forwarded_copy, _parse_email,
+        )
+        raw = self._send_and_capture(monkeypatch)
+        assert "X-Forwarded-By: " in raw
+        header_line = [ln for ln in raw.splitlines()
+                       if ln.lower().startswith("x-forwarded-by")][0]
+        assert header_line.split(":", 1)[1].strip() == FORWARD_COPY_MARKER
+        assert FORWARD_COPY_MARKER.isascii()
+
+    def test_roundtrip_is_recognized_as_copy(self, monkeypatch):
+        """端到端闭环比对：发出的邮件被接收端解析后必须判为「转发副本」"""
+        from app.services.email_fetcher import is_forwarded_copy, _parse_email
+        raw = self._send_and_capture(monkeypatch)
+        parsed = _parse_email(raw.encode("utf-8"))
+        assert is_forwarded_copy(parsed.headers) is True

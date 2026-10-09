@@ -235,10 +235,23 @@ async def resend_email(
     if not targets:
         return {"success": False, "message": "未配置转发目标邮箱"}
 
+    # 跳过此前已成功送达的目标：部分成功（A 成功、B 被拒）时状态记为 failed，
+    # 日志页会出现「重新转发」；若无脑重发全部目标，已收到的律师会重复收到同一份文书。
+    delivered = {
+        (r.target_email or "").strip()
+        for r in db.query(ForwardRecord).filter_by(log_id=log.id, success=True).all()
+    }
+    pending_targets = [t for t in targets if t not in delivered]
+    if not pending_targets:
+        return {
+            "success": True,
+            "message": f"全部目标（{len(targets)} 个）此前均已成功送达，无需重复转发",
+        }
+
     # 逐个转发（按候选发件服务器 failover：收件邮箱 SMTP 不可用时回退默认 SMTP）
     all_success = True
     last_error = ""
-    for target in targets:
+    for target in pending_targets:
         success = False
         error_detail = "无可用 SMTP 候选"
         for idx, smtp in enumerate(smtp_cfgs):
@@ -272,15 +285,20 @@ async def resend_email(
             last_error = f"SMTP: {hosts} → {target} | 原因: {error_detail}"
             logger.error(f"重新转发失败: {last_error}")
 
+        # 逐目标记录（与调度器转发路径一致），否则手动重发的邮件不会进入
+        # 「按转发目标邮箱的每日总结邮件」统计，也无法用于判断已送达目标
+        from app.services.scheduler import _record_forward_result
+        _record_forward_result(db, log, target, "", analyses, success, error_detail)
+
     # 更新状态
     log.error_message = last_error if not all_success else None
     log.status = "forwarded" if all_success else "failed"
     db_retry_commit(db)
 
-    return {
-        "success": all_success,
-        "message": "重新转发成功" if all_success else f"重新转发失败: {last_error}",
-    }
+    skipped_note = f"（已跳过此前已送达的 {len(delivered)} 个目标）" if delivered else ""
+    if all_success:
+        return {"success": True, "message": f"重新转发成功{skipped_note}"}
+    return {"success": False, "message": f"重新转发失败: {last_error}{skipped_note}"}
 
 
 @router.post("/delete-selected")

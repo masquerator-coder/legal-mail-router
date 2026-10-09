@@ -36,6 +36,13 @@ def check_csrf(request: Request, submitted_token: str = ""):
 
     表单提交：submitted_token 为 _csrf_token 表单字段值
     JS fetch：X-CSRF-Token header（中间件已验证，此处双重确认）
+
+    注意：校验通过后**不轮换**会话内的 token。页面把 token 同时渲染进
+    <meta name="csrf-token"> 与表单隐藏域，一次轮换会让同一浏览器其他页面
+    （或同页后续 fetch）持有的旧 token 立即失效并返回 403 —— 表现为
+    「清除所有记录」「修改密码」等按钮静默失败，必须刷新页面才能恢复。
+    防重放不依赖轮换：token 为 32 字节随机值，跨站请求由会话 cookie 的
+    SameSite=Lax + token 比对共同拦截。
     """
     session_token = request.session.get(CSRF_SESSION_KEY)
     if not session_token:
@@ -48,13 +55,11 @@ def check_csrf(request: Request, submitted_token: str = ""):
     # 检查 header（兜底，正常情况中间件已处理）
     header_token = request.headers.get(CSRF_HEADER)
     if header_token and secrets.compare_digest(session_token, header_token):
-        request.session[CSRF_SESSION_KEY] = secrets.token_hex(32)
         return
 
     # 检查表单隐藏域
     if not submitted_token or not secrets.compare_digest(session_token, submitted_token):
         raise HTTPException(status_code=403, detail="CSRF 验证失败，请刷新页面后重试")
-    request.session[CSRF_SESSION_KEY] = secrets.token_hex(32)
 
 
 # ── ASGI Middleware —— 仅处理 JS fetch header ──

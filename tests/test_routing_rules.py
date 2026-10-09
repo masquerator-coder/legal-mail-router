@@ -368,6 +368,67 @@ class TestClassifyFailedBlocksRouting:
         assert _targets(result) == ["xinfang@example.com"]
 
 
+class TestMultiGroupClassifyFailed:
+    """多附件分组：任一组类型识别失败时，兜底值不得进入类型规则匹配
+
+    回归背景：分组时 analysis 只是按 confidence 选出的**一组**，单看它无法发现
+    别的组识别失败；而 log.doc_types 含全部组，失败组的兜底值「其他法律文书」
+    会命中该类型规则 → 转发到错误邮箱。
+    """
+
+    FAILED_GROUP = {"doc_type": "其他法律文书", "confidence": 0.5, "classify_failed": True}
+    OK_GROUP = {"doc_type": "合同协议", "confidence": 0.9}
+
+    def test_failed_group_type_excluded_from_matching_set(self):
+        """失败组的兜底类型必须从匹配集合中剔除，成功组的类型保留"""
+        log = _Log(doc_types="其他法律文书,合同协议")
+        types = _collect_mail_doc_types(
+            self.OK_GROUP, log, analyses=[self.FAILED_GROUP, self.OK_GROUP]
+        )
+        assert types == {"合同协议"}
+
+    def test_single_group_failure_excludes_type(self):
+        """单组失败（未传 analyses 时由 analysis 自身兜底判定）"""
+        log = _Log(doc_types="其他法律文书")
+        types = _collect_mail_doc_types(self.FAILED_GROUP, log, analyses=[self.FAILED_GROUP])
+        assert types == set()
+
+    def test_successful_groups_keep_all_types(self):
+        """全部组均成功时，类型集合不受影响（不引入新的行为变化）"""
+        other = {"doc_type": "起诉状", "confidence": 0.8}
+        log = _Log(doc_types="合同协议,起诉状")
+        types = _collect_mail_doc_types(self.OK_GROUP, log, analyses=[self.OK_GROUP, other])
+        assert types == {"合同协议", "起诉状"}
+
+    def test_any_failed_group_blocks_forwarding(self, rule_db):
+        """任一组的识别失败 → 不转发（即使别的组识别成功）"""
+        _add_default_smtp(rule_db)
+        _add_rule(rule_db, "contract@example.com", rule_type="doc_type", doc_type="合同协议")
+        _add_rule(rule_db, "other-docs@example.com", rule_type="doc_type",
+                  doc_type="其他法律文书")
+        log = _Log(doc_types="其他法律文书,合同协议")
+        result = _get_forward_targets(
+            self.OK_GROUP, False, _Account(), rule_db, log,
+            analyses=[self.FAILED_GROUP, self.OK_GROUP],
+        )
+        assert result == []
+        assert log.status == "failed"
+        assert "识别失败" in log.error_message
+        assert "其他法律文书" in log.error_message
+
+    def test_all_groups_ok_still_routes(self, rule_db):
+        """全部组识别成功时照常路由（防止上面的拦截过度扩大）"""
+        _add_default_smtp(rule_db)
+        _add_rule(rule_db, "contract@example.com", rule_type="doc_type", doc_type="合同协议")
+        log = _Log(doc_types="合同协议")
+        result = _get_forward_targets(
+            self.OK_GROUP, False, _Account(), rule_db, log,
+            analyses=[self.OK_GROUP],
+        )
+        assert _targets(result) == ["contract@example.com"]
+        assert log.status == "analyzed"
+
+
 # ── 表单校验：一条规则只能使用一种匹配方式 ──
 
 class TestNormalizeRuleForm:

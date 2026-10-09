@@ -21,6 +21,31 @@ logger = logging.getLogger(__name__)
 _IMAP_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
+# ── 转发副本标记（X-Forwarded-By）──
+# 必须是纯 ASCII：非 ASCII 值会被 email 的 compat32 序列化成 RFC2047 编码串
+# （=?...?B?...?=），而接收端 email.message_from_bytes 不会自动解码，
+# 导致副本判重恒不相等 → 本系统转发出的邮件再被监控邮箱收到时会被反复
+# 重分析、重转发（每轮 Message-ID 都不同，message_id 去重挡不住）。
+# 读取端统一走 is_forwarded_copy()，两侧都必须解码后再比较。
+FORWARD_COPY_HEADER = "X-Forwarded-By"
+FORWARD_COPY_MARKER = "legal-mail-router"
+# 历史版本写入的中文标记（升级前已发出的转发副本仍以此值识别）
+FORWARD_COPY_MARKER_LEGACY = ("邮件智能分析转发系统",)
+
+
+def is_forwarded_copy(headers: dict) -> bool:
+    """判断邮件是否为「本系统转发出的副本」（依据 X-Forwarded-By 头）。
+
+    headers 为已小写化的头部字典（见 _parse_email）。历史中文标记会被
+    email 库序列化成 RFC2047 编码串，故必须先 decode_mime_header 再比较；
+    同时兼容「已按 policy.default 解析、值已是中文」的情况。
+    """
+    raw = (headers or {}).get(FORWARD_COPY_HEADER.lower(), "")
+    if not raw:
+        return False
+    value = decode_mime_header(raw).strip()
+    return value == FORWARD_COPY_MARKER or value in FORWARD_COPY_MARKER_LEGACY
+
 
 def _imap_astring(value: str) -> str:
     """RFC 3501 4.3: 将任意字符串转为 IMAP ASTRING 格式（双引号字符串，转义 \\ 和 \"）"""
@@ -191,7 +216,7 @@ def _parse_email(raw_bytes: bytes) -> Optional[ParsedEmail]:
 
     # 提取关键邮件头用于转发副本检测等问题排查
     headers = {}
-    for hdr in ["X-Forwarded-By", "X-Forwarded-For", "List-Id", "Precedence"]:
+    for hdr in [FORWARD_COPY_HEADER, "X-Forwarded-For", "List-Id", "Precedence"]:
         val = msg.get(hdr, "")
         if val:
             headers[hdr.lower()] = val

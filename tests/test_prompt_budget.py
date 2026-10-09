@@ -7,6 +7,7 @@
 import pytest
 
 from app.services.prompt_budget import (
+    CHARS_PER_TOKEN,
     compute_attachment_char_budget,
     compute_body_and_attachment_char_budget,
     estimate_tokens,
@@ -14,26 +15,65 @@ from app.services.prompt_budget import (
 )
 
 
+class TestTokenEstimationCalibration:
+    """approximate 估算不得低估中文 token 数（否则会在「估算安全」下发超窗请求）
+
+    回归背景：原系数 1.5 字符/token，实测 cl100k_base 约 0.87 字符/token，
+    低估约 1.8 倍。
+    """
+
+    CHINESE_SAMPLE = "本院认为，被告应当依照合同约定履行付款义务，逾期付款应承担违约责任。" * 20
+
+    def test_calibration_is_conservative(self):
+        """系数必须 <= 1.0（每 token 不足 1 个中文字符），不能乐观低估"""
+        assert CHARS_PER_TOKEN <= 1.0
+
+    def test_approximation_not_worse_than_two_thirds_of_tiktoken(self):
+        """approximate 与真实分词器的差距必须收敛到 1.5 倍以内"""
+        try:
+            import tiktoken
+        except ImportError:
+            pytest.skip("未安装 tiktoken（dev 可选依赖）")
+        real = len(tiktoken.get_encoding("cl100k_base").encode(
+            self.CHINESE_SAMPLE, disallowed_special=()))
+        approx = estimate_tokens(self.CHINESE_SAMPLE, "approximate")
+        assert approx >= real * 2 / 3, f"低估过多: approx={approx} real={real}"
+
+    def test_mixed_text_still_reasonable(self):
+        """中英混排不会因系数收紧而爆炸（英文仍按 4 字符/token）"""
+        text = "abc def ghi jkl " * 100
+        assert estimate_tokens(text, "approximate") == len(text) // 4
+
+
 class TestComputeAttachmentCharBudget:
-    def test_1m_large_window_capped(self):
-        """1M 上下文 → 应对 cap 封顶（默认 50 万字符）"""
+    def test_1m_large_window_not_capped_to_cap_by_default(self):
+        """1M 窗口：字符上限按预算公式给出（不得被误当成 token 上限）"""
         budget = compute_attachment_char_budget(1_048_576)
-        assert budget == 500_000
+        assert budget > 100_000
+        assert budget <= 500_000          # cap 仍生效
 
-    def test_1m_no_cap(self):
-        """1M 上下文且不封顶 → 由预算公式推导（约 77 万字符）"""
+    def test_char_budget_matches_token_budget_formula(self):
+        """字符上限 × 系数 ≈ 公式给出的 token 预算（±cap 边界）
+
+        这是本函数的核心契约：由 token 预算反推字符上限，系数改标定后仍成立。
+        """
+        for cw in (131_072, 200_000, 1_048_576):
+            budget = compute_attachment_char_budget(cw, cap=None)
+            token_equiv = budget / CHARS_PER_TOKEN
+            expected = int(cw * 0.50) - 2000 - 1200 - int(8000 / CHARS_PER_TOKEN) - 500
+            assert abs(token_equiv - expected) <= 2, f"window={cw}"
+
+    def test_1m_no_cap_scales_with_window(self):
+        """不封顶时字符上限随窗口放大（非线性：预留项随系数变大而占比更高）"""
         budget = compute_attachment_char_budget(1_048_576, cap=None)
-        # (int(1_048_576*0.5) - 2000 - 预留) * 1.5 ≈ 77 万
-        assert 700_000 < budget < 900_000
+        ref_128k = compute_attachment_char_budget(131_072, cap=None)
+        assert budget > 5 * ref_128k
 
-    def test_128k_window(self):
-        """128K 上下文 → 约 8.5 万字符/附件"""
-        budget = compute_attachment_char_budget(131_072)
-        assert 80_000 <= budget <= 90_000
-
-    def test_200k_window(self):
-        budget = compute_attachment_char_budget(200_000)
-        assert 120_000 <= budget <= 150_000
+    def test_budget_never_exceeds_input_budget(self):
+        """字符上限换算回 token 后不得超出输入预算（不超窗）"""
+        for cw in (8_192, 32_768, 131_072, 1_048_576):
+            budget = compute_attachment_char_budget(cw, cap=None)
+            assert budget / CHARS_PER_TOKEN <= int(cw * 0.50) - 2000
 
     def test_unknown_window_legacy_default(self):
         """窗口未知（<=0）→ 回退历史硬编码 6000，保持旧行为"""
@@ -97,13 +137,13 @@ class TestBodyAndAttachmentBudget:
         """1M 窗口下正文上限应远超旧固定值 8000，附件 cap 封顶"""
         body, attach = compute_body_and_attachment_char_budget(1_048_576)
         assert body > 50_000          # 大窗口下正文吃到合理上限（>>> 8000）
-        assert attach == 500_000      # 附件 cap 封顶
+        assert attach > 300_000       # 附件（主体）上限远大于正文
         assert body < attach          # 正文（辅助）上限应小于附件（主体）
 
     def test_128k_body_and_attach(self):
         body, attach = compute_body_and_attachment_char_budget(131_072)
-        assert 10_000 <= body <= 20_000
-        assert 60_000 <= attach <= 100_000
+        assert 6_000 <= body <= 12_000
+        assert 35_000 <= attach <= 60_000
         assert body < attach
 
     def test_legacy_when_window_unknown(self):
@@ -118,8 +158,8 @@ class TestBodyAndAttachmentBudget:
             cw, usage_ratio=ratio, output_tokens=out, template_tokens=template_tokens,
         )
         input_budget = int(cw * ratio) - out
-        body_tok = body_chars / 1.5
-        attach_tok = attach_chars / 1.5
+        body_tok = body_chars / CHARS_PER_TOKEN
+        attach_tok = attach_chars / CHARS_PER_TOKEN
         # 蓝本：正文(15%) + 附件(85%) = 100% 可用，预留(模板+盐)未计入字符侧
         assert (body_tok + attach_tok + template_tokens + 500) <= input_budget
 

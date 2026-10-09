@@ -5,6 +5,7 @@ import pytest
 from app.services.email_fetcher import (
     decode_mime_header, extract_body, extract_attachments,
     ParsedEmail, AttachmentInfo, save_attachments, _parse_email,
+    is_forwarded_copy, FORWARD_COPY_HEADER, FORWARD_COPY_MARKER,
 )
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -125,7 +126,6 @@ class TestParseRecipient:
 
 class TestExtractAttachments:
     """附件提取"""
-
     def test_no_attachments(self):
         raw = _make_raw_email()
         msg = message_from_bytes(raw, policy=policy.default)
@@ -152,3 +152,56 @@ class TestExtractAttachments:
         assert len(atts) == 2
         assert atts[0].filename == "doc.docx"
         assert atts[1].filename == "sheet.xlsx"
+
+
+class TestForwardedCopyDetection:
+    """转发副本识别（X-Forwarded-By）
+
+    回归背景：该头值若为非 ASCII，会被 email 的 compat32 序列化成 RFC2047
+    编码串，而 _parse_email（email.message_from_bytes，compat32）不会自动解码，
+    导致副本判重恒为 False → 转发副本被反复重分析、重转发。
+    """
+
+    def _raw_with_marker(self, marker, multipart=True):
+        msg = MIMEMultipart() if multipart else MIMEText("正文", "plain", "utf-8")
+        msg["From"] = "a@b.com"
+        msg["To"] = "lawyer@lawfirm.com"
+        msg["Subject"] = "测试"
+        msg["Date"] = "Mon, 01 Jan 2024 10:00:00 +0800"
+        msg["Message-ID"] = "<fwd@local>"
+        if marker is not None:
+            msg[FORWARD_COPY_HEADER] = marker
+        if multipart:
+            msg.attach(MIMEText("正文", "plain", "utf-8"))
+        return msg.as_bytes()
+
+    def test_marker_is_pure_ascii(self):
+        """标记值必须是纯 ASCII，否则会被 RFC2047 编码而无法比对"""
+        assert FORWARD_COPY_MARKER.isascii()
+
+    def test_current_marker_detected(self):
+        """本系统当前发出的转发副本必须被识别（multipart 与纯文本两种形态）"""
+        for multipart in (True, False):
+            parsed = _parse_email(self._raw_with_marker(FORWARD_COPY_MARKER, multipart))
+            assert is_forwarded_copy(parsed.headers) is True, f"multipart={multipart}"
+
+    def test_legacy_chinese_marker_still_detected(self):
+        """升级前发出的中文标记副本（线上是 RFC2047 编码串）仍需识别"""
+        parsed = _parse_email(self._raw_with_marker("邮件智能分析转发系统"))
+        assert parsed.headers[FORWARD_COPY_HEADER.lower()].startswith("=?utf-8?")
+        assert is_forwarded_copy(parsed.headers) is True
+
+    def test_ordinary_mail_not_matched(self):
+        """普通外部邮件不得被误判为副本"""
+        parsed = _parse_email(self._raw_with_marker(None))
+        assert is_forwarded_copy(parsed.headers) is False
+
+    def test_similar_value_not_matched(self):
+        """仅前缀相似的值不匹配（防止把无关邮件当副本跳过）"""
+        parsed = _parse_email(self._raw_with_marker("legal-mail-router-evil"))
+        assert is_forwarded_copy(parsed.headers) is False
+
+    def test_empty_headers(self):
+        assert is_forwarded_copy({}) is False
+        assert is_forwarded_copy(None) is False
+
