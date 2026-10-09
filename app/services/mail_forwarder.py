@@ -815,10 +815,14 @@ def _fill_review_template(template_path: str, analysis: dict,
     """
     使用审核意见模板 DOCX，替换其中的 xxx 占位符生成审核意见。
 
-    仅替换：
+    **以模板为主**：模板的抬头、措辞、落款格式与页眉图章全部原样保留，
+    只做占位符填充，不插入任何 LLM 生成的正文：
+
     - P1 中所有 xxx → 实际信息
-    - P6 日期 → 当前日期
-    其余内容保持模板原文不动。
+    - 末段日期 → 当前日期
+
+    其余内容（含标题抬头）保持模板原文不动。
+    实质分析结论仍由邮件正文/AI分析报告承载，不写入本意见书。
     """
     try:
         from docx import Document
@@ -877,18 +881,12 @@ def _fill_review_template(template_path: str, analysis: dict,
         ]
         _replace_xxx_in_paragraph(p1, replacements)
 
-    # ── P2: 模板自带的律所措辞，保持不动 ──
+    # ── 模板自带的律所措辞与抬头，保持不动 ──
 
-    # ── 插入 AI 分析正文 ──
-    # 模板正文原本只有模板自带的固定措辞，不含实质审查结论。
-    # 这里把 LLM 的 ai_interpretation（审查分析）按段落插入 P2 之后，
-    # 使审查意见具备可用的实质内容；同时把模板标题改写为与文书类型匹配。
-    _insert_analysis_body(doc, analysis)
-
-    # ── P6: 替换日期 ──
-    if len(doc.paragraphs) > 6:
-        p6_text = datetime.now().strftime("%Y年%m月%d日")
-        _replace_paragraph_text(doc.paragraphs[-1], p6_text)
+    # ── 落款日期：替换模板的示例日期 ──
+    if doc.paragraphs:
+        p_date = datetime.now().strftime("%Y年%m月%d日")
+        _replace_paragraph_text(doc.paragraphs[-1], p_date)
 
     # 写入临时文件
     tmp = tempfile.NamedTemporaryFile(
@@ -899,97 +897,33 @@ def _fill_review_template(template_path: str, analysis: dict,
     return tmp.name
 
 
-def _insert_analysis_body(doc, analysis: dict):
-    """把 LLM 的审查分析正文插入模板（在开头两段之后、落款之前）。
-
-    模板正文只含固定措辞，本身没有实质审查结论；此处按段落插入
-    ai_interpretation 的内容，并尽量沿用模板正文字体。
-
-    - 标题（P0）中的「合同审核意见」按文书类型改写，避免起诉状等
-      非合同文书顶着「合同审核意见」的抬头。
-    - 无 ai_interpretation 时静默跳过（保持模板原样，不报错）。
-    """
-    import copy
-    import re as _re
-
-    text = (analysis.get("ai_interpretation") or "").strip()
-    if not text:
-        return
-
-    paras = doc.paragraphs
-    if not paras:
-        return
-
-    # ── 标题改写：模板自带抬头 → 按文书类型命名 ──
-    doc_type = (analysis.get("doc_type") or "").strip()
-    if doc_type:
-        title = paras[0]
-        if "审核意见" in (title.text or "") or "审查意见" in (title.text or ""):
-            _replace_paragraph_text(title, f"{doc_type}审查意见")
-
-    # ── 正文插入点：模板前两段之后（落款前）──
-    anchor = paras[1] if len(paras) > 1 else paras[0]
-
-    # 样式参考：取模板正文字体的 rPr，使插入内容与模板一致
-    ref_rpr = None
-    for p in paras[:3]:
-        if p.runs:
-            found = p.runs[0]._element.find(
-                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rPr"
-            )
-            if found is not None:
-                ref_rpr = copy.deepcopy(found)
-            break
-
-    # 按空行切块，块内按单换行切行
-    blocks = [b for b in _re.split(r"\n\s*\n", text) if b.strip()]
-    if not blocks:
-        blocks = [text]
-
-    from docx.oxml.ns import qn
-    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-
-    for blk in blocks:
-        lines = [ln.strip() for ln in blk.split("\n") if ln.strip()] or [blk]
-        for ln in lines:
-            # 克隆锚点段落 → 保留 pPr（段落格式），清掉正文
-            new_p = copy.deepcopy(anchor._element)
-            for child in list(new_p):
-                if child.tag == W + "pPr":
-                    continue
-                new_p.remove(child)
-
-            run = new_p.makeelement(W + "r", {})
-            if ref_rpr is not None:
-                run.append(copy.deepcopy(ref_rpr))
-            t = new_p.makeelement(W + "t", {})
-            t.text = ln
-            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-            run.append(t)
-            new_p.append(run)
-
-            anchor._element.addnext(new_p)
-            # 后续内容插到刚插入的段落之后，保持顺序
-            from docx.text.paragraph import Paragraph
-            anchor = Paragraph(new_p, anchor._parent)
-
-
 def _extract_amount(text: str) -> str:
-    """从文本中提取金额，返回格式化字符串或默认值"""
+    """从文本中提取金额，返回**纯数值串**（去掉货币符号与末尾「元」）或默认值。
+
+    模板自带「合同价款xxx元」的「元」字，故返回值不再带单位；
+    `￥`/`¥`/`人民币` 等前缀同样由模板承担，不重复带入。
+    注意字符类里**不能**包含 `,` 与 `.` 以外的贪婪写法：也不要写成
+    `\\d+[\\d,.]*`——那会在 `人民币12000元` 上从第二个数字起匹配，
+    把「人民币」留成残渣。
+    """
     import re
-    # 匹配模式：XXX万元 / XXX元 / 人民币XXX元 等
+    # 匹配模式：XXX万元 / XXX元 / 人民币XXX元 / ￥XXX 等
     patterns = [
-        r'(人民币\s*)?(\d+[\d,.]*\s*万?\s*元)',
-        r'(¥|￥)\s*(\d+[\d,.]*\s*万?)',
+        r'(?:人民币\s*)?\d[\d,]*\.?\d*\s*万?\s*元',
+        r'[¥￥]\s*\d[\d,]*\.?\d*\s*万?',
     ]
     for pat in patterns:
         m = re.search(pat, text)
         if m:
             val = m.group(0).strip()
-            # 模板中已有 "元"，去掉匹配到的末尾 "元" 避免重复
-            if val.endswith("元"):
+            val = re.sub(r'^人民币\s*', '', val)                # 去掉「人民币」前缀
+            val = re.sub(r'^[¥￥]\s*', '', val)                 # 去掉货币符号
+            val = re.sub(r'\s*万\s*$', '万', val.strip())       # 归一化「30 万」→「30万」
+            if val.endswith("元"):                              # 模板自带「元」，避免重复
                 val = val[:-1]
-            return val
+            val = val.strip()
+            if val:
+                return val
     return "（待确认）"
 
 
@@ -998,10 +932,10 @@ def _strip_amount_phrases(text: str) -> str:
     import re
     # 匹配模式：金额表述 + 可选的前后标点/空格
     patterns = [
-        r'，?\s*合同总?金额[约共]?(人民币\s*)?(\d+[\d,.]*\s*万?\s*元)[。，]?\s*',  # "，合同总金额30万元。"
-        r'，?\s*总?金额[约共]?(人民币\s*)?(\d+[\d,.]*\s*万?\s*元)[。，]?\s*',     # "，总金额30万元。"
-        r'，?\s*价款[约共]?(人民币\s*)?(\d+[\d,.]*\s*万?\s*元)[。，]?\s*',         # "，价款30万元。"
-        r'，?\s*(¥|￥)\s*(\d+[\d,.]*\s*万?)[。，]?\s*',                           # "，¥30万。"
+        r'，?\s*合同总?金额[约共]?(人民币\s*)?(\d[\d,]*\.?\d*\s*万?\s*元)[。，]?\s*',  # "，合同总金额30万元。"
+        r'，?\s*总?金额[约共]?(人民币\s*)?(\d[\d,]*\.?\d*\s*万?\s*元)[。，]?\s*',     # "，总金额30万元。"
+        r'，?\s*价款[约共]?(人民币\s*)?(\d[\d,]*\.?\d*\s*万?\s*元)[。，]?\s*',         # "，价款30万元。"
+        r'，?\s*(¥|￥)\s*(\d[\d,]*\.?\d*\s*万?)[。，]?\s*',                           # "，¥30万。"
     ]
     result = text
     for pat in patterns:
