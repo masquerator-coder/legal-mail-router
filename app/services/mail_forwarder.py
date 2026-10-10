@@ -305,6 +305,214 @@ def _generate_analysis_docx(analyses: list[dict], original_subject: str) -> Opti
     return tmp.name
 
 
+# ── 日报 / 汇总报表的 Word 表格生成 ──
+# 与 _generate_analysis_docx 同源：python-docx 生成后立即读入内存发送，
+# 调用方负责删除临时文件（见 _send_report_mail 的 finally）。
+
+_REPORT_TABLE_STYLE = "Light Grid Accent 1"
+
+
+def _add_report_table(doc, headers: list[str], rows: list[list[str]]):
+    """在 doc 末尾追加一张表格：首行表头加粗，列数取 headers 长度。
+
+    rows 中的行若短于表头则补空串、长于表头则截断，避免
+    python-docx 因单元格数不匹配IndexError。
+    """
+    if not headers:
+        return None
+    table = doc.add_table(rows=1, cols=len(headers), style=_REPORT_TABLE_STYLE)
+    table.autofit = True
+    for i, h in enumerate(headers):
+        cell = table.rows[0].cells[i]
+        cell.text = str(h)
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                run.bold = True
+    for row in rows:
+        cells = table.add_row().cells
+        for i in range(len(headers)):
+            cells[i].text = str(row[i]) if i < len(row) else ""
+    return table
+
+
+def _build_daily_report_docx(data: dict) -> Optional[str]:
+    """生成管理员日报的 Word 附件（表格形式），返回临时文件路径。
+
+    data 字段：
+      sys_name, now_str, overview[(指标, 数值)],
+      cumulative[(指标, 数值)], accounts[[名称, 邮箱, 今日, 最近检查, 间隔]],
+      system[(指标, 数值)], errors[(时间, 主题, 原因)]
+    python-docx 不可用时返回 None，调用方回退纯文本正文。
+    """
+    try:
+        from docx import Document
+        from docx.shared import Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+    except ImportError:
+        logger.warning("python-docx 未安装，无法生成日报 Word 附件")
+        return None
+
+    doc = Document()
+    title = doc.add_heading(f"{data.get('sys_name', '')} 运行报告", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p = doc.add_paragraph(f"生成时间：{data.get('now_str', '')}")
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_heading("今日处理概况", level=1)
+    _add_report_table(doc, ["指标", "数值"], data.get("overview") or [])
+
+    doc.add_heading("累计统计", level=1)
+    _add_report_table(doc, ["指标", "数值"], data.get("cumulative") or [])
+
+    doc.add_heading("监控邮箱", level=1)
+    accounts = data.get("accounts") or []
+    if accounts:
+        _add_report_table(
+            doc,
+            ["名称", "邮箱", "今日处理", "最近检查", "检查间隔"],
+            accounts,
+        )
+    else:
+        doc.add_paragraph("（无启用的监控邮箱）")
+
+    doc.add_heading("系统状态", level=1)
+    _add_report_table(doc, ["项目", "值"], data.get("system") or [])
+
+    errors = data.get("errors") or []
+    if errors:
+        doc.add_heading(f"最近 {len(errors)} 条错误", level=1)
+        _add_report_table(doc, ["时间", "主题", "原因"], errors)
+
+    tail = doc.add_paragraph("")
+    tail.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = tail.add_run(f"—— {data.get('sys_name', '')} 自动生成 ——")
+    run.font.size = Pt(9)
+
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=".docx", prefix="运行报告_", delete=False
+    )
+    doc.save(tmp.name)
+    logger.info(f"日报 Word 附件已生成: {tmp.name}")
+    return tmp.name
+
+
+def _build_target_summary_docx(data: dict) -> Optional[str]:
+    """生成转发目标总结的 Word 附件（表格形式），返回临时文件路径。
+
+    data 字段：
+      sys_name, now_str, day_str, target_email, name, total, failed,
+      types[(类型, 数量, 占比)], subjects[[类型, 主题]], note(str)
+    """
+    try:
+        from docx import Document
+        from docx.shared import Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+    except ImportError:
+        logger.warning("python-docx 未安装，无法生成汇总 Word 附件")
+        return None
+
+    doc = Document()
+    title = doc.add_heading(f"{data.get('day_str', '')} 转发汇总", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p = doc.add_paragraph(
+        f"收件邮箱：{data.get('target_email', '')}    生成时间：{data.get('now_str', '')}"
+    )
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_heading("今日转发概况", level=1)
+    overview = [["转发总数", f"{data.get('total', 0)} 封"]]
+    if data.get("failed"):
+        overview.append(["转发失败", f"{data.get('failed')} 封（已记录，需人工关注）"])
+    _add_report_table(doc, ["指标", "数值"], overview)
+
+    doc.add_heading("文书类型分布", level=1)
+    types = data.get("types") or []
+    if types:
+        _add_report_table(doc, ["文书类型", "数量", "占比"], types)
+        if data.get("note"):
+            doc.add_paragraph(data["note"])
+    else:
+        doc.add_paragraph("（今日无转发记录）")
+
+    subjects = data.get("subjects") or []
+    if subjects:
+        doc.add_heading("今日转发清单", level=1)
+        _add_report_table(doc, ["文书类型", "邮件主题"], subjects)
+
+    tail = doc.add_paragraph("")
+    tail.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = tail.add_run(f"—— {data.get('sys_name', '')} 自动生成 ——")
+    run.font.size = Pt(9)
+
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=".docx", prefix="转发汇总_", delete=False
+    )
+    doc.save(tmp.name)
+    logger.info(f"汇总 Word 附件已生成: {tmp.name}")
+    return tmp.name
+
+
+def send_report_mail(smtp_cfg: dict, to_email: str, subject: str, body: str,
+                     docx_path: Optional[str] = None,
+                     attachment_name: str = "报告.docx") -> bool:
+    """发送纯文本正文 + 可选 Word 附件的报告类邮件。
+
+    与 _send_plain_mail 同源（不经过 forward_email，避免 AI 模板包裹），
+    区别仅在于可附带一个 docx。附件读入内存后立即删除临时文件，
+    避免长期运行堆积（与 forward_email 的 AI 分析报告处理一致）。
+    """
+    from app.config import decrypt
+
+    server = None
+    try:
+        smtp_password = decrypt(smtp_cfg["password_encrypted"])
+
+        if docx_path:
+            msg = MIMEMultipart()
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            path = Path(docx_path)
+            with open(path, "rb") as f:
+                part = MIMEApplication(
+                    f.read(), Name=attachment_name,
+                    _subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            part["Content-Disposition"] = f'attachment; filename="{attachment_name}"'
+            msg.attach(part)
+        else:
+            msg = MIMEText(body, "plain", "utf-8")
+
+        msg["From"] = smtp_cfg["username"]
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        from app.services.email_fetcher import FORWARD_COPY_HEADER, FORWARD_COPY_MARKER
+        msg[FORWARD_COPY_HEADER] = FORWARD_COPY_MARKER
+
+        if smtp_cfg["port"] == 465:
+            server = smtplib.SMTP_SSL(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
+        else:
+            server = smtplib.SMTP(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
+            server.starttls()
+
+        server.login(smtp_cfg["username"], smtp_password)
+        server.sendmail(smtp_cfg["username"], [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        logger.error(f"报告邮件发送失败 → {to_email}: [{type(e).__name__}] {e}")
+        return False
+    finally:
+        if server:
+            try:
+                server.quit()
+            except Exception:
+                pass
+        # 临时附件已读入内存，无论成败都清理
+        if docx_path:
+            try:
+                Path(docx_path).unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning(f"清理临时报表附件失败: {docx_path} — {e}")
+
+
 _SMTP_RETRY_DELAY = 5  # SMTP 重试间隔（秒）
 
 

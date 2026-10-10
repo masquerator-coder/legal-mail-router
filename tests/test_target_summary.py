@@ -16,6 +16,7 @@ import pytest
 from app.services.scheduler import (
     _collect_target_summaries,
     _build_target_summary_body,
+    _build_target_summary_brief,
     _record_forward_result,
     send_target_summary_reports,
 )
@@ -248,7 +249,7 @@ class TestSendTargetSummaryReports:
 
         called = []
         monkeypatch.setattr("app.database.SessionLocal", lambda: fwd_db)
-        monkeypatch.setattr("app.services.scheduler._send_plain_mail",
+        monkeypatch.setattr("app.services.mail_forwarder.send_report_mail",
                             lambda *a, **k: called.append(a) or True)
 
         send_target_summary_reports()
@@ -264,8 +265,90 @@ class TestSendTargetSummaryReports:
         monkeypatch.setattr("app.services.scheduler._get_smtp_config_for_report",
                             lambda db: {"host": "h", "port": 25, "username": "u",
                                         "password_encrypted": "p"})
-        monkeypatch.setattr("app.services.scheduler._send_plain_mail",
+        monkeypatch.setattr("app.services.mail_forwarder.send_report_mail",
                             lambda *a, **k: called.append(a) or True)
 
         send_target_summary_reports()
         assert called == []
+
+
+class TestSummaryWordAttachment:
+    """汇总邮件改为「摘要正文 + Word 表格附件」"""
+
+    def _stat(self):
+        return {
+            "name": "张律师", "total": 3,
+            "types": {"合同协议": 2, "政府信息公开": 1},
+            "subjects": [("合同甲", "合同协议")],
+            "failed": 0,
+        }
+
+    def test_brief_body_points_to_attachment(self):
+        """摘要正文不应再罗列明细，只给数字与附件指引"""
+        body = _build_target_summary_brief(
+            "系统", "a@x.com", "张律师", self._stat(),
+            "2026年01月01日 18:00", "2026年01月01日",
+            attachment_name="系统 转发汇总 2026-01-01.docx",
+        )
+        assert "转发总数：3 封" in body
+        assert "系统 转发汇总 2026-01-01.docx" in body
+        assert "张律师 您好" in body
+        # 明细列表标记不应出现在摘要里
+        assert "· [合同协议] 合同甲" not in body
+
+    def test_brief_body_no_attachment_name_falls_back(self):
+        """未给附件名时不出现空的附件指引段"""
+        body = _build_target_summary_brief(
+            "系统", "a@x.com", "张律师", self._stat(),
+            "now", "today", attachment_name="",
+        )
+        assert "附件《" not in body
+        assert "转发总数：3 封" in body
+
+    def test_brief_body_shows_failed(self):
+        stat = self._stat()
+        stat["failed"] = 2
+        body = _build_target_summary_brief(
+            "系统", "a@x.com", "张律师", stat, "now", "today", "x.docx")
+        assert "转发失败：2 封" in body
+
+    def test_docx_tables_built(self):
+        """Word 附件应含概况/类型分布/转发清单三张表"""
+        from docx import Document
+        from app.services.mail_forwarder import _build_target_summary_docx
+        import os
+
+        path = _build_target_summary_docx({
+            "sys_name": "系统", "now_str": "now", "day_str": "today",
+            "target_email": "a@x.com", "name": "张律师", "total": 3, "failed": 0,
+            "types": [["合同协议", "2 封", "66.7%"], ["政府信息公开", "1 封", "33.3%"]],
+            "subjects": [["合同协议", "合同甲"]], "note": "",
+        })
+        try:
+            doc = Document(path)
+            assert len(doc.tables) == 3
+            assert [c.text for c in doc.tables[1].rows[0].cells] == ["文书类型", "数量", "占比"]
+            assert [c.text for c in doc.tables[1].rows[1].cells] == ["合同协议", "2 封", "66.7%"]
+            # 只含本目标的邮箱，不得泄漏其他目标
+            text = "\n".join(p.text for p in doc.paragraphs)
+            assert "a@x.com" in text
+            assert "b@x.com" not in text
+        finally:
+            os.unlink(path)
+
+    def test_docx_empty_day_shows_hint(self):
+        from docx import Document
+        from app.services.mail_forwarder import _build_target_summary_docx
+        import os
+
+        path = _build_target_summary_docx({
+            "sys_name": "系统", "now_str": "now", "day_str": "today",
+            "target_email": "a@x.com", "name": "", "total": 0, "failed": 0,
+            "types": [], "subjects": [], "note": "",
+        })
+        try:
+            doc = Document(path)
+            text = "\n".join(p.text for p in doc.paragraphs)
+            assert "今日无转发记录" in text
+        finally:
+            os.unlink(path)

@@ -1544,8 +1544,6 @@ def send_daily_report():
             logger.warning("无法获取 SMTP 配置，跳过日报发送")
             return
 
-        from_email = smtp_cfg["username"]
-
         # ── 统计数据 ──
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -1624,39 +1622,89 @@ def send_daily_report():
 
         now_str = datetime.now().strftime("%Y年%m月%d日 %H:%M")
 
-        # ── 构建邮件正文 ──
+        # ── Word 附件：日报明细表格 ──
+        from app.services.mail_forwarder import _build_daily_report_docx, send_report_mail
+
+        docx_path = _build_daily_report_docx({
+            "sys_name": sys_name,
+            "now_str": now_str,
+            "overview": [
+                ["处理总数", f"{today_processed} 封"],
+                ["成功转发", f"{today_forwarded} 封"],
+                ["LLM 分析", f"{today_analyzed} 封"],
+                ["跳过邮件", f"{today_skipped} 封"],
+                ["处理失败", f"{today_failed} 封"],
+                ["紧急邮件", f"{today_urgent} 封"],
+            ],
+            "cumulative": [
+                ["累计处理", f"{total_all} 封"],
+                ["成功转发", f"{forwarded_all} 封"],
+                ["失败合计", f"{failed_all} 封"],
+                ["累计成功率", f"{(forwarded_all / total_all * 100):.1f}%" if total_all > 0 else "暂无数据"],
+                ["今日成功率", f"{(today_forwarded / today_processed * 100):.1f}%" if today_processed > 0 else "暂无数据"],
+            ],
+            "accounts": [
+                [acc["name"], acc["email"], f"{acc['today_count']} 封",
+                 acc["last_check"], f"{acc['interval']} 分钟"]
+                for acc in account_list
+            ],
+            "system": [
+                ["调度引擎", scheduler_status],
+                ["LLM 模型", llm_status],
+                ["模型类型", llm_type],
+                ["服务端口", _read_setting(db, "system_port", "8020")],
+                ["监控范围", f"{_read_setting(db, 'monitor_days', '7')} 天"],
+                ["日志保留", "永久" if _read_setting(db, "log_retention_days", "0") == "0"
+                 else _read_setting(db, "log_retention_days", "0") + " 天"],
+            ],
+            "errors": [
+                [err.created_at.strftime("%m-%d %H:%M"),
+                 err.subject or "(无主题)",
+                 (err.error_message or "未知错误")[:120]]
+                for err in recent_errors
+            ],
+        })
+
+        # ── 构建邮件正文（摘要 + 附件说明）──
         body = f"""您好，
 
 以下是 {sys_name} 的每日运行报告（{now_str}）：
 
-━━━━━━━━━━━━━━━━━━━━━━━
 📊 今日处理概况
-━━━━━━━━━━━━━━━━━━━━━━━
-  处理总数：{today_processed} 封
-  成功转发：{today_forwarded} 封
-  LLM 分析：{today_analyzed} 封
-  跳过邮件：{today_skipped} 封
-  处理失败：{today_failed} 封
-  紧急邮件：{today_urgent} 封
+  处理总数：{today_processed} 封 | 成功转发：{today_forwarded} 封
+  LLM 分析：{today_analyzed} 封 | 跳过邮件：{today_skipped} 封
+  处理失败：{today_failed} 封 | 紧急邮件：{today_urgent} 封
 
-━━━━━━━━━━━━━━━━━━━━━━━
 📈 累计统计
-━━━━━━━━━━━━━━━━━━━━━━━
-  累计处理：{total_all} 封
-  成功转发：{forwarded_all} 封
-  失败合计：{failed_all} 封
+  累计处理：{total_all} 封 | 成功转发：{forwarded_all} 封 | 失败合计：{failed_all} 封
   成功率：  {f"{(forwarded_all / total_all * 100):.1f}%" if total_all > 0 else "暂无数据"}{" | 今日: " + f"{(today_forwarded / today_processed * 100):.1f}%" if today_processed > 0 else ""}
 
+📮 监控邮箱：{account_count} 个
+⚙️ 调度引擎：{scheduler_status} | LLM 模型：{llm_status}
+"""
+
+        if recent_errors and docx_path:
+            body += f"\n⚠️ 最近 {len(recent_errors)} 条错误，详见附件。\n"
+
+        if docx_path:
+            body += """━━━━━━━━━━━━━━━━━━━━━━━
+
+📎 今日概况、累计统计、监控邮箱明细、系统状态与错误清单已按表格整理在
+   附件中，请下载查阅。
+"""
+        else:
+            # python-docx 不可用 → 回退为完整纯文本明细，保证信息不丢失
+            logger.warning("日报 Word 附件生成失败，回退纯文本明细正文")
+            body += f"""
 ━━━━━━━━━━━━━━━━━━━━━━━
 📮 监控邮箱（{account_count} 个）
 ━━━━━━━━━━━━━━━━━━━━━━━
 """
+            for acc in account_list:
+                body += f"  {acc['name']} ({acc['email']})\n"
+                body += f"    今日处理: {acc['today_count']} 封 | 最近检查: {acc['last_check']} | 间隔: {acc['interval']}分钟\n"
 
-        for acc in account_list:
-            body += f"  {acc['name']} ({acc['email']})\n"
-            body += f"    今日处理: {acc['today_count']} 封 | 最近检查: {acc['last_check']} | 间隔: {acc['interval']}分钟\n"
-
-        body += f"""
+            body += f"""
 ━━━━━━━━━━━━━━━━━━━━━━━
 ⚙️ 系统状态
 ━━━━━━━━━━━━━━━━━━━━━━━
@@ -1667,16 +1715,15 @@ def send_daily_report():
   监控范围：{_read_setting(db, 'monitor_days', '7')} 天
   日志保留：{'永久' if _read_setting(db, 'log_retention_days', '0') == '0' else _read_setting(db, 'log_retention_days', '0') + ' 天'}
 """
-
-        if recent_errors:
-            body += f"""
+            if recent_errors:
+                body += f"""
 ━━━━━━━━━━━━━━━━━━━━━━━
 ⚠️ 最近 {len(recent_errors)} 条错误
 ━━━━━━━━━━━━━━━━━━━━━━━
 """
-            for err in recent_errors:
-                body += f"  [{err.created_at.strftime('%m-%d %H:%M')}] {err.subject or '(无主题)'}\n"
-                body += f"    原因: {(err.error_message or '未知错误')[:120]}\n"
+                for err in recent_errors:
+                    body += f"  [{err.created_at.strftime('%m-%d %H:%M')}] {err.subject or '(无主题)'}\n"
+                    body += f"    原因: {(err.error_message or '未知错误')[:120]}\n"
 
         body += """
 ━━━━━━━━━━━━━━━━━━━━━━━
@@ -1685,38 +1732,15 @@ def send_daily_report():
 如需修改接收邮箱或发送时间，请前往系统设置页面配置。
 """
 
-        # ── 直接 SMTP 发送（不经过 forward_email 避免 AI 模板包裹） ──
-        from app.config import decrypt
-
-        smtp_password = decrypt(smtp_cfg["password_encrypted"])
+        # ── 发送（摘要正文 + Word 表格附件）──
         report_subject = f"{sys_name} 运行报告 {datetime.now().strftime('%Y-%m-%d')}"
+        attachment_name = f"{sys_name} 运行报告 {datetime.now().strftime('%Y-%m-%d')}.docx"
 
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["From"] = from_email
-        msg["To"] = to_email
-        msg["Subject"] = report_subject
-        from app.services.email_fetcher import FORWARD_COPY_HEADER, FORWARD_COPY_MARKER
-        msg[FORWARD_COPY_HEADER] = FORWARD_COPY_MARKER
-
-        server = None
-        try:
-            if smtp_cfg["port"] == 465:
-                server = smtplib.SMTP_SSL(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
-            else:
-                server = smtplib.SMTP(smtp_cfg["host"], smtp_cfg["port"], timeout=30)
-                server.starttls()
-
-            server.login(smtp_cfg["username"], smtp_password)
-            server.sendmail(from_email, [to_email], msg.as_string())
+        if send_report_mail(smtp_cfg, to_email, report_subject, body,
+                            docx_path=docx_path, attachment_name=attachment_name):
             logger.info(f"每日报告已发送至 {to_email}")
-        except Exception as e:
-            logger.error(f"每日报告发送失败: {e}", exc_info=True)
-        finally:
-            if server:
-                try:
-                    server.quit()
-                except Exception:
-                    pass
+        else:
+            logger.error(f"每日报告发送失败 → {to_email}")
 
     except Exception as e:
         logger.error(f"生成每日报告时出错: {e}", exc_info=True)
@@ -1873,6 +1897,53 @@ def _build_target_summary_body(sys_name: str, email: str, name: str,
     return "\n".join(lines)
 
 
+def _build_target_summary_brief(sys_name: str, email: str, name: str,
+                                stat: dict, now_str: str, day_str: str,
+                                attachment_name: str = "") -> str:
+    """构建转发目标总结的**摘要正文**（明细表格移入 Word 附件）。
+
+    与 _build_target_summary_body 的区别：只保留概况数字与附件指引，
+    文书类型分布、转发清单等明细由附件承载。正文保持纯文本，
+    所有邮件客户端都能正常显示。
+    """
+    total = stat["total"]
+    greeting = f"{name} 您好，" if name else "您好，"
+
+    lines = [
+        greeting,
+        "",
+        f"以下是 {sys_name} 统计的、{day_str} 当天转发给 {email} 的文书汇总（{now_str}）：",
+        "",
+        f"📊 转发总数：{total} 封",
+    ]
+    if stat["failed"]:
+        lines.append(f"  转发失败：{stat['failed']} 封（已记录，需人工关注）")
+
+    if stat["types"]:
+        type_names = "、".join(
+            t for t, _ in sorted(stat["types"].items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+        lines.append(f"📁 涉及类型：{type_names}")
+
+    if attachment_name:
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━",
+            "",
+            f"📎 文书类型分布与今日转发清单已按表格整理在附件《{attachment_name}》中，",
+            "   请下载查阅。",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+    lines += [
+        "",
+        "此为自动生成的每日汇总，请勿回复。",
+        "如需调整接收邮箱或发送时间，请前往系统设置页面配置。",
+    ]
+    return "\n".join(lines)
+
+
 def send_target_summary_reports():
     """按转发目标邮箱逐个发送当日总结邮件。
 
@@ -1905,12 +1976,55 @@ def send_target_summary_reports():
         day_str = datetime.now().strftime("%Y年%m月%d日")
 
         sent = 0
+        from app.services.mail_forwarder import _build_target_summary_docx, send_report_mail
+
         for email, stat in summaries.items():
-            body = _build_target_summary_body(
-                sys_name, email, stat["name"], stat, now_str, day_str
-            )
+            # 明细表格放进 Word 附件；附件名带日期便于归档
+            dateslug = datetime.now().strftime("%Y-%m-%d")
+            attachment_name = f"{sys_name} 转发汇总 {dateslug}.docx"
+
+            # 文书类型分布（按数量降序，同数量按类型名，保证输出稳定）
+            ordered = sorted(stat["types"].items(), key=lambda kv: (-kv[1], kv[0]))
+            note = ""
+            if len(ordered) > 1 and sum(stat["types"].values()) != stat["total"]:
+                note = ("说明：一封邮件含多份不同类型文书时会按类型分别计数，"
+                        "因此各类型数量之和可能大于转发总数。")
+
+            docx_path = _build_target_summary_docx({
+                "sys_name": sys_name,
+                "now_str": now_str,
+                "day_str": day_str,
+                "target_email": email,
+                "name": stat["name"],
+                "total": stat["total"],
+                "failed": stat["failed"],
+                "types": [
+                    [t, f"{cnt} 封",
+                     f"{(cnt / stat['total'] * 100):.1f}%" if stat["total"] else "0.0%"]
+                    for t, cnt in ordered
+                ],
+                "subjects": [
+                    [dt, subj if len(subj) <= 60 else subj[:57] + "..."]
+                    for subj, dt in stat["subjects"]
+                ],
+                "note": note,
+            })
+
+            if docx_path:
+                body = _build_target_summary_brief(
+                    sys_name, email, stat["name"], stat, now_str, day_str,
+                    attachment_name=attachment_name,
+                )
+            else:
+                # python-docx 不可用 → 回退为原有的完整纯文本明细
+                logger.warning("汇总 Word 附件生成失败，回退纯文本明细正文")
+                body = _build_target_summary_body(
+                    sys_name, email, stat["name"], stat, now_str, day_str
+                )
+
             subject = f"{sys_name} 转发汇总 {day_str}（{stat['total']} 封）"
-            if _send_plain_mail(smtp_cfg, email, subject, body):
+            if send_report_mail(smtp_cfg, email, subject, body,
+                                docx_path=docx_path, attachment_name=attachment_name):
                 sent += 1
                 logger.info(f"转发目标汇总已发送至 {email}（{stat['total']} 封）")
 
