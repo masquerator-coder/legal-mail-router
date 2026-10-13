@@ -1,6 +1,7 @@
 """
 LLM 分析模块 — 调用 OpenAI 兼容 API 分析法律文书
 """
+import ast
 import json
 import logging
 import re
@@ -282,6 +283,61 @@ def _escape_json_string_newlines(text: str) -> str:
     # 贪婪匹配完整的字符串字面量（转义引号 \\" 由 \\. 消费，不会提前结束），
     # 然后统一转义内部真实换行；字面 "\\n"（反斜杠+n）不包含真实 LF，不受影响。
     return re.sub(r'(?<=: )"((?:[^"\\]|\\.)*)"', _fix, text)
+
+
+def _loads_tolerant(content: str) -> dict:
+    """容错解析 LLM 返回的 JSON 对象（两阶段共用）。
+
+    依次尝试，任一成功即返回 dict：
+      1. 严格 json.loads；
+      2. 修复常见问题（字符串内未转义换行、尾随逗号）后再 json.loads；
+      3. 正则提取首个 {...} 块（丢弃模型多余的前后说明文字）后 json.loads；
+      4. ast.literal_eval —— 兼容模型偶发输出的**单引号 Python 字典风格**
+         （如 `{'doc_type': '政府信息公开', 'confidence': 0.9}`）及 True/False/None。
+    全部失败抛 ValueError。仅接受 dict，避免把列表/标量当对象。
+
+    ast.literal_eval 只解析字面量、不执行任意代码，故对不可信模型输出安全。
+    """
+    text = (content or "").strip()
+    if not text:
+        raise ValueError("空内容，无法解析")
+
+    def _as_dict(obj):
+        if isinstance(obj, dict):
+            return obj
+        raise ValueError("解析结果不是 JSON 对象")
+
+    # 1) 严格 JSON
+    try:
+        return _as_dict(json.loads(text))
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 2) 修复未转义换行 / 尾随逗号
+    repaired = _escape_json_string_newlines(text)
+    repaired = re.sub(r",\s*}", "}", repaired)
+    repaired = re.sub(r",\s*]", "]", repaired)
+    try:
+        return _as_dict(json.loads(repaired))
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 3) 提取首个 {...} 块（丢弃前后多余文字）
+    match = re.search(r"\{[\s\S]*\}", text)
+    candidate = match.group() if match else text
+    try:
+        return _as_dict(json.loads(candidate))
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 4) Python 字面量（单引号字典 / True/False/None）
+    for cand in (candidate, repaired, text):
+        try:
+            return _as_dict(ast.literal_eval(cand))
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            continue
+
+    raise ValueError("无法解析为 JSON 对象")
 
 
 def _build_revision_section(doc_type: str | None) -> str:
@@ -734,41 +790,19 @@ async def analyze_email(
     content = content.strip()
 
     try:
-        result = json.loads(content)
-        return _finalize_with_citations(_validate_llm_output(result), mcp_used, mcp_client)
-    except json.JSONDecodeError:
-        # 尝试修复常见 JSON 问题（revised_document 中未转义的换行符等）
-        import re
-        repaired = content
-        repaired = _escape_json_string_newlines(repaired)
-        repaired = re.sub(r',\s*}', '}', repaired)
-        repaired = re.sub(r',\s*]', ']', repaired)
-        try:
-            result = json.loads(repaired)
-            validated = _validate_llm_output(result)
-            logger.info("JSON 修复后解析成功")
-            return _finalize_with_citations(validated, mcp_used, mcp_client)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # 尝试从内容中提取 JSON 对象
-        import re
-        match = re.search(r"\{[\s\S]*\}", content)
-        if match:
-            try:
-                result = json.loads(match.group())
-                return _finalize_with_citations(_validate_llm_output(result), mcp_used, mcp_client)
-            except (json.JSONDecodeError, ValueError):
-                pass
-
+        result = _loads_tolerant(content)
+    except (ValueError, TypeError) as e:
         # 诊断：输出是否被截断（如 max_tokens 不足导致 JSON 不完整）
         if content and not content.rstrip().endswith("}"):
             logger.error(
                 f"LLM 输出疑似被截断（JSON 未闭合）: 末尾={content[-80:]!r}。"
                 f"请检查 LLM 配置的 max_tokens 是否过小（合同/协议等文书需完整输出修改版正文，建议 ≥ 4096）"
             )
-        logger.error(f"无法解析 LLM 响应: {content[:200]}")
+        logger.error(f"无法解析 LLM 响应: [{type(e).__name__}] {e}, content={content[:200]}")
         return _fallback_analysis(f"LLM 返回内容无法解析为 JSON: {content[:100]!r}")
+
+    try:
+        return _finalize_with_citations(_validate_llm_output(result), mcp_used, mcp_client)
     except (ValueError, TypeError) as e:
         logger.error(f"LLM 响应校验失败: {e}, content={content[:200]}")
         return _fallback_analysis(f"LLM 响应校验失败: {e}")
@@ -1012,12 +1046,12 @@ async def classify_doc_type(
     content = content.strip()
 
     try:
-        result = json.loads(content)
+        result = _loads_tolerant(content)
         return _validate_classify_output(result)
-    except (json.JSONDecodeError, ValueError, TypeError) as e:
+    except (ValueError, TypeError) as e:
         logger.error(
             f"类型识别响应解析失败，回退「其他法律文书」（失败兜底值，非模型判断）: "
-            f"[{type(e).__name__}] {str(e)[:200]}"
+            f"[{type(e).__name__}] {str(e)[:200]}；原始输出={content[:200]!r}"
         )
         return {"doc_type": "其他法律文书", "confidence": 0.5, "failed": True}
 

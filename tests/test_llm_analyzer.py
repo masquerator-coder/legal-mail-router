@@ -355,6 +355,62 @@ class TestEscapeJsonStringNewlines:
         assert _escape_json_string_newlines(text) == text
 
 
+class TestLoadsTolerant:
+    """容错 JSON 解析（两阶段共用）——回归背景：分类阶段曾因模型输出单引号
+    Python 字典风格（`{'doc_type': ...}`）导致 json.loads 抛 JSONDecodeError，
+    被判 failed=True，一封合法「政府信息公开」文书绕过默认邮箱未转发。
+    """
+
+    def test_strict_json(self):
+        assert m._loads_tolerant('{"doc_type": "合同协议", "confidence": 0.9}') \
+            == {"doc_type": "合同协议", "confidence": 0.9}
+
+    def test_single_quoted_python_dict(self):
+        """核心回归：单引号字典风格必须能解析（ast.literal_eval 路径）"""
+        assert m._loads_tolerant("{'doc_type': '政府信息公开', 'confidence': 0.9}") \
+            == {"doc_type": "政府信息公开", "confidence": 0.9}
+
+    def test_python_literal_true_none(self):
+        assert m._loads_tolerant("{'a': True, 'b': None, 'c': False}") \
+            == {"a": True, "b": None, "c": False}
+
+    def test_trailing_comma(self):
+        assert m._loads_tolerant('{"doc_type": "传票",}') == {"doc_type": "传票"}
+
+    def test_wrapped_in_prose(self):
+        """模型在 JSON 前后夹带说明文字时，提取首个 {...} 块"""
+        text = '好的，结果如下：\n{"doc_type": "信访件", "confidence": 0.95}\n以上。'
+        assert m._loads_tolerant(text) == {"doc_type": "信访件", "confidence": 0.95}
+
+    def test_single_quoted_wrapped_in_prose(self):
+        text = "结果：{'doc_type': '通知书', 'confidence': 0.8} 完毕"
+        assert m._loads_tolerant(text) == {"doc_type": "通知书", "confidence": 0.8}
+
+    def test_unescaped_newline_in_string(self):
+        parsed = m._loads_tolerant('{"revised_document": "第一行\n第二行"}')
+        assert parsed["revised_document"] == "第一行\n第二行"
+
+    def test_truncated_raises(self):
+        """被截断的 JSON（未闭合）应抛 ValueError，交由调用方兜底为 failed"""
+        with pytest.raises(ValueError):
+            m._loads_tolerant('{"doc_type": "合同协议", "confi')
+
+    def test_non_dict_raises(self):
+        with pytest.raises(ValueError):
+            m._loads_tolerant('["合同协议", "起诉状"]')
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            m._loads_tolerant("   ")
+
+    def test_single_quoted_classify_output_routes_correctly(self):
+        """端到端：单引号分类结果经容错解析 + 校验后 doc_type 正确、不判失败"""
+        parsed = m._loads_tolerant("{'doc_type': '政府信息公开', 'confidence': 0.95}")
+        result = m._validate_classify_output(parsed)
+        assert result["doc_type"] == "政府信息公开"
+        assert not result.get("failed")
+
+
 class TestGroupPrompt:
     """分组分析（多文书分组）prompt"""
 
