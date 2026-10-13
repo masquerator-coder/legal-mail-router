@@ -288,12 +288,14 @@ def _escape_json_string_newlines(text: str) -> str:
 def _loads_tolerant(content: str) -> dict:
     """容错解析 LLM 返回的 JSON 对象（两阶段共用）。
 
-    依次尝试，任一成功即返回 dict：
+    对多个候选串依次尝试，任一解析出 dict 即返回：
       1. 严格 json.loads；
-      2. 修复常见问题（字符串内未转义换行、尾随逗号）后再 json.loads；
+      2. 修复常见问题（字符串内未转义换行、尾随逗号）后 json.loads；
       3. 正则提取首个 {...} 块（丢弃模型多余的前后说明文字）后 json.loads；
       4. ast.literal_eval —— 兼容模型偶发输出的**单引号 Python 字典风格**
          （如 `{'doc_type': '政府信息公开', 'confidence': 0.9}`）及 True/False/None。
+    每个候选还会额外尝试**折叠外层多余花括号**：模型偶尔照抄提示词里被双重转义的
+    示例，输出 `{{"doc_type": ...}}`（双层花括号），需去掉一层才能解析。
     全部失败抛 ValueError。仅接受 dict，避免把列表/标量当对象。
 
     ast.literal_eval 只解析字面量、不执行任意代码，故对不可信模型输出安全。
@@ -302,40 +304,44 @@ def _loads_tolerant(content: str) -> dict:
     if not text:
         raise ValueError("空内容，无法解析")
 
-    def _as_dict(obj):
-        if isinstance(obj, dict):
-            return obj
-        raise ValueError("解析结果不是 JSON 对象")
-
-    # 1) 严格 JSON
-    try:
-        return _as_dict(json.loads(text))
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # 2) 修复未转义换行 / 尾随逗号
+    # 修复未转义换行 / 尾随逗号
     repaired = _escape_json_string_newlines(text)
     repaired = re.sub(r",\s*}", "}", repaired)
     repaired = re.sub(r",\s*]", "]", repaired)
-    try:
-        return _as_dict(json.loads(repaired))
-    except (json.JSONDecodeError, ValueError):
-        pass
 
-    # 3) 提取首个 {...} 块（丢弃前后多余文字）
+    # 提取首个 {...} 块（丢弃前后多余文字）
     match = re.search(r"\{[\s\S]*\}", text)
-    candidate = match.group() if match else text
-    try:
-        return _as_dict(json.loads(candidate))
-    except (json.JSONDecodeError, ValueError):
-        pass
+    extracted = match.group() if match else text
 
-    # 4) Python 字面量（单引号字典 / True/False/None）
-    for cand in (candidate, repaired, text):
+    def _collapse_braces(s: str) -> str:
+        """折叠外层成对的多余花括号：{{...}} → {...}（JSON 对象绝不会以 {{ 开头，故安全）"""
+        s = s.strip()
+        while s.startswith("{{") and s.endswith("}}"):
+            s = s[1:-1].strip()
+        return s
+
+    # 候选串（含折叠双花括号变体），去重且保持尝试顺序
+    candidates: list[str] = []
+    for base in (text, repaired, extracted):
+        for variant in (base, _collapse_braces(base)):
+            if variant and variant not in candidates:
+                candidates.append(variant)
+
+    # 先严格 JSON，再 Python 字面量（单引号）
+    for cand in candidates:
         try:
-            return _as_dict(ast.literal_eval(cand))
+            obj = json.loads(cand)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict):
+            return obj
+    for cand in candidates:
+        try:
+            obj = ast.literal_eval(cand)
         except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
             continue
+        if isinstance(obj, dict):
+            return obj
 
     raise ValueError("无法解析为 JSON 对象")
 
@@ -837,7 +843,7 @@ def _get_default_classify_prompt() -> str:
 - 当一份文书同时具备多个类型特征时，以文书的**文书名称与文号**为第一判断依据，其次才是正文内容。
 
 返回格式：
-{{"doc_type": "文书类型", "confidence": 0.0-1.0}}
+{"doc_type": "文书类型", "confidence": 0.0-1.0}
 
 邮件信息：
 - 发件人：{sender}
@@ -902,11 +908,11 @@ B) 包含多份独立的不同文书 → 各自成组
 {file_list}
 
 请返回 JSON（只返回 JSON，不要多余文字）：
-{{"groups": [[indices...], ...]}}
+{"groups": [[indices...], ...]}
 
-示例1（采购合同+报价单+保密协议）: {{"groups": [[0, 1], [2]]}}
-示例2（起诉状+证据清单+证据材料+证据1）: {{"groups": [[0, 1, 2, 3]]}}
-示例3（只有1个附件）: {{"groups": [[0]]}}"""
+示例1（采购合同+报价单+保密协议）: {"groups": [[0, 1], [2]]}
+示例2（起诉状+证据清单+证据材料+证据1）: {"groups": [[0, 1, 2, 3]]}
+示例3（只有1个附件）: {"groups": [[0]]}"""
 
 
 def build_group_prompt(subject: str, file_list: str, custom_prompt: str = "") -> str:

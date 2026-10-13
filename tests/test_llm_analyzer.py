@@ -206,6 +206,23 @@ class TestClassifyPrompt:
         assert "{doc_types}" in template
         assert "非法律文书" in template
 
+    def test_default_classify_prompt_renders_single_braces(self):
+        """回归：默认模板的 JSON 示例经 build 后必须是**单**花括号。
+
+        历史 bug：模板里预转义的 {{...}} 又被 build_classify_prompt 二次转义，
+        最终 prompt 显示 {{"doc_type"...}}，模型照抄输出双花括号 → 第一阶段
+        json 解析失败 → classify_failed → 多组邮件被整封拦下不转发。
+        """
+        prompt = build_classify_prompt(subject="t", sender="s", body="b")
+        assert '{"doc_type": "文书类型", "confidence": 0.0-1.0}' in prompt
+        assert '{{"doc_type"' not in prompt
+
+    def test_default_group_prompt_renders_single_braces(self):
+        """同上：分组默认模板的 JSON 示例经 build 后也须是单花括号"""
+        prompt = m.build_group_prompt(subject="t", file_list="0. a.pdf")
+        assert '{"groups": [[indices...], ...]}' in prompt
+        assert '{{"groups"' not in prompt
+
     def test_classify_prompt_custom(self):
         """自定义分类提示词模板应生效"""
         prompt = build_classify_prompt(
@@ -373,6 +390,15 @@ class TestLoadsTolerant:
     def test_python_literal_true_none(self):
         assert m._loads_tolerant("{'a': True, 'b': None, 'c': False}") \
             == {"a": True, "b": None, "c": False}
+
+    def test_double_braced_json(self):
+        """核心回归：模型照抄被双重转义的示例，输出 {{...}} 双层花括号"""
+        assert m._loads_tolerant('{{"doc_type": "政府信息公开", "confidence": 0.95}}') \
+            == {"doc_type": "政府信息公开", "confidence": 0.95}
+
+    def test_double_braced_wrapped_in_prose(self):
+        text = '结果：{{"doc_type": "信访件", "confidence": 0.9}} 以上'
+        assert m._loads_tolerant(text) == {"doc_type": "信访件", "confidence": 0.9}
 
     def test_trailing_comma(self):
         assert m._loads_tolerant('{"doc_type": "传票",}') == {"doc_type": "传票"}
