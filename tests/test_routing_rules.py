@@ -400,8 +400,13 @@ class TestMultiGroupClassifyFailed:
         types = _collect_mail_doc_types(self.OK_GROUP, log, analyses=[self.OK_GROUP, other])
         assert types == {"合同协议", "起诉状"}
 
-    def test_any_failed_group_blocks_forwarding(self, rule_db):
-        """任一组的识别失败 → 不转发（即使别的组识别成功）"""
+    def test_partial_group_failure_still_forwards_ok_groups(self, rule_db):
+        """部分组识别失败**不阻断**：按成功组路由转发整封，失败组兜底类型不参与匹配
+
+        策略变更背景：旧行为「任一组失败即整封否决」会让多附件/压缩包邮件因单组
+        偶发识别失败而石沉大海。现改为只要有成功组就照常转发（失败组内容随邮件
+        转发并在正文标注人工复核），仅当全部组都失败才判 failed。
+        """
         _add_default_smtp(rule_db)
         _add_rule(rule_db, "contract@example.com", rule_type="doc_type", doc_type="合同协议")
         _add_rule(rule_db, "other-docs@example.com", rule_type="doc_type",
@@ -411,10 +416,24 @@ class TestMultiGroupClassifyFailed:
             self.OK_GROUP, False, _Account(), rule_db, log,
             analyses=[self.FAILED_GROUP, self.OK_GROUP],
         )
+        # 失败组兜底类型「其他法律文书」不得命中 other-docs 规则；成功组「合同协议」命中
+        assert _targets(result) == ["contract@example.com"]
+        assert log.status != "failed"
+
+    def test_all_groups_failed_blocks_forwarding(self, rule_db):
+        """所有组都识别失败 → 无任何路由依据，判 failed 不转发（即便配了默认邮箱）"""
+        _add_default_smtp(rule_db)
+        _add_rule(rule_db, "other-docs@example.com", rule_type="doc_type",
+                  doc_type="其他法律文书")
+        _set_default_email(rule_db, "default@example.com")
+        log = _Log(doc_types="其他法律文书")
+        result = _get_forward_targets(
+            self.FAILED_GROUP, False, _Account(), rule_db, log,
+            analyses=[self.FAILED_GROUP],
+        )
         assert result == []
         assert log.status == "failed"
         assert "识别失败" in log.error_message
-        assert "其他法律文书" in log.error_message
 
     def test_all_groups_ok_still_routes(self, rule_db):
         """全部组识别成功时照常路由（防止上面的拦截过度扩大）"""

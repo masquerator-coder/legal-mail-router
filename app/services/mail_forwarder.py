@@ -73,9 +73,13 @@ def _build_email_body(
     def _render_one(analysis: dict, idx: int = 0) -> str:
         urgency_text = urgency_map.get(analysis.get("urgency"), "🟡 一般")
         ai_interp = analysis.get('ai_interpretation', '')
-        header = f"\n── 第 {idx + 1} 组：{analysis.get('doc_type', '文书')} ──\n" if is_multi else ""
+        # 类型识别失败的组：doc_type 是兜底值而非模型判断，标注提醒律师人工复核
+        dt_display = analysis.get('doc_type') or '未知'
+        if analysis.get('classify_failed'):
+            dt_display = f"{dt_display}（⚠️类型未识别，请人工复核）"
+        header = f"\n── 第 {idx + 1} 组：{dt_display} ──\n" if is_multi else ""
         if brief_mode:
-            return f"""{header}📋 文书类型：{analysis.get('doc_type', '未知')}
+            return f"""{header}📋 文书类型：{dt_display}
 ⚡ 紧急程度：{urgency_text}
 📝 案件摘要：{analysis.get('case_summary', '无')}
 🏛️ 涉及方：{analysis.get('involved_parties', '无')}
@@ -85,7 +89,7 @@ def _build_email_body(
 """
         else:
             interp_section = ai_interp if ai_interp else "（暂无AI解读，请人工审核）"
-            return f"""{header}📋 文书类型：{analysis.get('doc_type', '未知')}
+            return f"""{header}📋 文书类型：{dt_display}
 ⚡ 紧急程度：{urgency_text}
 📝 案件摘要：{analysis.get('case_summary', '无')}
 🏛️ 涉及方：{analysis.get('involved_parties', '无')}
@@ -225,8 +229,13 @@ def _generate_analysis_docx(analyses: list[dict], original_subject: str) -> Opti
         if not analysis:
             continue
 
+        # 类型识别失败的组：doc_type 是兜底值而非模型判断，标注提醒律师人工复核
+        dt_display = analysis.get("doc_type") or "未知"
+        if analysis.get("classify_failed"):
+            dt_display = f"{dt_display}（⚠️类型未识别，请人工复核）"
+
         if is_multi:
-            doc.add_heading(f"第 {idx + 1} 组：{analysis.get('doc_type', '文书')}", level=1)
+            doc.add_heading(f"第 {idx + 1} 组：{dt_display}", level=1)
 
         # ── 基本信息表 ──
         doc.add_heading("基本信息", level=2 if is_multi else 1)
@@ -234,7 +243,7 @@ def _generate_analysis_docx(analyses: list[dict], original_subject: str) -> Opti
         table.autofit = True
 
         fields = [
-            ("文书类型", analysis.get("doc_type", "未知")),
+            ("文书类型", dt_display),
             ("紧急程度", urgency_map.get(analysis.get("urgency"), "🟡 一般")),
             ("案件摘要", analysis.get("case_summary", "无")),
             ("涉及方", analysis.get("involved_parties", "无")),

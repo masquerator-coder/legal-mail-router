@@ -1215,15 +1215,25 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log,
     llm_doc_type = analysis.get("doc_type", "") if analysis else ""
     llm_confidence = analysis.get("confidence", 0.5) if analysis else 0.0
 
-    # ── 类型识别失败：不得据此路由 ──
-    # 兜底值「其他法律文书/0.5」与模型真实判断无法区分，若继续走规则匹配，
-    # 要么因无规则命中而落到「未配置转发目标」的误导性提示，要么误命中规则转发到错误邮箱。
-    # 多附件分组时任一组的识别失败同样不得放行：该组内容未识别，转发出去只会误导律师。
+    # ── 类型识别失败的处理 ──
+    # 兜底值「其他法律文书/0.5」与模型真实判断无法区分，故失败组的类型**不参与规则匹配**
+    # （见 _collect_mail_doc_types 的剔除逻辑），避免误命中该类型规则转发到错误邮箱。
+    #
+    # 单封（未分组）：analysis 自身识别失败 → 无任何路由依据，判 failed、不转发。
+    # 多组：**只要还有识别成功的组**，就照常按成功组的类型路由并转发整封邮件——
+    #   失败组的兜底类型已被排除（不会误命中），其内容仍随邮件一并转发，并在正文/
+    #   docx 中标注「类型未识别，请人工复核」。仅当**所有组都识别失败**时才判 failed。
+    #   （旧行为是「任一组失败即整封否决」，会让多附件/压缩包邮件因单组偶发识别失败
+    #    而石沉大海，故改为部分失败不阻断。）
     classify_failed_types = sorted({
         str(a.get("doc_type", "") or "").strip()
         for a in (analyses or []) if _is_classify_failed(a)
     })
-    if _is_classify_failed(analysis) or classify_failed_types:
+    ok_groups = [a for a in (analyses or []) if a and not _is_classify_failed(a)]
+    # 是否「无任何可用路由依据」：多组看是否全失败，单封看 analysis 自身
+    no_routing_basis = (not ok_groups) if analyses else _is_classify_failed(analysis)
+
+    if no_routing_basis:
         failed_desc = "、".join(classify_failed_types) or llm_doc_type
         log.status = "failed"
         log.error_message = (
@@ -1231,6 +1241,14 @@ def _get_forward_targets(analysis, llm_failed: bool, account, db, log,
             f"请检查类型识别模型配置（尤其是 max_tokens 是否过小导致 JSON 输出被截断）。"
         )
         return []
+
+    if classify_failed_types:
+        # 部分组识别失败：不阻断转发，仅留痕（失败组内容随邮件转发并标注人工复核）
+        logger.warning(
+            f"多组邮件存在类型识别失败组（兜底类型：{'、'.join(classify_failed_types)}），"
+            f"已按其余 {len(ok_groups)} 个成功组正常路由转发，失败组标注人工复核 "
+            f"(log_id={getattr(log, 'id', '?')})"
+        )
 
     # ── 垃圾过滤 ──
     is_junk = (

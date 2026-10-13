@@ -81,6 +81,35 @@ class TestBuildEmailBodyMeta:
         assert "原邮件主题：主题X" in body
 
 
+class TestClassifyFailedAnnotation:
+    """类型识别失败的组：正文/docx 须标注「请人工复核」，兜底类型不得冒充模型判断
+
+    策略背景：多组邮件改为「部分组失败不阻断转发」，失败组内容随邮件转发，
+    但必须让律师一眼看出该组类型未经模型确认。
+    """
+
+    def test_failed_group_annotated_in_body(self):
+        analyses = [
+            {"doc_type": "合同协议", "confidence": 0.9},
+            {"doc_type": "其他法律文书", "confidence": 0.5, "classify_failed": True},
+        ]
+        body = _build_email_body("张三", analyses, "主题X")
+        assert "其他法律文书（⚠️类型未识别，请人工复核）" in body
+        # 成功组不受影响，不带复核标注
+        assert "合同协议（⚠️" not in body
+
+    def test_failed_group_annotated_in_brief_mode(self):
+        analyses = [{"doc_type": "其他法律文书", "confidence": 0.5, "classify_failed": True}]
+        body = _build_email_body("张三", analyses, "主题X", brief_mode=True)
+        assert "⚠️类型未识别，请人工复核" in body
+
+    def test_no_annotation_when_classify_ok(self):
+        body = _build_email_body(
+            "张三", [{"doc_type": "起诉状", "confidence": 0.9}], "主题X",
+        )
+        assert "请人工复核" not in body
+
+
 class TestParseRevisionMarkers:
     """修订标记解析（含对 LLM 不规范输出的容错）"""
 
